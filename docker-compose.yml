@@ -19,15 +19,14 @@ services:
     tmpfs:
       - /tmp:size=16m
     cpus: 0.25
-    # Plan's starting hypothesis was 128m (bumped to 192m if measurement
-    # showed it insufficient). Measured: just importing aiogram/aiohttp/
-    # requests and completing bootstrap (Bot object + DB open + migrations,
-    # before any Telegram traffic) already uses ~170-175 MiB RSS, and a
-    # container capped at 128m was OOM-killed within ~9s during startup.
-    # 256m leaves real headroom (measured ~160 MiB used, i.e. ~60%) for
-    # actual traffic; revisit with production numbers once observed.
-    mem_limit: 256m
-    memswap_limit: 256m
+    # Measured in this image with a 2000-subscriber list (far above the
+    # 1-2 users this bot is sized for): peak RSS 168 MiB with migrations,
+    # aiogram and a full subscriber render. 128m is OOM-killed during
+    # startup (exit 137); 192m completes the same run with ~24 MiB spare
+    # and 256m peaks at the identical 168 MiB, so the extra cap buys
+    # nothing. Raise this only against observed production numbers.
+    mem_limit: 192m
+    memswap_limit: 192m
     pids_limit: 64
     ulimits:
       core: 0
