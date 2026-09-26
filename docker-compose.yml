@@ -3,6 +3,7 @@ services:
     image: ping-pong-bot:${APP_VERSION}
     container_name: ping-pong-bot
     restart: unless-stopped
+    user: "10001:10001"
     env_file:
       - .env
     cap_drop:
@@ -10,14 +11,35 @@ services:
     security_opt:
       - no-new-privileges:true
     read_only: true
+    # No ports: - nothing is published; the bot only makes outbound calls.
+    volumes:
+      # Named + explicit `name:` so a different compose project/directory can
+      # never point at (or silently create) a different, empty database.
+      - upb-data:/data
     tmpfs:
-      - /tmp
-    deploy:
-      resources:
-        limits:
-          memory: 256M
+      - /tmp:size=16m
+    cpus: 0.25
+    # Plan's starting hypothesis was 128m (bumped to 192m if measurement
+    # showed it insufficient). Measured: just importing aiogram/aiohttp/
+    # requests and completing bootstrap (Bot object + DB open + migrations,
+    # before any Telegram traffic) already uses ~170-175 MiB RSS, and a
+    # container capped at 128m was OOM-killed within ~9s during startup.
+    # 256m leaves real headroom (measured ~160 MiB used, i.e. ~60%) for
+    # actual traffic; revisit with production numbers once observed.
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    ulimits:
+      core: 0
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  # Stable explicit name: `docker compose down -v` (or a compose project
+  # rename) destroys this database. Never run `down -v` as part of an
+  # upgrade; it is a deliberate, separate, destructive operation.
+  upb-data:
+    name: upb-data
