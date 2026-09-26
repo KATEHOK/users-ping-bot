@@ -31,9 +31,22 @@ class RecordingTransport:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self._raise: Exception | None = None
+        self._raise_queue: list[Exception] = []
+        self._fail_chats: dict[int, Exception] = {}
 
     def raise_next(self, exc: Exception) -> None:
         self._raise = exc
+
+    def queue_raises(self, excs: list[Exception]) -> None:
+        # each call pops the next queued exception, in order, until exhausted
+        self._raise_queue.extend(excs)
+
+    def fail_chat(self, chat_id: int, exc: Exception) -> None:
+        # every send to this chat_id raises exc until clear_fail_chat is called
+        self._fail_chats[chat_id] = exc
+
+    def clear_fail_chat(self, chat_id: int) -> None:
+        self._fail_chats.pop(chat_id, None)
 
     async def send_message(
         self,
@@ -51,6 +64,10 @@ class RecordingTransport:
                 "thread_id": thread_id,
             }
         )
+        if chat_id in self._fail_chats:
+            raise self._fail_chats[chat_id]
+        if self._raise_queue:
+            raise self._raise_queue.pop(0)
         if self._raise is not None:
             exc, self._raise = self._raise, None
             raise exc
