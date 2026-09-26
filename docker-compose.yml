@@ -1,0 +1,23 @@
+services:
+  ping-pong-bot:
+    image: ping-pong-bot:${APP_VERSION}
+    container_name: ping-pong-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
