@@ -1,2 +1,7 @@
 .env
 .idea/
+local/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
