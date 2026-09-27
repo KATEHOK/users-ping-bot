@@ -1,8 +1,11 @@
 import pytest
 
 from app.db import Database
+from app.delivery import Delivery
 from app.models import Role
 from app.services import Services
+
+from conftest import FakeClock, RecordingTransport
 
 
 async def _register(services, db, user_id, chat_id, title="Chat"):
@@ -320,6 +323,50 @@ async def test_failure_inside_migrate_chat_leaves_no_alias_and_no_conflict(db: D
     assert canonical == -100  # no alias committed
     assert old_row is not None  # old registration untouched
     assert conflicts == []
+
+
+async def test_revoke_admin_inside_blocked_scope_applies_but_queues_no_farewell(db: Database):
+    # punch-list P4: an admin's only chat sits inside an open conflict's blocked
+    # scope; the CLI/Telegram revocation must still apply (role gone, chat gone)
+    # while the conflict itself stays open and nothing is sent into that chat.
+    services = Services()
+    async with db.transaction() as c:
+        await services.touch_user(c, 5)
+        await services.grant_admin(c, 5)
+        await services.register_chat(c, -100, "Blocked chat", 5)
+        conflict_id = await services.open_conflict(c, [-100, -200], "manual")
+
+    async with db.reader() as c:
+        chat_before = await services.get_chat(c, -100)
+    assert chat_before is not None
+    assert chat_before.blocked is True  # registration untouched by opening the conflict
+
+    async with db.transaction() as c:
+        revoke_result = await services.revoke_admin(c, 5)
+    assert revoke_result.revoked is True
+    assert revoke_result.chat_ids == [-100]
+
+    async with db.reader() as c:
+        role_after = await services.get_role(c, 5)
+        chat_after = await services.get_chat(c, -100)
+        conflicts = await services.list_conflicts(c, status="open")
+        cursor = await c.execute(
+            "SELECT COUNT(*) FROM outbox WHERE target_kind = 'chat' AND target_id = -100"
+        )
+        (farewell_rows,) = await cursor.fetchone()
+
+    assert role_after is None  # revocation applied despite the block
+    assert chat_after is None  # the chat's registration is gone too
+    assert any(row.conflict_id == conflict_id for row in conflicts)  # conflict stays open
+    assert farewell_rows == 0  # no farewell -- deliverable or not -- was ever queued
+
+    # confirm at the transport level too: an outbox run sends nothing for -100
+    clock = FakeClock()
+    transport = RecordingTransport()
+    delivery = Delivery(db, Services(clock=clock), transport, clock=clock)
+    delivered = await delivery.run_outbox_once()
+    assert delivered == 0
+    assert transport.calls == []
 
 
 async def test_is_blocked_true_for_any_id_in_the_alias_group(db: Database):

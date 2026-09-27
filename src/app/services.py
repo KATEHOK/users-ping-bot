@@ -480,6 +480,13 @@ class Services:
         # farewell:<chat_id>:<generation> is deterministic and collision-free: a chat
         # only ever gets one farewell per registration generation, and generation is
         # a monotonic counter shared by all chats, so the key never repeats by chance.
+        if await self.is_blocked(c, chat_id):
+            # plan section 12: a chat inside an open migration conflict's scope is
+            # never messaged, including a farewell -- queuing one anyway would just
+            # accumulate an undeliverable event until an operator resets the conflict.
+            # Role/registration revocation itself still applies; only the message is
+            # suppressed (see `revoke_admin`/`set_root`/`remove_chat_cascade` callers).
+            return
         await self.queue_event(
             c,
             event_key=f"farewell:{chat_id}:{generation}",

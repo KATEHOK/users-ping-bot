@@ -61,6 +61,23 @@ def _group_event(text, *, update_id, user_id, chat_id=CHAT, message_id=None, **k
     return make_event(**defaults)
 
 
+def _private_event(text, *, update_id, user_id, message_id=None, **kwargs):
+    defaults = dict(
+        kind="message",
+        chat_type="private",
+        chat_id=user_id,
+        update_id=update_id,
+        user_id=user_id,
+        username=f"user{user_id}",
+        display_name=f"User{user_id}",
+        message_id=message_id or update_id,
+        text=text,
+        entities=_entities(text),
+    )
+    defaults.update(kwargs)
+    return make_event(**defaults)
+
+
 async def _register_chat(db, services, chat_id, registrar_id):
     async with db.transaction() as c:
         await services.touch_user(c, registrar_id)
@@ -200,13 +217,19 @@ async def test_concurrent_cli_set_root_and_telegram_admin_create_do_not_corrupt_
 
 @pytest.mark.asyncio
 async def test_concurrent_admin_remove_and_register_leaves_consistent_state(tmp_path):
+    # punch-list P1, bullet 3: an /admin-remove-style cascade racing a chat
+    # register must leave no chat row referencing the revoked admin and no
+    # orphaned subscription, in either possible commit order.
     path = str(tmp_path / "race_admin_remove_register.sqlite3")
     A = 7
+    SUB = 55
     async with open_database(path) as boot:
         async with boot.transaction() as c:
             await Services().touch_user(c, A)
             await Services().grant_admin(c, A)
             await Services().register_chat(c, -100, "First", A)
+            await Services().touch_user(c, SUB)
+            await Services().subscribe(c, -100, SUB)
 
     db_remove = Database(path)
     db_register = Database(path)
@@ -234,21 +257,200 @@ async def test_concurrent_admin_remove_and_register_leaves_consistent_state(tmp_
             role_a = await services.get_role(c, A)
             chat_100 = await services.get_chat(c, -100)
             chat_200 = await services.get_chat(c, -200)
+            cursor = await c.execute("SELECT COUNT(*) FROM subscriptions WHERE chat_id = -100")
+            (subs_on_100,) = await cursor.fetchone()
     finally:
         await check.close()
 
     if role_a is None:
         # the cascade committed at some point; the chat that existed before
-        # either coroutine started is gone in every possible ordering
+        # either coroutine started is gone in every possible ordering, and its
+        # subscription went with it via the FK cascade -- no orphan left behind
         assert chat_100 is None
+        assert subs_on_100 == 0
         # -200 only survives if it was registered after the cascade had already
         # run (services.register_chat performs no role check of its own -- the
         # handler layer is what would have refused this before ever mutating)
     else:
         # register_chat committed first and observed A still admin throughout;
-        # nothing was removed
+        # nothing was removed, so no chat row references a revoked admin and
+        # the original subscription is exactly as it was, not duplicated
         assert chat_100 is not None
         assert chat_200 is not None
+        assert subs_on_100 == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_set_root_race_never_leaves_two_roots_or_partial_cascade(tmp_path):
+    # punch-list P1, bullet 1: a real root with real chats races two challengers
+    # for root at once. "Never leaves a partial cascade" means the loser's view
+    # of the old root's chats is never half-dropped: both chats disappear
+    # together, exactly once, and the root_revoked notice is queued exactly once.
+    path = str(tmp_path / "race_root_cascade.sqlite3")
+    async with open_database(path) as boot:
+        async with boot.transaction() as c:
+            svc = Services()
+            await svc.touch_user(c, 1, private_contact=True)
+            await svc.set_root(c, 1)
+            await svc.register_chat(c, -900, "Root chat 1", 1)
+            await svc.register_chat(c, -901, "Root chat 2", 1)
+            await svc.touch_user(c, 2)
+            await svc.touch_user(c, 3)
+
+    db_a = Database(path)
+    db_b = Database(path)
+    await db_a.connect()
+    await db_b.connect()
+    services = Services()
+    try:
+        async def set_root_via(conn_db, user_id):
+            async with conn_db.transaction() as c:
+                return await services.set_root(c, user_id)
+
+        await asyncio.gather(set_root_via(db_a, 2), set_root_via(db_b, 3))
+    finally:
+        await db_a.close()
+        await db_b.close()
+
+    check = Database(path)
+    await check.connect()
+    try:
+        async with check.reader() as c:
+            cursor = await c.execute("SELECT user_id FROM roles WHERE role = 'root'")
+            roots = await cursor.fetchall()
+            role_1 = await services.get_role(c, 1)
+            chat_900 = await services.get_chat(c, -900)
+            chat_901 = await services.get_chat(c, -901)
+            cursor = await c.execute(
+                "SELECT event_type, target_id, status FROM outbox ORDER BY event_id"
+            )
+            events = await cursor.fetchall()
+    finally:
+        await check.close()
+
+    assert len(roots) == 1
+    assert roots[0][0] in (2, 3)
+    assert role_1 is None
+    # the old root's chats are gone in full: never one dropped and one left
+    assert chat_900 is None
+    assert chat_901 is None
+    farewells = sorted(
+        (target_id, status) for (etype, target_id, status) in events if etype == "chat_farewell"
+    )
+    assert farewells == [(-901, "pending"), (-900, "pending")]  # both, exactly once each
+    root_revoked = [e for e in events if e[0] == "root_revoked"]
+    assert len(root_revoked) == 1  # queued exactly once, by whichever op saw user 1 as root
+    assert root_revoked[0][1] == 1
+
+
+@pytest.mark.asyncio
+async def test_permission_check_after_other_connections_commit_observes_new_rights(tmp_path):
+    # punch-list P1, bullet 2: a permission check that BEGINS after another
+    # connection's commit must see the new rights -- the bot side keeps no
+    # per-connection cache of a role, so nothing here needs invalidating.
+    path = str(tmp_path / "rights_visibility.sqlite3")
+    async with open_database(path) as boot:
+        async with boot.transaction() as c:
+            await Services().touch_user(c, 999)  # will become root via connection A
+            await Services().touch_user(c, 500)  # target of the admin grant
+
+    db_a = Database(path)  # stands in for the CLI
+    db_b = Database(path)  # stands in for the running bot process
+    await db_a.connect()
+    await db_b.connect()
+    try:
+        ctx, _services_b, transport, _clock = _mk_ctx(db_b)
+
+        # before any role exists, /admin create is denied for user 999 on B
+        denied_event = _private_event("/admin create 500", update_id=1, user_id=999)
+        await handle_event(ctx, denied_event)
+        assert transport.calls == []
+
+        # connection A grants root to 999 and commits -- a fully separate connection
+        async with db_a.transaction() as c:
+            await Services().set_root(c, 999)
+
+        # the very next check, on connection B, begins strictly after A's commit
+        allowed_event = _private_event("/admin create 500", update_id=2, user_id=999)
+        await handle_event(ctx, allowed_event)
+    finally:
+        await db_a.close()
+        await db_b.close()
+
+    assert len(transport.calls) == 1
+    assert "Granted admin to user 500" in transport.calls[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_ping_last_check_boundary_write_lands_between_check_and_send(tmp_path):
+    """Punch-list P1, bullet 4 (plan section 9's last-check boundary).
+
+    Connection A runs the ping; connection B is a fully independent connection
+    to the same file that commits an unsubscribe while A's first chunk send is
+    in flight. The plan's own promise is narrow: the chunk A already built
+    from its last check is allowed to go out as-is; only the *next* re-check
+    (before building the following chunk) must see B's write. It does not
+    promise the in-flight chunk itself reflects B's commit -- that would be a
+    stronger guarantee than the plan makes.
+
+    Both connections run on the same event loop, so B's write is driven from
+    an explicit await point inside A's send call rather than a true OS-level
+    race; SQLite's own file locking would serialize a genuinely concurrent
+    write the same way, so the outcome checked here does not depend on that.
+    """
+    path = str(tmp_path / "boundary.sqlite3")
+    async with open_database(path) as boot:
+        async with boot.transaction() as c:
+            svc = Services()
+            await svc.touch_user(c, 1)
+            await svc.grant_admin(c, 1)  # initiator needs a ground to ping at all
+            reg = await svc.register_chat(c, -500, "Chat", 1)
+            for uid in (90001, 90002, 90003):
+                await svc.touch_user(c, uid, display_name=f"User{uid}")
+                await svc.subscribe(c, -500, uid)
+
+    db_a = Database(path)
+    db_b = Database(path)
+    await db_a.connect()
+    await db_b.connect()
+    clock = FakeClock()
+    services_a = Services(clock=clock)
+    transport = RecordingTransport()
+    delivery = Delivery(db_a, services_a, transport, clock=clock)
+
+    original_send = transport.send_message
+    raced = False
+
+    async def send_then_race(chat_id, text, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            # connection B's commit lands here: after A already built and
+            # peeled this chunk from its last check, before this send returns
+            async with db_b.transaction() as c:
+                await Services(clock=clock).unsubscribe(c, chat_id, 90002)
+        await original_send(chat_id, text, **kwargs)
+
+    transport.send_message = send_then_race
+
+    try:
+        async with db_a.reader() as c:
+            subs = await services_a.list_subscribers(c, -500)
+        snapshot = [
+            SubscriberRef(s.user_id, s.subscription_id, s.display_name, s.username)
+            for s in subs
+        ]
+        await delivery.run_ping(-500, 1, MSG, THREAD, reg.generation, snapshot, chunk_limit=10)
+    finally:
+        await db_a.close()
+        await db_b.close()
+
+    seen: list[int] = []
+    for call in transport.calls:
+        seen.extend(_ids_in(call["text"]))
+    assert 90001 in seen  # already-checked fragment: sent regardless of B's later write
+    assert 90003 in seen  # untouched recipient still reached by the next chunk
+    assert 90002 not in seen  # the NEXT re-check saw B's commit and excluded it
 
 
 # --- notify-off is not blocked behind a stalled/retrying ping ---

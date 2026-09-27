@@ -3,6 +3,7 @@ import logging
 import pytest
 
 from app.clock import iso
+from app.db import Database, open_database
 from app.delivery import AmbiguousSend, Delivery, PermanentSend, RateLimited
 from app.services import Services
 
@@ -190,6 +191,92 @@ async def test_unexpected_error_in_one_event_does_not_stop_the_batch(db):
     assert delivered == 1  # CHAT_B still delivered despite CHAT_A raising unexpectedly
     chat_ids_sent = {call["chat_id"] for call in transport.calls}
     assert CHAT_B in chat_ids_sent
+
+
+@pytest.mark.asyncio
+async def test_root_revoked_permanent_failure_leaves_role_change_untouched(db):
+    # punch-list P2: a root_revoked notice hits a PermanentSend (the demoted
+    # root blocked the bot); the role change that queued the notice must stand
+    # regardless -- the outbox worker only ever calls services.mark_event, it
+    # never re-reads or reverts role state on any delivery outcome.
+    delivery, services, transport, clock = _mk_delivery(db)
+    async with db.transaction() as c:
+        await services.touch_user(c, 10, private_contact=True)
+        await services.set_root(c, 10)
+    async with db.transaction() as c:
+        await services.set_root(c, 11)  # queues a root_revoked notice for user 10
+
+    transport.fail_chat(10, PermanentSend())
+    delivered = await delivery.run_outbox_once()
+
+    assert delivered == 0
+    async with db.reader() as c:
+        cursor = await c.execute(
+            "SELECT status, last_error FROM outbox WHERE event_type = 'root_revoked'"
+        )
+        status, last_error = await cursor.fetchone()
+        root = await services.get_root(c)
+        role_10 = await services.get_role(c, 10)
+    assert status == "failed"
+    assert last_error == "permanent"
+    assert root == 11  # new root stands
+    assert role_10 is None  # demoted root stays demoted; nothing was rolled back
+
+
+@pytest.mark.asyncio
+async def test_run_outbox_once_skips_event_cancelled_between_fetch_and_final_check(tmp_path):
+    # punch-list P3: drives Delivery.run_outbox_once() itself (not just the
+    # services-level status transition) through fetch-then-cancel, using a
+    # genuinely separate connection for the cancelling write.
+    path = str(tmp_path / "cancel_race.sqlite3")
+    async with open_database(path) as boot:
+        async with boot.transaction() as c:
+            svc = Services()
+            await svc.touch_user(c, 1)
+            await svc.register_chat(c, CHAT_A, "Chat A", 1)
+            await svc.unregister_chat(c, CHAT_A)  # queues a pending farewell
+
+    db_worker = Database(path)
+    db_canceller = Database(path)
+    await db_worker.connect()
+    await db_canceller.connect()
+    clock = FakeClock()
+    services = Services(clock=clock)
+    transport = RecordingTransport()
+    delivery = Delivery(db_worker, services, transport, clock=clock)
+
+    real_due_events = services.due_events
+    cancelled_event_id: list[int] = []
+
+    async def due_events_then_race_cancel(c, now_iso, limit=10):
+        events = await real_due_events(c, now_iso, limit=limit)
+        assert len(events) == 1  # exactly the farewell the worker was meant to fetch
+        cancelled_event_id.append(events[0].event_id)
+        # a second, independent connection cancels the event right after the
+        # worker fetched it -- before the worker's own per-event re-check
+        async with db_canceller.transaction() as c2:
+            await Services(clock=clock).cancel_chat_events(c2, CHAT_A)
+        return events
+
+    services.due_events = due_events_then_race_cancel
+
+    try:
+        delivered = await delivery.run_outbox_once()
+    finally:
+        await db_worker.close()
+        await db_canceller.close()
+
+    assert delivered == 0
+    assert transport.calls == []  # zero transport calls for the cancelled event
+
+    check = Database(path)
+    await check.connect()
+    try:
+        async with check.reader() as c:
+            status = await services.event_status(c, cancelled_event_id[0])
+    finally:
+        await check.close()
+    assert status == "cancelled"  # stays cancelled; the worker's re-check never flips it
 
 
 @pytest.mark.asyncio
