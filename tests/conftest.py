@@ -1,3 +1,6 @@
+import builtins
+import os
+import socket as socket_module
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -6,6 +9,54 @@ import pytest
 from app.clock import Clock
 from app.db import Database, apply_migrations
 from app.models import IncomingEvent
+
+# Plan section 15 requires that the whole suite runs against temp databases and
+# fake transports only: no production .env, no network sockets. The two guards
+# below fail loudly (rather than silently letting a stray real access through)
+# so a future test cannot accidentally reintroduce either dependency.
+
+# Env vars a real production .env could set (see .env.example). No test may rely
+# on these being present via plain os.environ fallback: every test either passes
+# an explicit env mapping to config.load_config()/load_db_path(), or
+# monkeypatch.setenv()s its own value.
+_PRODUCTION_ENV_VARS = (
+    "VAULT_ADDR",
+    "VAULT_ROLE_ID",
+    "VAULT_SECRET_ID",
+    "VAULT_SECRET_PATH",
+    "VAULT_AUTH_MOUNT",
+    "VAULT_KV_MOUNT",
+    "VAULT_CA_PATH",
+    "VAULT_TIMEOUT",
+    "UPB_DB_PATH",
+    "UPB_LOG_LEVEL",
+)
+
+_REAL_ENV_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, ".env"))
+_ORIGINAL_OPEN = builtins.open
+
+
+def _guarded_open(file, *args, **kwargs):
+    if isinstance(file, (str, bytes, os.PathLike)):
+        if os.path.abspath(os.fspath(file)) == _REAL_ENV_FILE:
+            raise AssertionError("tests must never read the repository's real .env file")
+    return _ORIGINAL_OPEN(file, *args, **kwargs)
+
+
+def _guarded_connect(self, address):
+    # blocks only actual outbound connection attempts, never plain socket
+    # construction: asyncio's own event loop wiring (e.g. its self-pipe) uses
+    # a local AF_UNIX socketpair() internally (no connect() call) and keeps working
+    raise AssertionError(f"tests must never open a real network connection to {address!r}")
+
+
+@pytest.fixture(autouse=True)
+def _no_network_no_production_env(monkeypatch):
+    monkeypatch.setattr(builtins, "open", _guarded_open)
+    monkeypatch.setattr(socket_module.socket, "connect", _guarded_connect)
+    monkeypatch.setattr(socket_module.socket, "connect_ex", _guarded_connect)
+    for name in _PRODUCTION_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 class FakeClock(Clock):

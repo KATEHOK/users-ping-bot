@@ -428,3 +428,54 @@ async def test_unregister_then_register_then_replay_of_unregister(db):
         chat_after_replay = await services.get_chat(c, CHAT)
     assert chat_after_replay is not None
     assert chat_after_replay.registration_generation == chat_before_replay.registration_generation
+
+
+# --- private-scope command text sent inside a group never does anything ---
+#
+# Section 15 bullet: "private commands do not work in group." parse_group_command
+# only ever recognises "/upb ..." text (see commands.py), so "/admin ..."/"/chat ..."
+# text hits the same "not a recognised /upb subcommand" silent path as any unknown
+# command -- this is asserted directly, for a root actor, rather than only inferred
+# from reading commands.py.
+
+PRIVATE_ONLY_TEXTS = [
+    "/admin list",
+    "/admin create 5",
+    "/admin remove 5",
+    "/chat list",
+    "/chat remove -100",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", PRIVATE_ONLY_TEXTS)
+async def test_private_scope_commands_are_silent_and_inert_in_a_group(db, text):
+    ctx, services, transport, clock = _mk_ctx(db)
+    await _make_root(db, services, ACTOR)
+    await _register_chat(db, services, CHAT, REGISTRAR)
+
+    async with db.reader() as c:
+        admins_before = await services.list_admins(c)
+        chat_before = await services.get_chat(c, CHAT)
+
+    event = make_event(
+        kind="message",
+        chat_type="group",
+        chat_id=CHAT,
+        update_id=1,
+        user_id=ACTOR,
+        username=f"user{ACTOR}",
+        display_name=f"User{ACTOR}",
+        message_id=1,
+        text=text,
+        entities=_entities(text),
+    )
+    await handle_event(ctx, event)
+
+    assert transport.calls == []  # not even a private-command reply leaks into the group
+
+    async with db.reader() as c:
+        admins_after = await services.list_admins(c)
+        chat_after = await services.get_chat(c, CHAT)
+    assert admins_after == admins_before  # no admin created/removed
+    assert chat_after == chat_before  # no chat removed

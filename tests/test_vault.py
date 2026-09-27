@@ -175,6 +175,27 @@ def test_read_kv_timeout_retries_then_fails():
     assert "token" not in str(exc_info.value).lower() or TOKEN_MARKER not in str(exc_info.value)
 
 
+def test_login_tls_failure_gives_safe_diagnosis_no_secrets():
+    # an invalid/untrusted TLS certificate surfaces as requests.exceptions.SSLError,
+    # a RequestException subclass; it must map to a safe VaultError, never a raw
+    # exception message that could carry a hostname, path or certificate detail.
+    session = FakeSession(
+        post_responses=[
+            requests.exceptions.SSLError(f"certificate verify failed for {SECRET_MARKER}.example")
+        ],
+        get_responses=[],
+    )
+    client = VaultClient(
+        "https://vault.example.com", SECRET_MARKER, "the-secret-id", session=session
+    )
+    with pytest.raises(VaultError) as exc_info:
+        client.read_kv("upb")
+    message = str(exc_info.value)
+    assert SECRET_MARKER not in message
+    assert "certificate" not in message
+    assert "SSLError" in message  # safe: only the exception class name is reported
+
+
 def test_login_failure_never_leaks_body_or_ids():
     session = FakeSession(
         post_responses=[FakeResponse(400, text=f"bad request {SECRET_MARKER}")],

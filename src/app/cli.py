@@ -11,13 +11,16 @@ result.
 
 import argparse
 import asyncio
+import os
+import sqlite3
 import sys
-from typing import Coroutine, Sequence
+from pathlib import Path
+from typing import Callable, Coroutine, Sequence
 
 import aiosqlite
 
 from . import config
-from .db import open_database
+from .db import MIGRATIONS_DIR, open_database
 from .services import ConflictScope, ResetResult, Services, SetRootResult
 
 
@@ -55,6 +58,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reset = mc_sub.add_parser("reset", help="preview or apply a conflict reset")
     p_reset.add_argument("conflict_id", type=_positive_int)
     p_reset.add_argument("--apply", action="store_true")
+
+    p_backup = sub.add_parser(
+        "backup", help="write a consistent snapshot of the live database via the backup API"
+    )
+    p_backup.add_argument("destination_path")
+    p_backup.add_argument("--force", action="store_true", help="overwrite an existing destination")
+
+    p_verify = sub.add_parser(
+        "verify", help="check that a backup file is a usable database with the expected schema"
+    )
+    p_verify.add_argument("path")
 
     return parser
 
@@ -159,6 +173,113 @@ async def _cmd_conflicts_reset(conflict_id: int, apply: bool) -> int:
     return 0
 
 
+def _expected_schema_versions() -> list[str]:
+    return sorted(path.stem for path in MIGRATIONS_DIR.glob("*.sql"))
+
+
+def _cmd_backup(destination_path: str, force: bool) -> int:
+    """Consistent snapshot via sqlite3.Connection.backup(), safe against a live WAL db.
+
+    Opens the source read-only and lets the SQLite backup API do the copy: it
+    walks the source's own pager, so it only ever sees committed data, even if
+    another connection holds an open write transaction or has WAL frames not
+    yet checkpointed into the main file. A plain file copy of a live WAL
+    database would not have that guarantee (plan section 12).
+    """
+    source_path = config.load_db_path()
+    if not Path(source_path).is_file():
+        raise CliError(f"source database not found: {source_path}", code=2)
+
+    destination = Path(destination_path)
+    if destination.exists() and not force:
+        raise CliError(
+            f"destination already exists: {destination_path} (use --force to overwrite)",
+            code=2,
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_destination = destination.with_name(destination.name + ".tmp")
+    if tmp_destination.exists():
+        tmp_destination.unlink()
+
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    try:
+        dest = sqlite3.connect(str(tmp_destination))
+        try:
+            source.backup(dest)
+            (page_count,) = dest.execute("PRAGMA page_count").fetchone()
+        finally:
+            dest.close()
+    except sqlite3.Error as exc:
+        tmp_destination.unlink(missing_ok=True)
+        raise CliError(f"backup failed: sqlite3 error during copy ({exc.__class__.__name__})") from None
+    finally:
+        source.close()
+
+    os.replace(tmp_destination, destination)
+    byte_size = destination.stat().st_size
+
+    print(f"source={source_path}")
+    print(f"destination={destination_path}")
+    print(f"bytes={byte_size}")
+    print(f"pages={page_count}")
+    return 0
+
+
+def _cmd_verify(path: str) -> int:
+    """Open a backup read-only and confirm it is a usable, expected-schema database.
+
+    Never writes to `path`. Reports non-secret status lines only (integrity
+    check codes and schema version strings), and returns non-zero whenever the
+    file is not a usable database or its schema does not match this build's
+    migrations.
+    """
+    target = Path(path)
+    if not target.is_file():
+        raise CliError(f"backup file not found: {path}", code=1)
+
+    conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    try:
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+        except sqlite3.DatabaseError:
+            raise CliError(f"not a usable sqlite database: {path}", code=1) from None
+
+        statuses = [row[0] for row in rows]
+        if statuses != ["ok"]:
+            print(f"integrity_check_failed count={len(statuses)}")
+            for status in statuses[:20]:
+                print(f"  {status}")
+            return 1
+        print("integrity_check=ok")
+
+        try:
+            cursor = conn.execute("SELECT version FROM schema_migrations ORDER BY version")
+            versions = [row[0] for row in cursor.fetchall()]
+        except sqlite3.DatabaseError:
+            raise CliError(f"no schema_migrations table: {path}", code=1) from None
+
+        expected = _expected_schema_versions()
+        if versions != expected:
+            print(f"schema_versions_mismatch expected=[{','.join(expected)}] found=[{','.join(versions)}]")
+            return 1
+        print(f"schema_versions=[{','.join(versions)}]")
+        return 0
+    finally:
+        conn.close()
+
+
+def _run_sync(fn: Callable[..., int], *args: object) -> int:
+    try:
+        return fn(*args)
+    except CliError as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
+    except Exception as exc:  # unexpected failure: OS error, sqlite error, etc.
+        print(f"unexpected failure: {exc}", file=sys.stderr)
+        return 1
+
+
 def _run(coro: Coroutine[object, object, int]) -> int:
     try:
         return asyncio.run(coro)
@@ -189,6 +310,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run(_cmd_conflicts_show(args.conflict_id))
         if args.action == "reset":
             return _run(_cmd_conflicts_reset(args.conflict_id, args.apply))
+
+    if args.command == "backup":
+        return _run_sync(_cmd_backup, args.destination_path, args.force)
+
+    if args.command == "verify":
+        return _run_sync(_cmd_verify, args.path)
 
     parser.error("unknown command")  # pragma: no cover - unreachable, subparsers are required
     return 2
