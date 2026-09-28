@@ -5,3 +5,5 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+# database copies made by `make backup`
+backups/

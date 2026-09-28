@@ -76,9 +76,11 @@ cp .env.example .env    # заполнить VAULT_* и APP_VERSION
 ### 3. Сборка и запуск
 
 ```sh
-docker build -t ping-pong-bot:"$(grep ^APP_VERSION .env | cut -d= -f2)" .
-docker compose up -d
+make build    # docker build с тегом APP_VERSION из .env
+make up       # docker compose up -d
 ```
+
+`make` без аргументов покажет все цели: тесты, сборку, запуск, логи, назначение root, бэкап и проверку копии. Ниже приведены и сами команды — на случай работы без make.
 
 БД живёт в именованном томе `upb-data` (`/data` в контейнере).
 
@@ -87,6 +89,8 @@ docker compose up -d
 Назначить root, при работающем боте или остановленном:
 
 ```sh
+make set-root ID=<telegram_user_id>
+# то же без make:
 docker compose run --rm --entrypoint python ping-pong-bot -m app.cli set-root <telegram_user_id>
 ```
 
@@ -106,7 +110,7 @@ docker compose run --rm --entrypoint python ping-pong-bot -m app.cli set-root <t
 
 > Не выполняйте `docker compose down -v`: флаг `-v` удаляет том с БД.
 
-**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. Каталог `backups/` должен быть доступен на запись пользователю с UID 10001.
+**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. `make backup` делает копию в `backups/` и сразу проверяет её; `make verify FILE=backups/<файл>` проверяет готовую копию. Вручную — так (каталог `backups/` должен быть доступен на запись пользователю с UID 10001):
 
 ```sh
 mkdir -p backups
@@ -161,8 +165,7 @@ docker compose start
 ## Разработка
 
 ```sh
-python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/pytest
+make test    # создаёт .venv при первом запуске; ARGS="-k ..." передаёт аргументы pytest
 ```
 
 Тесты работают на временной SQLite и фейковых транспортах. Они не читают `.env` и не ходят в сеть.
