@@ -110,11 +110,11 @@ docker compose run --rm --entrypoint python users-ping-bot -m app.cli set-root <
 
 > Не выполняйте `docker compose down -v`: флаг `-v` удаляет том с БД.
 
-**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. Все шаги идут через том данных, поэтому права на каталоги хоста не важны. `make backup`:
+**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. Все шаги идут через том данных, поэтому права на каталоги хоста не важны. Файлы передаются потоком через stdin/stdout одноразового контейнера от пользователя сервиса (uid 10001), а не `docker compose cp`: так файл в томе принадлежит нужному пользователю, а копия на хосте — оператору (по его umask). Флаг `-T` (без TTY) обязателен: иначе поток портится. `make backup`:
 - создаёт `backups/` и выставляет ему режим 0750 (это же исправляет каталог 0777 от старого `Makefile`);
 - пишет копию внутрь тома (`/data/backups/`) и проверяет её там;
-- копирует проверенную копию в `backups/` на хосте;
-- только после успешного копирования удаляет копию внутри тома (полный том ломает запись в БД). Если копирование не удалось, копия в томе остаётся.
+- передаёт проверенную копию потоком в `backups/<имя>.part` на хосте и переименовывает в `<имя>` только после успеха (оборванная передача не выглядит готовым бэкапом);
+- только после этого удаляет копию внутри тома (полный том ломает запись в БД). Если копирование не удалось, копия в томе остаётся.
 
 Имя файла — `upb-<дата>_<ччммсс>.sqlite3`. `BACKUP_FILE=<имя>` задаёт только имя файла (каталог из значения отбрасывается: копия всегда в `backups/`). Вручную:
 
@@ -123,31 +123,34 @@ mkdir -p backups && chmod 0750 backups
 f=upb-$(date +%F_%H%M%S).sqlite3
 docker compose run --rm --entrypoint python users-ping-bot -m app.cli backup /data/backups/$f
 docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/$f
-docker compose cp users-ping-bot:/data/backups/$f backups/$f
-docker compose run --rm --entrypoint sh users-ping-bot -c "rm -f /data/backups/$f"
+docker compose run --rm -T --entrypoint sh users-ping-bot -c "cat /data/backups/$f" > backups/$f.part &&
+  mv backups/$f.part backups/$f &&
+  docker compose run --rm --entrypoint sh users-ping-bot -c "rm -f /data/backups/$f"
 ```
 
-`docker compose cp` требует, чтобы контейнер сервиса существовал (после `make up`; запущенный или остановленный — неважно). Копия на хосте принадлежит оператору.
+Существующий контейнер сервиса не нужен.
 
-`make verify FILE=backups/<файл>` сначала копирует файл с хоста в том (`/data/backups/`), затем проверяет его там; копия в томе остаётся, удалите её сами, когда она не нужна. Вручную:
+`make verify FILE=backups/<файл>` сначала передаёт файл с хоста в том (`/data/backups/`) потоком, затем проверяет его там и в любом случае удаляет копию из тома (данные остаются на хосте). Вручную:
 
 ```sh
 docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups'
-docker compose cp backups/<файл> users-ping-bot:/data/backups/<файл>
+docker compose run --rm -T --entrypoint sh users-ping-bot -c 'cat > /data/backups/<файл>' < backups/<файл>
 docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/<файл>
+docker compose run --rm --entrypoint sh users-ping-bot -c 'rm -f /data/backups/<файл>'
 ```
 
 Копия — один самодостаточный файл. На существующий файл бэкап пишет только с `--force`, а на рабочую базу и её `-wal`/`-shm`/`-journal` не пишет никогда.
 
-**Восстановление** — при остановленном боте, после `make verify` нужной копии. Копия сначала кладётся в том, затем одной командой копируется во временный файл рядом с БД; только если это удалось, убираются старые `-wal`/`-shm` (иначе SQLite применит их к восстановленному файлу) и временный файл переименовывается поверх БД. Сбой копирования оставляет текущую БД нетронутой.
+**Восстановление** — при остановленном боте, после `make verify` нужной копии. Копия сначала передаётся потоком в том, затем одной командой копируется во временный файл рядом с БД; только если это удалось, убираются старые `-wal`/`-shm` (иначе SQLite применит их к восстановленному файлу), временный файл переименовывается поверх БД и удаляется копия в `/data/backups/`. Сбой любого шага оставляет текущую БД нетронутой.
 
 ```sh
 docker compose stop
 docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups'
-docker compose cp backups/<файл> users-ping-bot:/data/backups/<файл>
+docker compose run --rm -T --entrypoint sh users-ping-bot -c 'cat > /data/backups/<файл>' < backups/<файл>
 docker compose run --rm --entrypoint sh users-ping-bot -c \
   'cp /data/backups/<файл> /data/upb.sqlite3.restore || { rm -f /data/upb.sqlite3.restore; exit 1; }
-   rm -f /data/upb.sqlite3-wal /data/upb.sqlite3-shm && mv /data/upb.sqlite3.restore /data/upb.sqlite3'
+   rm -f /data/upb.sqlite3-wal /data/upb.sqlite3-shm && mv /data/upb.sqlite3.restore /data/upb.sqlite3 &&
+   rm -f /data/backups/<файл>'
 docker compose start
 ```
 
