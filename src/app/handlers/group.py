@@ -1,4 +1,4 @@
-"""Group command handlers (decisions sections 1-3)."""
+"""Group command handlers."""
 
 from __future__ import annotations
 

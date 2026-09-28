@@ -160,7 +160,7 @@ async def test_membership_events_for_an_aliased_old_id_are_ignored(db):
     assert await _q(db, "SELECT COUNT(*) FROM processed_updates WHERE outcome = 'ignored'") == [(3,)]
 
 
-# --- cascades through the command handlers (decisions 5) ---
+# --- cascades through the command handlers ---
 
 
 async def test_admin_remove_sends_a_farewell_per_chat_in_each_chat_language(db):
@@ -189,7 +189,7 @@ async def test_set_root_cascade_keeps_the_new_roots_chats(db):
     assert [c["chat_id"] for c in transport.calls] == [502]
 
 
-# --- migration (decisions 7.1, 7.2, 7.4) ---
+# --- migration ---
 
 
 async def test_migration_moves_registration_language_and_subscriptions(db):

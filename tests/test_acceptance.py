@@ -381,7 +381,7 @@ async def test_permission_check_after_other_connections_commit_observes_new_righ
 
 @pytest.mark.asyncio
 async def test_ping_snapshot_is_final_when_another_connection_unsubscribes_mid_ping(tmp_path):
-    """Decisions 6.1: recipients are fixed at the command and never re-filtered."""
+    """Recipients are fixed at the command and never re-filtered."""
     path = str(tmp_path / "boundary.sqlite3")
     async with open_database(path) as boot:
         async with boot.transaction() as c:

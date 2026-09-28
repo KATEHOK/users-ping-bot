@@ -262,7 +262,7 @@ def test_usage_filters_by_prefix():
     assert _syntax_lines(text) == {"/lang &lt;en|ru&gt;"}
 
 
-def test_usage_examples_from_decisions():
+def test_usage_examples_per_actor_and_scope():
     def lines(actor, scope, active, prefix):
         return _syntax_lines(usage_text(actor, scope=scope, chat_active=active, prefix=prefix, lang="en"))
 

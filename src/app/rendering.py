@@ -50,7 +50,6 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "Recipients are fixed at the command. Delivery is not guaranteed.",
         "\u041f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u0438 \u0444\u0438\u043a\u0441\u0438\u0440\u0443\u044e\u0442\u0441\u044f \u0432 \u043c\u043e\u043c\u0435\u043d\u0442 \u043a\u043e\u043c\u0430\u043d\u0434\u044b. \u0414\u043e\u0441\u0442\u0430\u0432\u043a\u0430 \u043d\u0435 \u0433\u0430\u0440\u0430\u043d\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f.",
     ),
-    # not in decisions section 10
     "help_title": ("Commands:", "\u041a\u043e\u043c\u0430\u043d\u0434\u044b:"),
     "help_register_hint": (
         "To register a group: add the bot there and send /upb chat register.",

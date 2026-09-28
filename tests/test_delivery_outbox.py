@@ -232,3 +232,28 @@ async def test_outbox_loop_stops_promptly_on_stop(db):
     assert not task.done()
     stop.set()
     await asyncio.wait_for(task, 2)
+
+
+async def test_failed_sent_mark_never_resends_and_only_the_write_is_retried(db, caplog):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services)
+    real_mark = services.mark_event
+    failing = {"on": True}
+
+    async def flaky(c, event_id, status, **kw):
+        if status == "sent" and failing["on"]:
+            raise RuntimeError("database is locked")
+        return await real_mark(c, event_id, status, **kw)
+
+    services.mark_event = flaky  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        assert await delivery.run_outbox_once() == 1
+        assert await delivery.run_outbox_once() == 0
+        assert await delivery.run_outbox_once() == 0
+    assert len(transport.calls) == 1  # sent once, however often the write fails
+    assert (await _event(db, services, eid)).status == "pending"
+    assert any(f"event_id={eid}" in r.getMessage() for r in caplog.records)
+    failing["on"] = False
+    assert await delivery.run_outbox_once() == 0
+    assert len(transport.calls) == 1
+    assert (await _event(db, services, eid)).status == "sent"

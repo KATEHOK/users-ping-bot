@@ -15,7 +15,7 @@ async def test_grant_admin_created(db: Database):
 
 
 async def test_grant_admin_by_id_before_first_contact(db: Database):
-    # decisions section 4: admin can be granted before the user ever wrote to the bot
+    # admin can be granted before the user ever wrote to the bot
     services = Services()
     async with db.transaction() as c:
         result = await services.grant_admin(c, 777)
@@ -330,7 +330,7 @@ async def test_set_root_drops_previous_root_chats_with_farewells_and_subscriptio
     assert [(e.event_type, e.target_id) for e in events] == [("chat_farewell", -100)]
 
 
-async def test_claim_update_records_outcome_and_prune_deletes_old_rows(db: Database):
+async def test_claim_update_and_prune_deletes_old_rows(db: Database):
     from datetime import datetime, timedelta, timezone
 
     from app.clock import iso
@@ -339,8 +339,8 @@ async def test_claim_update_records_outcome_and_prune_deletes_old_rows(db: Datab
     clock = FakeClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
     services = Services(clock=clock)
     async with db.transaction() as c:
-        assert await services.claim_update(c, 1, 1, "ignored")
-        assert await services.claim_update(c, 1, 2, "error")
+        assert await services.claim_update(c, 1, 1)
+        assert await services.claim_update(c, 1, 2)
     clock.advance(3 * 86400)
     async with db.transaction() as c:
         assert await services.claim_update(c, 1, 3)
@@ -355,5 +355,5 @@ async def test_claim_update_records_outcome_and_prune_deletes_old_rows(db: Datab
         assert await cursor.fetchall() == [(3, "ok")]
     async with db.transaction() as c:
         # a pruned update id is claimable again
-        assert await services.claim_update(c, 1, 1, "ignored")
+        assert await services.claim_update(c, 1, 1)
         assert await services.prune_processed_updates(c, older_than=cutoff) == 0

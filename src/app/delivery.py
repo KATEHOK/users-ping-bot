@@ -119,6 +119,8 @@ class Delivery:
         self._transport = transport
         self._clock = clock
         self.stop = stop if stop is not None else asyncio.Event()
+        # sent, but the status write failed: never resend, only retry the write
+        self._sent_unmarked: set[int] = set()
 
     # --- replies and ping ---
 
@@ -243,6 +245,11 @@ class Delivery:
         async with self._db.reader() as c:
             event = await self._services.get_event(c, stale.event_id)
         if event is None or event.status != "pending":
+            if event is not None:
+                self._sent_unmarked.discard(event.event_id)
+            return False
+        if event.event_id in self._sent_unmarked:
+            await self._mark_sent(event)
             return False
 
         text = self._render_outbox_text(event)
@@ -272,9 +279,21 @@ class Delivery:
             await self._finish(event, error="ambiguous", retryable=True)
             return False
 
-        async with self._db.transaction() as c:
-            await self._services.mark_event(c, event.event_id, "sent")
+        await self._mark_sent(event)
         return True
+
+    async def _mark_sent(self, event: OutboxEvent) -> None:
+        """Record a delivered event. On failure remember it so it is never sent again."""
+        try:
+            async with self._db.transaction() as c:
+                await self._services.mark_event(c, event.event_id, "sent")
+        except Exception as exc:
+            self._sent_unmarked.add(event.event_id)
+            logger.error(
+                "outbox_mark_sent_failed event_id=%s exc=%s", event.event_id, type(exc).__name__
+            )
+        else:
+            self._sent_unmarked.discard(event.event_id)
 
     async def run_outbox_once(self) -> int:
         now_iso = iso(self._clock.now())

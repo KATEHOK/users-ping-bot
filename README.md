@@ -106,20 +106,21 @@ docker compose run --rm --entrypoint python users-ping-bot -m app.cli set-root <
 
 ## Эксплуатация
 
-**Обновление.** Соберите образ с новым тегом, поменяйте `APP_VERSION` в `.env` и выполните `docker compose up -d`. Данные остаются в томе.
+**Обновление.** Соберите образ с новым тегом, поменяйте `APP_VERSION` в `.env` и выполните `docker compose up -d`. Данные остаются в томе. Если контейнер от старого compose-файла (например, под прежним именем сервиса) ещё существует, `docker compose up -d --remove-orphans` заменит его; иначе два процесса будут опрашивать Telegram одним токеном.
 
 > Не выполняйте `docker compose down -v`: флаг `-v` удаляет том с БД.
 
-**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. `make backup` делает копию в `backups/` и сразу проверяет её; `make verify FILE=backups/<файл>` проверяет готовую копию. Вручную — так. Каталог `backups/` должен быть доступен на запись пользователю с UID 10001, иначе бэкап завершится сообщением о правах на каталог:
+**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. `make backup` пишет копию внутрь тома данных (`/data/backups/`), проверяет её там и копирует в `backups/` на хосте; `make verify FILE=backups/<файл>` проверяет готовую копию на хосте. Вручную:
 
 ```sh
-mkdir -p -m 0750 backups
-setfacl -m u:10001:rwx,d:u:10001:rwx backups    # или: sudo chown 10001 backups
-docker compose run --rm --entrypoint python -v "$PWD/backups:/backups" \
-  users-ping-bot -m app.cli backup /backups/upb-$(date +%F).sqlite3
-docker compose run --rm --entrypoint python -v "$PWD/backups:/backups" \
-  users-ping-bot -m app.cli verify /backups/upb-$(date +%F).sqlite3
+mkdir -p backups
+f=upb-$(date +%F_%H%M).sqlite3
+docker compose run --rm --entrypoint python users-ping-bot -m app.cli backup /data/backups/$f
+docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/$f
+docker compose cp users-ping-bot:/data/backups/$f backups/$f
 ```
+
+`docker compose cp` требует, чтобы контейнер сервиса существовал (после `make up`; запущенный или остановленный — неважно). Копия на хосте принадлежит оператору и читается всеми. Копии внутри тома там и остаются, пока оператор сам их не удалит.
 
 Копия — один самодостаточный файл. На существующий файл бэкап пишет только с `--force`, а на рабочую базу и её `-wal`/`-shm`/`-journal` не пишет никогда.
 

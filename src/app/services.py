@@ -201,13 +201,12 @@ class Services:
     # --- updates ---
 
     async def claim_update(
-        self, c: aiosqlite.Connection, bot_id: int, update_id: int,
-        outcome: Literal["ok", "ignored", "error"] = "ok",
+        self, c: aiosqlite.Connection, bot_id: int, update_id: int
     ) -> bool:
         cursor = await c.execute(
             "INSERT INTO processed_updates(bot_id, update_id, processed_at, outcome) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT(bot_id, update_id) DO NOTHING",
-            (bot_id, update_id, self._now(), outcome),
+            "VALUES (?, ?, ?, 'ok') ON CONFLICT(bot_id, update_id) DO NOTHING",
+            (bot_id, update_id, self._now()),
         )
         return cursor.rowcount == 1
 
@@ -538,7 +537,7 @@ class Services:
         return group
 
     async def cancel_chat_events(self, c: aiosqlite.Connection, chat_id: int) -> int:
-        # Cancellation-across-generations rule (decisions sections 5 and 9): a chat's pending
+        # Cancellation across generations: a chat's pending
         # group events are matched by its whole alias group, not just the literal
         # id passed in, so a stale farewell queued under an old id is still found
         # after the chat has since migrated or been re-registered under aliases.

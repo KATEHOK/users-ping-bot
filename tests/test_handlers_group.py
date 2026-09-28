@@ -79,7 +79,7 @@ async def _count(db, sql, *params):
         return (await cur.fetchone())[0]
 
 
-# --- rights matrix (decisions 1, 2): a denied command makes zero transport calls ---
+# --- rights matrix: a denied command makes zero transport calls ---
 
 
 def _assert_matrix_reply(cmd: Cmd, who: str, active: bool, texts: list[str]) -> None:

@@ -6,7 +6,7 @@ Each handler runs one write transaction, in this order:
 3. Group only: canonical chat id (an old migrated id is ignored) and chat row.
 4. Actor load and the single authorization check; a denial is silent and recorded 'ignored'.
 5. Argument validation, mutation, outbox rows.
-Replies are sent only after commit and are never re-checked (decisions section 2).
+Replies are sent only after commit and are never re-checked.
 """
 
 import logging

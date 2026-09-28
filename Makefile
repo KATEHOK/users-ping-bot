@@ -54,12 +54,14 @@ set-root: _need-version ## Assign root: make set-root ID=<telegram_user_id>
 	@test -n "$(ID)" || { echo "usage: make set-root ID=<telegram_user_id>" >&2; exit 2; }
 	$(CLI) $(SERVICE) -m app.cli set-root $(ID)
 
-# The container runs as uid 10001: grant it access to the backup directory via ACL.
+# The snapshot is written inside the data volume (where uid 10001 has rights), verified
+# there, then copied out. Needs the service container to exist (`make up` once).
+BACKUP_NAME = $(notdir $(BACKUP_FILE))
 backup: _need-version ## Snapshot the live database into ./backups and verify the copy
-	@command -v setfacl >/dev/null || { echo "setfacl not found: run 'sudo chown 10001 $(BACKUP_DIR)' after creating it" >&2; exit 2; }
-	@mkdir -p -m 0750 $(BACKUP_DIR) && setfacl -m u:10001:rwx,d:u:10001:rwx $(BACKUP_DIR)
-	$(CLI) -v "$(CURDIR)/$(BACKUP_DIR):/backups" $(SERVICE) -m app.cli backup /backups/$(notdir $(BACKUP_FILE))
-	$(CLI) -v "$(CURDIR)/$(BACKUP_DIR):/backups" $(SERVICE) -m app.cli verify /backups/$(notdir $(BACKUP_FILE))
+	@mkdir -p $(BACKUP_DIR)
+	$(CLI) $(SERVICE) -m app.cli backup /data/backups/$(BACKUP_NAME)
+	$(CLI) $(SERVICE) -m app.cli verify /data/backups/$(BACKUP_NAME)
+	docker compose cp $(SERVICE):/data/backups/$(BACKUP_NAME) $(BACKUP_DIR)/$(BACKUP_NAME)
 
 verify: _need-version ## Check a backup file: make verify FILE=backups/<file>
 	@test -n "$(FILE)" || { echo "usage: make verify FILE=backups/<file>" >&2; exit 2; }

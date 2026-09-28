@@ -108,7 +108,7 @@ def _cmd_backup(destination_path: str, force: bool) -> int:
     walks the source's own pager, so it only ever sees committed data, even if
     another connection holds an open write transaction or has WAL frames not
     yet checkpointed into the main file. A plain file copy of a live WAL
-    database would not have that guarantee (decisions.md section 12).
+    database would not have that guarantee.
     """
     source_path = _abs(config.load_db_path())
     print(f"db={source_path}")

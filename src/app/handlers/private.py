@@ -1,4 +1,4 @@
-"""Private-chat command handlers (decisions section 4)."""
+"""Private-chat command handlers."""
 
 from __future__ import annotations
 

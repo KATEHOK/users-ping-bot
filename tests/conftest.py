@@ -12,7 +12,7 @@ from app.clock import Clock
 from app.db import Database, apply_migrations
 from app.models import IncomingEvent
 
-# Decisions section 17 requires that the whole suite runs against temp databases and
+# The whole suite runs against temp databases and
 # fake transports only: no production .env, no network sockets. The two guards
 # below fail loudly (rather than silently letting a stray real access through)
 # so a future test cannot accidentally reintroduce either dependency.

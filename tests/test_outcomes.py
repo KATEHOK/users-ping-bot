@@ -1,5 +1,5 @@
 """Recorded processed_updates outcome of every command path, the ping cooldown clock
-and the 'error' upsert (decisions sections 2.5, 3 and 8.1)."""
+and the 'error' upsert."""
 
 import pytest
 

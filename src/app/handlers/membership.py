@@ -1,4 +1,4 @@
-"""Membership and migration handlers (decisions sections 5 and 7)."""
+"""Membership and migration handlers."""
 
 from __future__ import annotations
 

@@ -511,7 +511,7 @@ async def test_outbox_loop_survives_a_transient_error_but_not_unauthorized(db, m
         await asyncio.wait_for(ctx.delivery.outbox_loop(asyncio.Event()), 2)
 
 
-# --- startup reconciliation and root report (decisions 11) ---
+# --- startup reconciliation and root report ---
 
 
 async def _reg_world(db, services):
@@ -896,3 +896,31 @@ def test_third_party_loggers_are_never_below_warning():
     finally:
         for n, lvl in saved.items():
             logging.getLogger(n).setLevel(lvl)
+
+
+async def test_signal_during_vault_login_aborts_startup(tmp_path, monkeypatch):
+    events = []
+
+    def fake_login(cfg):
+        for ev in events:
+            ev.set()  # a signal arrives while the login is in flight
+        return "123:tok"
+
+    def boom(*a, **kw):
+        raise AssertionError("startup must not continue")
+
+    monkeypatch.setattr(entry.config_module, "load_config", lambda: _cfg(tmp_path))
+    monkeypatch.setattr(entry.vault, "load_bot_token", fake_login)
+    monkeypatch.setattr(entry, "_install_stop_handlers", lambda s, g: events.extend([s, g]))
+    monkeypatch.setattr(entry, "Bot", boom)
+    assert await asyncio.wait_for(entry._run(), 5) == 0
+
+
+async def test_stop_before_serve_skips_reconcile_report_and_prune(db):
+    clock, stop = RecordingClock(), asyncio.Event()
+    ctx, services, _t, _c = mk_ctx(db, clock)
+    await _reg_world(db, services)
+    transport = RecordingTransport()
+    stop.set()
+    assert await _serve(db, FakeBot([], stop), clock, stop, transport) == 0
+    assert transport.probes == [] and transport.calls == []

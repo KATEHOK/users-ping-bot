@@ -69,7 +69,7 @@ def _install_stop_handlers(stop: asyncio.Event, signalled: asyncio.Event) -> Non
             pass  # signal handlers unsupported on this platform
 
 
-# --- startup reconciliation and report (decisions section 11) ---
+# --- startup reconciliation and report ---
 
 
 async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
@@ -158,6 +158,9 @@ async def serve(
         ping_cooldown_seconds=cooldown,
     )
 
+    if stop.is_set():
+        return 0  # signalled during startup: no reconciliation, report or pruning
+
     tasks: list[asyncio.Future] = []
     fatal: BaseException | None = None
     try:
@@ -203,6 +206,8 @@ async def _run() -> int:
         logger.error("vault_error exc=%s", type(exc).__name__)
         await wait_or_stop(SYSTEM_CLOCK, signalled, FATAL_PAUSE)  # a signal cuts the pause short
         return EXIT_FATAL
+    if stop.is_set():
+        return 0  # signalled during the Vault login
 
     return await _serve_with_token(cfg, token, stop, signalled)
 
