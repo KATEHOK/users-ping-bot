@@ -11,6 +11,7 @@ result.
 
 import argparse
 import asyncio
+import logging
 import os
 import sqlite3
 import sys
@@ -70,9 +71,23 @@ def _print_set_root_result(new_root_id: int, result: SetRootResult) -> None:
     )
 
 
+def _abs(path: str) -> str:
+    return str(Path(path).resolve())
+
+
 async def _cmd_set_root(user_id: int) -> int:
     services = Services()
     db_path = config.load_db_path()
+    absolute = _abs(db_path)
+    print(f"db={absolute}")
+    if not Path(db_path).exists():
+        print(
+            f"WARNING: database file not found, creating a new one: {absolute} "
+            "(check UPB_DB_PATH)",
+            file=sys.stderr,
+        )
+    # db.py also logs this; the CLI already said it, keep stderr to one line
+    logging.getLogger("app.db").setLevel(logging.ERROR)
     async with open_database(db_path) as db:
         async with db.transaction() as c:
             result = await services.set_root(c, user_id)
@@ -93,11 +108,14 @@ def _cmd_backup(destination_path: str, force: bool) -> int:
     yet checkpointed into the main file. A plain file copy of a live WAL
     database would not have that guarantee (plan section 12).
     """
-    source_path = config.load_db_path()
+    source_path = _abs(config.load_db_path())
+    print(f"db={source_path}")
     if not Path(source_path).is_file():
         raise CliError(f"source database not found: {source_path}", code=2)
 
-    destination = Path(destination_path)
+    destination = Path(destination_path).resolve()
+    if destination.exists() and os.path.samefile(source_path, destination):
+        raise CliError(f"destination is the source database itself: {destination}", code=2)
     if destination.exists() and not force:
         raise CliError(
             f"destination already exists: {destination_path} (use --force to overwrite)",
@@ -106,19 +124,25 @@ def _cmd_backup(destination_path: str, force: bool) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_destination = destination.with_name(destination.name + ".tmp")
-    if tmp_destination.exists():
-        tmp_destination.unlink()
+    if os.path.lexists(tmp_destination) and os.path.samefile(source_path, tmp_destination):
+        raise CliError(f"temporary file is the source database itself: {tmp_destination}", code=2)
+    tmp_destination.unlink(missing_ok=True)
 
-    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    source = sqlite3.connect(f"{Path(source_path).as_uri()}?mode=ro", uri=True)
     try:
         dest = sqlite3.connect(str(tmp_destination))
         try:
             source.backup(dest)
+            # one self-contained file: no -wal/-shm next to the copy
+            (mode,) = dest.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if str(mode).lower() != "delete":
+                raise sqlite3.OperationalError("could not switch copy to journal_mode=DELETE")
             (page_count,) = dest.execute("PRAGMA page_count").fetchone()
         finally:
             dest.close()
     except sqlite3.Error as exc:
-        tmp_destination.unlink(missing_ok=True)
+        for leftover in (tmp_destination, Path(f"{tmp_destination}-wal"), Path(f"{tmp_destination}-shm")):
+            leftover.unlink(missing_ok=True)
         raise CliError(f"backup failed: sqlite3 error during copy ({exc.__class__.__name__})") from None
     finally:
         source.close()
@@ -127,7 +151,7 @@ def _cmd_backup(destination_path: str, force: bool) -> int:
     byte_size = destination.stat().st_size
 
     print(f"source={source_path}")
-    print(f"destination={destination_path}")
+    print(f"destination={destination}")
     print(f"bytes={byte_size}")
     print(f"pages={page_count}")
     return 0
@@ -136,16 +160,18 @@ def _cmd_backup(destination_path: str, force: bool) -> int:
 def _cmd_verify(path: str) -> int:
     """Open a backup read-only and confirm it is a usable, expected-schema database.
 
-    Never writes to `path`. Reports non-secret status lines only (integrity
+    Never writes to `path` (immutable open). Reports non-secret status lines only (integrity
     check codes and schema version strings), and returns non-zero whenever the
     file is not a usable database or its schema does not match this build's
     migrations.
     """
-    target = Path(path)
+    target = Path(path).resolve()
+    print(f"db={target}")
     if not target.is_file():
-        raise CliError(f"backup file not found: {path}", code=1)
+        raise CliError(f"backup file not found: {target}", code=1)
 
-    conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    # immutable=1: no locks, no -shm/-journal created next to the file
+    conn = sqlite3.connect(f"{target.as_uri()}?mode=ro&immutable=1", uri=True)
     try:
         try:
             rows = conn.execute("PRAGMA integrity_check").fetchall()

@@ -67,8 +67,9 @@ def test_backup_creates_file_and_prints_summary(tmp_path, monkeypatch, capsys):
     assert cli.main(["backup", str(dest)]) == 0
 
     out = capsys.readouterr().out
-    assert f"source={src}" in out
-    assert f"destination={dest}" in out
+    assert out.splitlines()[0] == f"db={Path(src).resolve()}"
+    assert f"source={Path(src).resolve()}" in out
+    assert f"destination={dest.resolve()}" in out
     assert "bytes=" in out
     assert "pages=" in out
     assert dest.is_file()
@@ -112,6 +113,55 @@ def test_backup_missing_source_database_exits_nonzero(tmp_path, monkeypatch):
     dest = tmp_path / "backup.sqlite3"
     assert cli.main(["backup", str(dest)]) != 0
     assert not dest.exists()
+
+
+def test_backup_refuses_same_file_even_with_force(tmp_path, monkeypatch):
+    src = _db_path(tmp_path)
+    monkeypatch.setenv("UPB_DB_PATH", src)
+    _write(src, _seed_full_state)
+    before = _dump(src, "roles", "user_id")
+
+    assert cli.main(["backup", src]) == 2
+    assert cli.main(["backup", src, "--force"]) == 2
+    # same file through a different spelling / a symlink
+    alias = tmp_path / "sub" / ".." / "live.sqlite3"
+    assert cli.main(["backup", str(alias), "--force"]) == 2
+    link = tmp_path / "link.sqlite3"
+    link.symlink_to(src)
+    assert cli.main(["backup", str(link), "--force"]) == 2
+
+    assert _dump(src, "roles", "user_id") == before
+    assert cli.main(["verify", src]) == 0
+
+
+def test_backup_works_with_special_characters_in_paths(tmp_path, monkeypatch):
+    weird = tmp_path / "we?ird #dir%41"
+    weird.mkdir()
+    src = str(weird / "live?db#1.sqlite3")
+    monkeypatch.setenv("UPB_DB_PATH", src)
+    _write(src, _seed_full_state)
+
+    dest = weird / "copy?.sqlite3"
+    assert cli.main(["backup", str(dest)]) == 0
+    assert _dump(src, "roles", "user_id") == _dump(str(dest), "roles", "user_id")
+    assert cli.main(["verify", str(dest)]) == 0
+
+
+def test_backup_is_single_file_in_delete_journal_mode(tmp_path, monkeypatch):
+    src = _db_path(tmp_path)
+    monkeypatch.setenv("UPB_DB_PATH", src)
+    _write(src, _seed_full_state)  # source is WAL
+
+    dest = tmp_path / "out" / "backup.sqlite3"
+    assert cli.main(["backup", str(dest)]) == 0
+
+    assert sorted(p.name for p in dest.parent.iterdir()) == ["backup.sqlite3"]
+    conn = sqlite3.connect(f"{dest.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        conn.close()
+    assert not Path(f"{dest}-wal").exists() and not Path(f"{dest}-shm").exists()
 
 
 # --- backup: restorability and content fidelity ---
@@ -228,6 +278,33 @@ def test_verify_accepts_a_good_backup(tmp_path, monkeypatch):
     dest = str(tmp_path / "backup.sqlite3")
     assert cli.main(["backup", dest]) == 0
     assert cli.main(["verify", dest]) == 0
+
+
+def test_verify_leaves_no_files_behind(tmp_path, monkeypatch):
+    src = _db_path(tmp_path)
+    monkeypatch.setenv("UPB_DB_PATH", src)
+    _write(src, _seed_full_state)
+    outdir = tmp_path / "out"
+    dest = outdir / "backup.sqlite3"
+    assert cli.main(["backup", str(dest)]) == 0
+
+    before = {p.name: p.read_bytes() for p in outdir.iterdir()}
+    assert cli.main(["verify", str(dest)]) == 0
+    assert {p.name: p.read_bytes() for p in outdir.iterdir()} == before
+
+
+def test_verify_works_on_read_only_directory(tmp_path, monkeypatch):
+    src = _db_path(tmp_path)
+    monkeypatch.setenv("UPB_DB_PATH", src)
+    _write(src, _seed_full_state)
+    outdir = tmp_path / "ro"
+    dest = outdir / "backup.sqlite3"
+    assert cli.main(["backup", str(dest)]) == 0
+    outdir.chmod(0o500)
+    try:
+        assert cli.main(["verify", str(dest)]) == 0
+    finally:
+        outdir.chmod(0o700)
 
 
 def test_verify_rejects_truncated_file(tmp_path, monkeypatch):

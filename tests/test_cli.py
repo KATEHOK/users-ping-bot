@@ -173,6 +173,43 @@ def test_cli_applies_migrations_on_database_bot_never_opened(tmp_path):
     assert len(rows) >= 1
 
 
+def test_every_command_starts_with_db_line(tmp_path, capsys):
+    path = _db_path(tmp_path)
+    assert cli.main(["set-root", "42"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == f"db={Path(path).resolve()}"
+
+    dest = tmp_path / "b.sqlite3"
+    assert cli.main(["backup", str(dest)]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == f"db={Path(path).resolve()}"
+
+    assert cli.main(["verify", str(dest)]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == f"db={dest.resolve()}"
+
+
+def test_db_line_is_absolute_for_relative_path(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UPB_DB_PATH", "rel.sqlite3")
+    assert cli.main(["set-root", "1"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == f"db={tmp_path.resolve() / 'rel.sqlite3'}"
+
+
+def test_set_root_warns_on_stderr_when_database_is_created(tmp_path, capsys):
+    path = _db_path(tmp_path)
+    assert cli.main(["set-root", "1"]) == 0
+    captured = capsys.readouterr()
+    warnings = [line for line in captured.err.splitlines() if "WARNING" in line]
+    assert len(warnings) == 1
+    assert str(Path(path).resolve()) in warnings[0]
+    assert Path(path).exists()
+
+
+def test_set_root_does_not_warn_for_existing_database(tmp_path, capsys):
+    assert cli.main(["set-root", "1"]) == 0
+    capsys.readouterr()
+    assert cli.main(["set-root", "2"]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
 def test_migration_conflicts_command_is_gone(capsys):
     assert cli.main(["migration-conflicts", "list"]) == 2
     assert "invalid choice" in capsys.readouterr().err
