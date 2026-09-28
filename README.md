@@ -165,7 +165,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest
 ```
 
-Тесты работают на временной SQLite и фейковых транспортах. Они не читают `.env` и не ходят в сеть. Временные каталоги pytest — в `local/tmp/pytest`.
+Тесты работают на временной SQLite и фейковых транспортах. Они не читают `.env` и не ходят в сеть.
 
 Код — в `src/app/`:
 

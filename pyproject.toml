@@ -2,5 +2,5 @@
 asyncio_mode = "auto"
 pythonpath = ["src"]
 testpaths = ["tests"]
-# keep temp dirs inside the repo (local/ is gitignored); pytest recreates it each run
+# keep pytest temp dirs inside the repo, in an ignored path; pytest recreates it each run
 addopts = "--basetemp=local/tmp/pytest"

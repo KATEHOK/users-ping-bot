@@ -1,10 +1,8 @@
-"""Plan section 15 acceptance gaps not exercised elsewhere.
+"""Acceptance checks not exercised elsewhere.
 
-Every test here targets one specific bullet from local/REFACTOR_PLAN.md section
-15 that local/impl/ACCEPTANCE.md records as "newly covered" rather than
-"covered": true multi-connection concurrency (not just sequential calls), a
-database error at the permission-check point, and a comprehensive sweep for a
-planted fake secret marker across the sqlite file, the outbox table and logs.
+True multi-connection concurrency (not just sequential calls), a database
+error at the permission-check point, and a sweep for a planted fake secret
+marker across the sqlite file, the outbox table and logs.
 """
 
 import asyncio
