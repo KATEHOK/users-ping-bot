@@ -63,20 +63,15 @@ def _no_network_no_production_env(monkeypatch):
 class FakeClock(Clock):
     def __init__(self, start: datetime | None = None) -> None:
         self._now = start or datetime(2026, 1, 1, tzinfo=timezone.utc)
-        self._monotonic = 0.0
 
     def now(self) -> datetime:
         return self._now
-
-    def monotonic(self) -> float:
-        return self._monotonic
 
     async def sleep(self, seconds: float) -> None:
         self.advance(seconds)
 
     def advance(self, seconds: float) -> None:
         self._now += timedelta(seconds=seconds)
-        self._monotonic += seconds
 
 
 # Telegram HTML subset: only these tags, `a` carries href only, and &, <, > outside

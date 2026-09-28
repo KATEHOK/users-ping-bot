@@ -315,3 +315,15 @@ async def test_set_root_same_id_keeps_pending_notices(db: Database):
     assert result.changed is False
     async with db.reader() as c:
         assert len(await services.due_events(c, "9999-01-01T00:00:00+00:00")) == 1
+
+
+async def test_set_update_outcome_changes_a_claimed_update(db):
+    services = Services()
+    async with db.transaction() as c:
+        assert await services.claim_update(c, 1, 42)
+        await services.set_update_outcome(c, 1, 42, "ignored")
+    async with db.reader() as c:
+        cursor = await c.execute(
+            "SELECT outcome FROM processed_updates WHERE bot_id = 1 AND update_id = 42"
+        )
+        assert (await cursor.fetchone())[0] == "ignored"

@@ -212,6 +212,15 @@ class Services:
         )
         return cursor.rowcount == 1
 
+    async def set_update_outcome(
+        self, c: aiosqlite.Connection, bot_id: int, update_id: int,
+        outcome: Literal["ok", "ignored", "error"],
+    ) -> None:
+        await c.execute(
+            "UPDATE processed_updates SET outcome = ? WHERE bot_id = ? AND update_id = ?",
+            (outcome, bot_id, update_id),
+        )
+
     async def prune_processed_updates(self, c: aiosqlite.Connection, *, older_than: str) -> int:
         cursor = await c.execute(
             "DELETE FROM processed_updates WHERE processed_at < ?", (older_than,)

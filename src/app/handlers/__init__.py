@@ -37,11 +37,7 @@ from . import group, membership, private  # noqa: E402
 
 
 async def mark_ignored(c: aiosqlite.Connection, ctx: Context, update_id: int) -> None:
-    """Flip the claimed update to outcome 'ignored' (services has no API for it)."""
-    await c.execute(
-        "UPDATE processed_updates SET outcome = 'ignored' WHERE bot_id = ? AND update_id = ?",
-        (ctx.bot_id, update_id),
-    )
+    await ctx.services.set_update_outcome(c, ctx.bot_id, update_id, "ignored")
 
 
 async def _dispatch(ctx: Context, event: IncomingEvent) -> None:
