@@ -146,7 +146,10 @@ def test_two_sequential_set_root_runs_never_leave_two_roots(tmp_path):
     assert rows == [(20,)]
 
 
-@pytest.mark.parametrize("bad", ["0", "-1", "abc"])
+@pytest.mark.parametrize(
+    "bad",
+    ["0", "-1", "abc", "\u0665", "1_000", " 1", "9223372036854775808", "99999999999999999999999999"],
+)
 def test_set_root_invalid_id_exits_2_and_writes_nothing(tmp_path, bad):
     path = _db_path(tmp_path)
     assert cli.main(["set-root", bad]) == 2

@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import Callable, Coroutine, Sequence
 
 from . import config
+from .commands import validate_args
 from .db import MIGRATIONS_DIR, open_database
+from .models import Cmd
 from .services import Services, SetRootResult
 
 
@@ -29,13 +31,13 @@ class CliError(Exception):
         self.code = code
 
 
-def _positive_int(raw: str) -> int:
+def _root_id(raw: str) -> int:
+    # strict: ASCII digits, int64, > 0 (same parser as the bot's /admin create)
     try:
-        value = int(raw)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a positive integer, got {raw!r}") from None
-    if value <= 0:
-        raise argparse.ArgumentTypeError(f"expected a positive integer, got {raw!r}")
+        value = validate_args(Cmd.ADMIN_CREATE, [raw])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{exc}, got {raw!r}") from None
+    assert isinstance(value, int)
     return value
 
 
@@ -44,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_set_root = sub.add_parser("set-root", help="assign the global root user")
-    p_set_root.add_argument("telegram_user_id", type=_positive_int)
+    p_set_root.add_argument("telegram_user_id", type=_root_id)
 
     p_backup = sub.add_parser(
         "backup", help="write a consistent snapshot of the live database via the backup API"
@@ -106,7 +108,7 @@ def _cmd_backup(destination_path: str, force: bool) -> int:
     walks the source's own pager, so it only ever sees committed data, even if
     another connection holds an open write transaction or has WAL frames not
     yet checkpointed into the main file. A plain file copy of a live WAL
-    database would not have that guarantee (plan section 12).
+    database would not have that guarantee (decisions.md section 12).
     """
     source_path = _abs(config.load_db_path())
     print(f"db={source_path}")
@@ -116,12 +118,21 @@ def _cmd_backup(destination_path: str, force: bool) -> int:
     destination = Path(destination_path).resolve()
     if destination.exists() and os.path.samefile(source_path, destination):
         raise CliError(f"destination is the source database itself: {destination}", code=2)
+    # SQLite side files of the source: overwriting them corrupts the live database
+    for suffix in ("-wal", "-shm", "-journal"):
+        if destination == Path(source_path + suffix):
+            raise CliError(f"destination is a side file of the source database: {destination}", code=2)
     if destination.exists() and not force:
         raise CliError(
             f"destination already exists: {destination_path} (use --force to overwrite)",
             code=2,
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        raise CliError(f"destination directory is not writable: {destination.parent}", code=2) from None
+    if not os.access(destination.parent, os.W_OK | os.X_OK):
+        raise CliError(f"destination directory is not writable: {destination.parent}", code=2)
 
     tmp_destination = destination.with_name(destination.name + ".tmp")
     if os.path.lexists(tmp_destination) and os.path.samefile(source_path, tmp_destination):

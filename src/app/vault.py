@@ -3,7 +3,6 @@ from typing import Any
 
 import requests
 
-from .clock import SYSTEM_CLOCK, Clock
 from .config import Config
 
 
@@ -24,7 +23,6 @@ class VaultClient:
         timeout: float = 5.0,
         max_attempts: int = 3,
         session: Any = None,
-        clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         if not addr.startswith("https://"):
             raise VaultError("vault addr must use https")
@@ -37,12 +35,9 @@ class VaultClient:
         self._timeout = timeout
         self._max_attempts = max(1, max_attempts)
         self._session = session or requests.Session()
-        self._clock = clock
         self._token: str | None = None
 
-    # backoff sleeps use wall-clock time directly: read_kv/_login are sync,
-    # Clock.sleep is async, so it can't be awaited here. clock is kept for
-    # signature parity with other components and possible future use.
+    # read_kv/_login are sync, so backoff uses time.sleep directly
     def _backoff(self, attempt: int) -> None:
         time.sleep(min(0.05 * (2 ** (attempt - 1)), 1.0))
 

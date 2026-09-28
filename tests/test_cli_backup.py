@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -338,3 +339,38 @@ def test_verify_rejects_empty_file_missing_schema(tmp_path):
     empty.write_bytes(b"")  # a fresh, valid-but-schemaless sqlite file
 
     assert cli.main(["verify", str(empty)]) != 0
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_backup_refuses_source_side_files_even_with_force(tmp_path, monkeypatch, suffix):
+    src = _db_path(tmp_path)
+    monkeypatch.setenv("UPB_DB_PATH", src)
+    _write(src, _seed_full_state)
+    side = Path(src + suffix)
+    side.write_bytes(b"side")
+
+    assert cli.main(["backup", str(side), "--force"]) == 2
+    assert side.read_bytes() == b"side"
+    # even when the side file does not exist yet, and through another spelling
+    side.unlink()
+    assert cli.main(["backup", str(tmp_path / "x" / ".." / (Path(src).name + suffix)), "--force"]) == 2
+    assert not side.exists()
+    assert cli.main(["verify", src]) == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_backup_reports_unwritable_directory(tmp_path, monkeypatch, capsys):
+    src = _db_path(tmp_path)
+    monkeypatch.setenv("UPB_DB_PATH", src)
+    _write(src, _seed_full_state)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        assert cli.main(["backup", str(locked / "b.sqlite3")]) == 2
+    finally:
+        locked.chmod(0o755)
+    err = capsys.readouterr().err
+    assert "not writable" in err
+    assert str(locked) in err
+    assert not (locked / "b.sqlite3").exists()

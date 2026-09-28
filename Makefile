@@ -54,9 +54,10 @@ set-root: _need-version ## Assign root: make set-root ID=<telegram_user_id>
 	@test -n "$(ID)" || { echo "usage: make set-root ID=<telegram_user_id>" >&2; exit 2; }
 	$(CLI) $(SERVICE) -m app.cli set-root $(ID)
 
-# The container runs as uid 10001, so the host backup directory must be writable for it.
+# The container runs as uid 10001: grant it access to the backup directory via ACL.
 backup: _need-version ## Snapshot the live database into ./backups and verify the copy
-	@mkdir -p $(BACKUP_DIR) && chmod a+rwx $(BACKUP_DIR)
+	@command -v setfacl >/dev/null || { echo "setfacl not found: run 'sudo chown 10001 $(BACKUP_DIR)' after creating it" >&2; exit 2; }
+	@mkdir -p -m 0750 $(BACKUP_DIR) && setfacl -m u:10001:rwx,d:u:10001:rwx $(BACKUP_DIR)
 	$(CLI) -v "$(CURDIR)/$(BACKUP_DIR):/backups" $(SERVICE) -m app.cli backup /backups/$(notdir $(BACKUP_FILE))
 	$(CLI) -v "$(CURDIR)/$(BACKUP_DIR):/backups" $(SERVICE) -m app.cli verify /backups/$(notdir $(BACKUP_FILE))
 
