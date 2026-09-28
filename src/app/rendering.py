@@ -24,7 +24,6 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "unsubscribed": ("Unsubscribed.", "\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u0430."),
     "not_subscribed": ("Not subscribed.", "\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0438 \u043d\u0435 \u0431\u044b\u043b\u043e."),
     "list_empty": ("No subscribers yet.", "\u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u043e\u0432 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442."),
-    "pong": ("pong", "pong"),
     "farewell": ("Chat unregistered. Bye!", "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u0430 \u0441\u043d\u044f\u0442\u0430. \u0414\u043e \u0432\u0441\u0442\u0440\u0435\u0447\u0438!"),
     "lang_set": ("Language: English.", "\u042f\u0437\u044b\u043a: \u0440\u0443\u0441\u0441\u043a\u0438\u0439."),
     "root_cli_only": ("Root is assigned via CLI only.", "Root \u043d\u0430\u0437\u043d\u0430\u0447\u0430\u0435\u0442\u0441\u044f \u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0435\u0440\u0435\u0437 CLI."),
@@ -78,8 +77,6 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "cmd_chat_remove": ("Unregister a chat.", "\u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e \u0447\u0430\u0442\u0430."),
 }
 
-CATALOG_KEYS: tuple[str, ...] = tuple(_CATALOG)
-
 
 def esc(text: str) -> str:
     return html.escape(text, quote=False)
@@ -92,10 +89,9 @@ def t(key: str, lang: Lang, **kw: object) -> str:
     return template.format(**{k: esc(str(v)) for k, v in kw.items()})
 
 
-def mention(user_id: int, display_name: str | None, username: str | None) -> str:
+def mention(user_id: int, display_name: str | None) -> str:
     # Always an id-anchored link, never an @username ping: usernames are cached
     # hints for lists only, not stable delivery addresses.
-    del username  # kept for signature parity with the contract; not used for the label
     label = display_name if display_name else f"id{user_id}"
     return f'<a href="tg://user?id={user_id}">{esc(label)}</a>'
 
@@ -145,12 +141,19 @@ def _command_lines(specs: Sequence[access.CommandSpec], lang: Lang) -> list[str]
     return [f"{esc(s.syntax)} - {t('cmd_' + s.cmd.value, lang)}" for s in specs]
 
 
-def _listed(specs: Sequence[access.CommandSpec]) -> list[access.CommandSpec]:
-    return [s for s in specs if s.cmd not in access.INTERNAL]
+def _listed(specs: Sequence[access.CommandSpec], *, chat_active: bool) -> list[access.CommandSpec]:
+    # register stays runnable in an active chat (owners get "already registered") but is not advertised
+    return [
+        s
+        for s in specs
+        if s.cmd not in access.INTERNAL and not (chat_active and s.cmd is Cmd.CHAT_REGISTER)
+    ]
 
 
 def help_text(actor: Actor, *, scope: Scope, chat_active: bool, lang: Lang = DEFAULT_LANG) -> str:
-    specs = _listed(access.allowed_commands(actor, scope=scope, chat_active=chat_active))
+    specs = _listed(
+        access.allowed_commands(actor, scope=scope, chat_active=chat_active), chat_active=chat_active
+    )
     lines = [t("help_title", lang), *_command_lines(specs, lang)]
     if scope is Scope.PRIVATE:
         lines.append(t("help_register_hint", lang))
@@ -183,7 +186,9 @@ def usage_text(
 
     Known prefix: only allowed commands under it (no fallback). Bare or unknown: all allowed.
     """
-    specs = _listed(access.allowed_commands(actor, scope=scope, chat_active=chat_active))
+    specs = _listed(
+        access.allowed_commands(actor, scope=scope, chat_active=chat_active), chat_active=chat_active
+    )
     want = [p.lower() for p in prefix]
     if want and want[0] in _KNOWN_PREFIXES[scope]:
         specs = [s for s in specs if _words(s.syntax)[: len(want)] == want]

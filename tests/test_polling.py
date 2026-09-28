@@ -11,6 +11,7 @@ from aiogram.types import (
     Chat,
     ChatMemberLeft,
     ChatMemberMember,
+    ChatMemberRestricted,
     ChatMemberUpdated,
     Message,
     MessageEntity,
@@ -125,6 +126,28 @@ def test_to_event_maps_chat_member_leave_and_bot_removal():
     assert ev.bot_removed is False
 
 
+def _restricted(uid, is_member):
+    rights = {n: False for n in ChatMemberRestricted.model_fields if n.startswith("can_")}
+    return ChatMemberRestricted(
+        user=_user(user_id=uid), is_member=is_member, until_date=0, **rights
+    )
+
+
+def test_a_restricted_non_member_bot_counts_as_removed_but_a_member_does_not():
+    def cmu(new):
+        return ChatMemberUpdated(
+            chat=_chat(), from_user=_user(), date=NOW,
+            old_chat_member=ChatMemberMember(user=_user(user_id=BOT_ID)), new_chat_member=new,
+        )
+
+    gone = to_event(Update(update_id=1, my_chat_member=cmu(_restricted(BOT_ID, False))))
+    assert (gone.bot_removed, gone.left_user_id) == (True, BOT_ID)
+    kept = to_event(Update(update_id=2, my_chat_member=cmu(_restricted(BOT_ID, True))))
+    assert (kept.bot_removed, kept.left_user_id) == (False, None)
+    member = to_event(Update(update_id=3, chat_member=cmu(_restricted(8, False))))
+    assert (member.kind, member.left_user_id, member.bot_removed) == ("chat_member", 8, False)
+
+
 def test_to_event_returns_none_for_unsupported_update():
     assert to_event(_bare(17)) is None
 
@@ -170,8 +193,8 @@ def test_mapped_errors_carry_no_text_from_the_source():
 class _RaisingBot:
     id = BOT_ID
 
-    def __init__(self, exc=None, status=None):
-        self._exc, self._status = exc, status
+    def __init__(self, exc=None, status=None, is_member=None):
+        self._exc, self._status, self._is_member = exc, status, is_member
 
     async def send_message(self, *a, **k):
         raise self._exc
@@ -179,7 +202,10 @@ class _RaisingBot:
     async def get_chat_member(self, chat_id, user_id):
         if self._exc is not None:
             raise self._exc
-        return type("M", (), {"status": self._status})()
+        attrs = {"status": self._status}
+        if self._is_member is not None:
+            attrs["is_member"] = self._is_member
+        return type("M", (), attrs)()
 
 
 async def test_transport_send_translates_and_hides_the_cause():
@@ -196,6 +222,8 @@ async def test_transport_send_translates_and_hides_the_cause():
         (_RaisingBot(status="administrator"), None),
         (_RaisingBot(status="kicked"), PermanentSend),
         (_RaisingBot(status="left"), PermanentSend),
+        (_RaisingBot(status="restricted", is_member=False), PermanentSend),
+        (_RaisingBot(status="restricted", is_member=True), None),
         (_RaisingBot(aex.TelegramForbiddenError(method=None, message="x")), PermanentSend),
         (_RaisingBot(aex.TelegramNotFound(method=None, message="chat not found")), PermanentSend),
         (_RaisingBot(aex.TelegramMigrateToChat(method=None, message="m", migrate_to_chat_id=-9)), ChatMigrated),
@@ -400,6 +428,89 @@ async def test_stop_interrupts_a_pending_long_poll(db):
     await asyncio.wait_for(task, 2)
 
 
+async def test_stop_mid_batch_leaves_the_rest_unhandled_and_a_restart_finishes_it(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_admin(db, services, 5)
+    stop = asyncio.Event()
+    send = transport.send_message
+
+    async def send_then_stop(*a, **k):
+        stop.set()  # SIGTERM arrives while the first update is being answered
+        await send(*a, **k)
+
+    transport.send_message = send_then_stop
+    batch = [_cmd_update(1, "/upb chat register"), _cmd_update(2, "/upb notify on"), _cmd_update(3, "/upb list")]
+    bot = FakeBot([batch])
+    await _poll(ctx, bot, stop)
+    assert bot.offsets == [None]
+    async with db.reader() as c:
+        cur = await c.execute("SELECT update_id FROM processed_updates ORDER BY update_id")
+        assert await cur.fetchall() == [(1,)]  # 2 and 3 stay unclaimed: Telegram redelivers them
+
+    transport.send_message = send
+    stop2 = asyncio.Event()
+    await _poll(ctx, FakeBot([batch], stop2), stop2)  # after the restart
+    async with db.reader() as c:
+        cur = await c.execute("SELECT update_id FROM processed_updates ORDER BY update_id")
+        assert await cur.fetchall() == [(1,), (2,), (3,)]
+    assert len(transport.calls) == 3  # update 1 was not answered twice
+
+
+# --- background loops survive transient errors ---
+
+
+async def test_prune_loop_survives_a_transient_error(db, monkeypatch, caplog):
+    import sqlite3
+
+    ctx, *_ = mk_ctx(db)
+    stop = asyncio.Event()
+    calls = []
+
+    async def flaky(_ctx):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        if len(calls) == 3:
+            stop.set()
+        return 0
+
+    monkeypatch.setattr(entry, "prune_once", flaky)
+    with caplog.at_level(logging.ERROR):
+        await asyncio.wait_for(entry.prune_loop(ctx, stop), 2)
+    assert len(calls) == 3
+    assert "prune_error exc=OperationalError" in caplog.text
+
+
+async def test_outbox_loop_survives_a_transient_error_but_not_unauthorized(db, monkeypatch, caplog):
+    import sqlite3
+
+    ctx, services, transport, _c = mk_ctx(db)
+    stop = asyncio.Event()
+    real = services.due_events
+    calls = []
+
+    async def flaky(c, now_iso):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        if len(calls) == 3:
+            stop.set()
+        return await real(c, now_iso)
+
+    monkeypatch.setattr(services, "due_events", flaky)
+    with caplog.at_level(logging.ERROR):
+        await asyncio.wait_for(ctx.delivery.outbox_loop(stop), 2)
+    assert len(calls) == 3
+    assert "outbox_loop_error exc=OperationalError" in caplog.text
+
+    async def revoked(c, now_iso):
+        raise Unauthorized()
+
+    monkeypatch.setattr(services, "due_events", revoked)
+    with pytest.raises(Unauthorized):
+        await asyncio.wait_for(ctx.delivery.outbox_loop(asyncio.Event()), 2)
+
+
 # --- startup reconciliation and root report (decisions 11) ---
 
 
@@ -507,23 +618,23 @@ async def _serve(db, bot, clock, stop, transport=None):
     )
 
 
-async def test_revoked_token_is_critical_pause_and_exit_3(db, caplog):
+async def test_revoked_token_is_critical_and_exit_3(db, caplog):
     clock, stop = RecordingClock(), asyncio.Event()
     bot = FakeBot([aex.TelegramUnauthorizedError(method=None, message=MARKER)])
     with caplog.at_level(logging.DEBUG):
         assert await _serve(db, bot, clock, stop) == 3
-    assert clock.sleeps[-1] == 60.0
+    assert 60.0 not in clock.sleeps  # the pause belongs to the caller, after the resources close
     crit = [r for r in caplog.records if r.levelno == logging.CRITICAL]
     assert len(crit) == 1 and MARKER not in caplog.text
     assert all(r.exc_info is None for r in caplog.records)
 
 
-async def test_ten_poll_failures_are_an_error_pause_and_exit_1(db, caplog):
+async def test_ten_poll_failures_are_an_error_and_exit_1(db, caplog):
     clock, stop = RecordingClock(), asyncio.Event()
     bot = FakeBot([RuntimeError(MARKER)] * 10)
     with caplog.at_level(logging.DEBUG):
         assert await _serve(db, bot, clock, stop) == 1
-    assert clock.sleeps.count(5.0) >= 9 and clock.sleeps[-1] == 60.0
+    assert clock.sleeps.count(5.0) >= 9 and 60.0 not in clock.sleeps
     assert any(r.levelno == logging.ERROR and "polling_failed" in r.getMessage() for r in caplog.records)
     assert MARKER not in caplog.text
 
@@ -566,13 +677,14 @@ async def test_serve_runs_startup_before_polling(db):
 
 
 async def test_sigterm_sets_stop_and_interrupts_waits(db):
-    stop = asyncio.Event()
-    entry._install_stop_handlers(stop)
+    stop, signalled = asyncio.Event(), asyncio.Event()
+    entry._install_stop_handlers(stop, signalled)
     try:
         task = asyncio.create_task(entry.wait_or_stop(FakeClockNeverSleeps(), stop, 3600))
         await asyncio.sleep(0.01)
         signal.raise_signal(signal.SIGTERM)
         assert await asyncio.wait_for(task, 2) is True
+        assert signalled.is_set()
     finally:
         loop = asyncio.get_running_loop()
         loop.remove_signal_handler(signal.SIGTERM)
@@ -600,7 +712,7 @@ async def test_vault_error_at_start_pauses_60_seconds_and_exits_1(tmp_path, monk
         sleeps.append(seconds)
     monkeypatch.setattr(entry.SYSTEM_CLOCK.__class__, "sleep", lambda self, s: fake_sleep(s))
     monkeypatch.setattr(entry.config_module, "load_config", lambda: _cfg(tmp_path))
-    monkeypatch.setattr(entry, "_install_stop_handlers", lambda stop: None)
+    monkeypatch.setattr(entry, "_install_stop_handlers", lambda stop, signalled: None)
     monkeypatch.setattr(entry, "configure_logging", lambda level: None)
 
     def bad_vault(cfg):
@@ -644,13 +756,132 @@ async def test_session_and_database_are_closed_on_exit(tmp_path, monkeypatch):
     monkeypatch.setattr(entry, "open_database", spy)
     stop = asyncio.Event()
     stop.set()
-    assert await entry._serve_with_token(_cfg(tmp_path), "123:tok", stop) == 0
+    assert await entry._serve_with_token(_cfg(tmp_path), "123:tok", stop, asyncio.Event()) == 0
     assert closed["session"] is True
     assert dbs and dbs[0]._conn is None
 
 
+class _RevokedTokenBot(FakeBot):
+    """aiogram Bot stand-in whose first getUpdates reports a revoked token."""
+
+    def __init__(self, events, token=None, default=None):
+        super().__init__([aex.TelegramUnauthorizedError(method=None, message=MARKER)])
+        self.id = BOT_ID
+        outer = events
+
+        class Session:
+            async def close(self):
+                outer.append("session closed")
+
+        self.session = Session()
+
+    async def get_me(self):
+        return type("Me", (), {"id": BOT_ID, "username": "upb_bot"})()
+
+
+def _spy_open_database(monkeypatch, events, dbs):
+    from contextlib import asynccontextmanager
+
+    real_open = entry.open_database
+
+    @asynccontextmanager
+    async def spy(path):
+        async with real_open(path) as database:
+            dbs.append(database)
+            yield database
+        events.append("db closed")
+
+    monkeypatch.setattr(entry, "open_database", spy)
+
+
+async def test_fatal_pause_starts_only_after_the_database_and_session_are_closed(
+    tmp_path, monkeypatch
+):
+    events, dbs = [], []
+    _spy_open_database(monkeypatch, events, dbs)
+    monkeypatch.setattr(entry, "Bot", lambda token, default=None: _RevokedTokenBot(events))
+
+    async def fake_sleep(self, seconds):
+        if seconds != entry.FATAL_PAUSE:
+            await asyncio.Event().wait()  # loop waits: cancelled at stop
+        events.append(f"pause {seconds}")
+
+    monkeypatch.setattr(entry.SYSTEM_CLOCK.__class__, "sleep", fake_sleep)
+    code = await asyncio.wait_for(
+        entry._serve_with_token(_cfg(tmp_path), "123:tok", asyncio.Event(), asyncio.Event()), 5
+    )
+    assert code == 3
+    assert events == ["db closed", "session closed", "pause 60.0"]
+
+
+async def test_sigterm_during_the_fatal_pause_exits_at_once_with_resources_closed(
+    tmp_path, monkeypatch
+):
+    events, dbs = [], []
+    _spy_open_database(monkeypatch, events, dbs)
+    monkeypatch.setattr(entry, "Bot", lambda token, default=None: _RevokedTokenBot(events))
+    stop, signalled = asyncio.Event(), asyncio.Event()
+    entry._install_stop_handlers(stop, signalled)  # real signal handlers, as in production
+    loop = asyncio.get_running_loop()
+    try:
+        task = asyncio.create_task(
+            entry._serve_with_token(_cfg(tmp_path), "123:tok", stop, signalled)
+        )
+        for _ in range(200):  # wait until the pause has begun
+            if events == ["db closed", "session closed"]:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert events == ["db closed", "session closed"]
+        # serve() sets `stop` itself while winding down; that must not end the pause
+        assert stop.is_set() and not signalled.is_set()
+        assert not task.done()
+
+        started = loop.time()
+        signal.raise_signal(signal.SIGTERM)
+        assert await asyncio.wait_for(task, 2) == 3
+        assert loop.time() - started < 1.0
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        loop.remove_signal_handler(signal.SIGINT)
+    assert dbs[0]._conn is None
+
+
+def test_debug_logging_does_not_emit_sql_with_personal_data(tmp_path, caplog):
+    import asyncio as aio
+
+    from app.db import Database, apply_migrations
+    from app.services import Services
+
+    names = ("aiosqlite", "aiohttp", "aiogram", "urllib3", "requests", "")
+    saved = {n: logging.getLogger(n).level for n in names}
+
+    async def workload():
+        database = Database(str(tmp_path / "debug.sqlite3"))
+        await database.connect()
+        await apply_migrations(database)
+        try:
+            async with database.transaction() as c:
+                await Services().touch_user(
+                    c, 42, username="ivan_private", display_name="Ivan Private-Name"
+                )
+                await Services().register_chat(c, -7, "Secret Chat Title", 42)
+        finally:
+            await database.close()
+
+    try:
+        entry.configure_logging("DEBUG")
+        caplog.set_level(logging.DEBUG)
+        aio.run(workload())
+    finally:
+        for n, lvl in saved.items():
+            logging.getLogger(n).setLevel(lvl)
+    for private in ("ivan_private", "Ivan Private-Name", "Secret Chat Title"):
+        assert private not in caplog.text
+
+
 def test_third_party_loggers_are_never_below_warning():
-    names = ("aiohttp", "aiogram", "urllib3", "requests")
+    names = ("aiohttp", "aiogram", "aiosqlite", "urllib3", "requests")
     saved = {n: logging.getLogger(n).level for n in (*names, "")}
     try:
         entry.configure_logging("DEBUG")

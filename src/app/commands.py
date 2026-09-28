@@ -44,39 +44,38 @@ def parse_group_command(
     if name != "upb":
         return None
 
-    raw = text or ""
     words = rest.split()
     w = [x.lower() for x in words]
 
     def usage() -> ParsedCommand:
-        return ParsedCommand(Cmd.USAGE, tuple(w[:1]), raw)
+        return ParsedCommand(Cmd.USAGE, tuple(w[:1]))
 
     if not w:
         return usage()
     if w[0] == "chat":
         if len(w) >= 2 and w[1] == "register":
-            return ParsedCommand(Cmd.CHAT_REGISTER, tuple(words[2:]), raw)
+            return ParsedCommand(Cmd.CHAT_REGISTER, tuple(words[2:]))
         if len(w) >= 2 and w[1] == "unregister":
-            return ParsedCommand(Cmd.CHAT_UNREGISTER, tuple(words[2:]), raw)
+            return ParsedCommand(Cmd.CHAT_UNREGISTER, tuple(words[2:]))
         return usage()
     if w[0] == "notify":
         if len(w) >= 2 and w[1] == "on":
-            return ParsedCommand(Cmd.NOTIFY_ON, tuple(words[2:]), raw)
+            return ParsedCommand(Cmd.NOTIFY_ON, tuple(words[2:]))
         if len(w) >= 2 and w[1] == "off":
-            return ParsedCommand(Cmd.NOTIFY_OFF, tuple(words[2:]), raw)
+            return ParsedCommand(Cmd.NOTIFY_OFF, tuple(words[2:]))
         if len(w) >= 2 and w[1] == "all":
-            return ParsedCommand(Cmd.PING, tuple(words[2:]), raw)
+            return ParsedCommand(Cmd.PING, tuple(words[2:]))
         return usage()
     if w[0] == "lang":
         if len(words) == 1:
             return usage()
-        return ParsedCommand(Cmd.LANG, tuple(words[1:]), raw)
+        return ParsedCommand(Cmd.LANG, tuple(words[1:]))
     if w[0] == "all":
-        return ParsedCommand(Cmd.PING, tuple(words[1:]), raw)
+        return ParsedCommand(Cmd.PING, tuple(words[1:]))
     if w[0] == "list":
-        return ParsedCommand(Cmd.LIST, tuple(words[1:]), raw)
+        return ParsedCommand(Cmd.LIST, tuple(words[1:]))
     if w[0] in ("help", "usage"):
-        return ParsedCommand(Cmd.HELP, tuple(words[1:]), raw)
+        return ParsedCommand(Cmd.HELP, tuple(words[1:]))
     return usage()
 
 
@@ -90,33 +89,32 @@ def parse_private_command(
     if leading is None:
         return None
     name, rest = leading
-    raw = text or ""
     words = rest.split()
     sub = words[0].lower() if words else ""
 
     if name in ("help", "usage", "start"):
-        return ParsedCommand(Cmd.P_HELP, tuple(words), raw)
+        return ParsedCommand(Cmd.P_HELP, tuple(words))
 
     if name == "lang":
         if not words:
-            return ParsedCommand(Cmd.P_USAGE, ("lang",), raw)
-        return ParsedCommand(Cmd.P_LANG, tuple(words), raw)
+            return ParsedCommand(Cmd.P_USAGE, ("lang",))
+        return ParsedCommand(Cmd.P_LANG, tuple(words))
 
     if name == "admin":
         if sub == "create":
-            return ParsedCommand(Cmd.ADMIN_CREATE, tuple(words[1:]), raw)
+            return ParsedCommand(Cmd.ADMIN_CREATE, tuple(words[1:]))
         if sub == "remove":
-            return ParsedCommand(Cmd.ADMIN_REMOVE, tuple(words[1:]), raw)
+            return ParsedCommand(Cmd.ADMIN_REMOVE, tuple(words[1:]))
         if sub == "list":
-            return ParsedCommand(Cmd.ADMIN_LIST, tuple(words[1:]), raw)
-        return ParsedCommand(Cmd.P_USAGE, ("admin",), raw)
+            return ParsedCommand(Cmd.ADMIN_LIST, tuple(words[1:]))
+        return ParsedCommand(Cmd.P_USAGE, ("admin",))
 
     if name == "chat":
         if sub == "list":
-            return ParsedCommand(Cmd.CHAT_LIST, tuple(words[1:]), raw)
+            return ParsedCommand(Cmd.CHAT_LIST, tuple(words[1:]))
         if sub == "remove":
-            return ParsedCommand(Cmd.CHAT_REMOVE, tuple(words[1:]), raw)
-        return ParsedCommand(Cmd.P_USAGE, ("chat",), raw)
+            return ParsedCommand(Cmd.CHAT_REMOVE, tuple(words[1:]))
+        return ParsedCommand(Cmd.P_USAGE, ("chat",))
 
     return None
 

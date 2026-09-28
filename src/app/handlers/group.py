@@ -22,14 +22,17 @@ def _ping_limited(ctx: Context, chat_id: int, user_id: int, is_root: bool) -> bo
     if is_root or ctx.ping_cooldown_seconds <= 0:
         return False
     last = ctx.ping_last.get((chat_id, user_id))
-    return last is not None and _now(ctx) - last < ctx.ping_cooldown_seconds
+    if last is None:
+        return False
+    # a negative difference means the wall clock went back: the interval has expired
+    return 0 <= _now(ctx) - last < ctx.ping_cooldown_seconds
 
 
 def _note_ping(ctx: Context, chat_id: int, user_id: int) -> None:
     now = _now(ctx)
     if len(ctx.ping_last) >= _COOLDOWN_GC_SIZE:
         cutoff = now - ctx.ping_cooldown_seconds
-        for key in [k for k, v in ctx.ping_last.items() if v <= cutoff]:
+        for key in [k for k, v in ctx.ping_last.items() if v <= cutoff or v > now]:
             del ctx.ping_last[key]
     ctx.ping_last[(chat_id, user_id)] = now
 
@@ -110,11 +113,10 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
                 )
                 if text:
                     replies.append(text)
+                else:
+                    await mark_ignored(c, ctx, event.update_id)
         else:
             raise AssertionError(f"unhandled group command {cmd!r}")
-
-        if not replies and ping is None:
-            await mark_ignored(c, ctx, event.update_id)
 
     # after commit: what is sent is final
     if ping_key is not None:

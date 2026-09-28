@@ -186,7 +186,7 @@ class Delivery:
                 chat_id, rendering.PONG, reply_to=message_id, thread_id=thread_id, code="pong"
             )
             return
-        parts = [rendering.mention(r.user_id, r.display_name, r.username) for r in snapshot]
+        parts = [rendering.mention(r.user_id, r.display_name) for r in snapshot]
         for text in rendering.split_mentions(parts, limit=chunk_limit, max_items=max_mentions):
             if not await self._send(
                 chat_id, text, reply_to=message_id, thread_id=thread_id, code="ping"
@@ -298,6 +298,12 @@ class Delivery:
     async def outbox_loop(self, stop: asyncio.Event | None = None) -> None:
         stop = stop if stop is not None else self.stop
         while not stop.is_set():
-            await self.run_outbox_once()
+            try:
+                await self.run_outbox_once()
+            except Unauthorized:
+                raise
+            except Exception as exc:
+                # e.g. a locked database: try again on the next tick
+                logger.error("outbox_loop_error exc=%s", type(exc).__name__)
             if await wait_or_stop(self._clock, stop, OUTBOX_POLL_INTERVAL):
                 return

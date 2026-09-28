@@ -47,7 +47,7 @@ def test_html_validator_sanity():
 
 def test_every_key_has_both_languages_and_no_placeholder_drift():
     assert set(LANGS) == {"en", "ru"}
-    for key in rendering.CATALOG_KEYS:
+    for key in rendering._CATALOG:
         fields = {}
         for lang in LANGS:
             template = rendering._CATALOG[key][0 if lang == "en" else 1]
@@ -59,7 +59,7 @@ def test_every_key_has_both_languages_and_no_placeholder_drift():
 def test_every_listed_command_has_a_description_in_both_languages():
     for s in access.CATALOG:
         if s.cmd not in access.INTERNAL:
-            assert "cmd_" + s.cmd.value in rendering.CATALOG_KEYS
+            assert "cmd_" + s.cmd.value in rendering._CATALOG
             for lang in LANGS:
                 assert t("cmd_" + s.cmd.value, lang).strip()
 
@@ -71,11 +71,11 @@ def test_command_spec_has_no_duplicate_description():
 def test_decision_keys_present():
     for key in (
         "welcome already_registered subscribed already_subscribed unsubscribed not_subscribed "
-        "list_empty pong farewell lang_set root_cli_only bad_args admin_created admin_exists "
+        "list_empty farewell lang_set root_cli_only bad_args admin_created admin_exists "
         "admin_removed admin_absent chat_removed chat_absent root_revoked startup name_unknown "
         "ping_note help_register_hint"
     ).split():
-        assert key in rendering.CATALOG_KEYS
+        assert key in rendering._CATALOG
 
 
 def test_t_escapes_keyword_values_and_resolves_language():
@@ -91,7 +91,7 @@ def test_t_escapes_keyword_values_and_resolves_language():
 
 def test_russian_texts_are_gender_and_number_neutral():
     banned = re.compile(r"(?i)\b(\u0432\u044b|\u0442\u044b|\u0432\u0430\u0448\w*|\u0442\u0435\u0431\u044f|\u0432\u0430\u043c)\b")
-    for key in rendering.CATALOG_KEYS:
+    for key in rendering._CATALOG:
         assert not banned.search(rendering._CATALOG[key][1]), key
 
 
@@ -104,17 +104,17 @@ def test_esc_escapes_html_and_keeps_unicode():
     assert "\u0410\u043b\u0438\u0441\u0430" in out
 
 
-def test_mention_always_uses_id_link_even_with_username():
-    m = mention(555, "Some Name", "someusername")
+def test_mention_is_an_id_link_never_an_at_username():
+    m = mention(555, "Some Name")
     assert m == '<a href="tg://user?id=555">Some Name</a>'
 
 
 def test_mention_falls_back_to_id_label_when_no_display_name():
-    assert mention(777, None, "u") == '<a href="tg://user?id=777">id777</a>'
+    assert mention(777, None) == '<a href="tg://user?id=777">id777</a>'
 
 
 def test_mention_escapes_html_injection_in_display_name():
-    m = mention(1, EVIL, None)
+    m = mention(1, EVIL)
     assert find_html_errors(m) == []
     assert "<script>" not in m
 
@@ -124,7 +124,7 @@ def test_mention_escapes_html_injection_in_display_name():
 
 def test_split_mentions_caps_at_50_without_loss_or_duplication():
     ids = list(range(1, 173))
-    parts = [mention(i, f"U{i}", None) for i in ids]
+    parts = [mention(i, f"U{i}") for i in ids]
     chunks = split_mentions(parts)
     assert [c.count("<a ") for c in chunks] == [50, 50, 50, 22]
     assert max(c.count("<a ") for c in chunks) <= MAX_MENTIONS
@@ -136,7 +136,7 @@ def test_split_mentions_caps_at_50_without_loss_or_duplication():
 
 def test_split_mentions_respects_char_limit_and_never_splits_one():
     ids = list(range(1, 201))
-    parts = [mention(i, f"User {i}", None) for i in ids]
+    parts = [mention(i, f"User {i}") for i in ids]
     chunks = split_mentions(parts, limit=120)
     assert len(chunks) > 1
     for c in chunks:
@@ -147,15 +147,15 @@ def test_split_mentions_respects_char_limit_and_never_splits_one():
 
 
 def test_split_mentions_default_char_limit():
-    parts = [mention(i, "n" * 200, None) for i in range(1, 60)]
+    parts = [mention(i, "n" * 200) for i in range(1, 60)]
     chunks = split_mentions(parts)
     assert all(len(c) <= rendering.MAX_MESSAGE for c in chunks)
     assert sum(c.count("<a ") for c in chunks) == 59
 
 
 def test_split_mentions_oversized_single_mention_goes_out_alone():
-    huge = mention(1, "x" * 200, None)
-    chunks = split_mentions([huge] + [mention(i, f"u{i}", None) for i in range(2, 5)], limit=50)
+    huge = mention(1, "x" * 200)
+    chunks = split_mentions([huge] + [mention(i, f"u{i}") for i in range(2, 5)], limit=50)
     assert huge in chunks
 
 
@@ -198,7 +198,11 @@ def _syntax_lines(text: str) -> set[str]:
 @pytest.mark.parametrize("actor", ACTORS)
 def test_help_lists_exactly_the_allowed_commands(actor, scope, chat_active, lang):
     allowed = access.allowed_commands(actor, scope=scope, chat_active=chat_active)
-    listed = {esc(s.syntax) for s in allowed if s.cmd not in access.INTERNAL}
+    listed = {
+        esc(s.syntax)
+        for s in allowed
+        if s.cmd not in access.INTERNAL and not (chat_active and s.cmd is Cmd.CHAT_REGISTER)
+    }
     text = help_text(actor, scope=scope, chat_active=chat_active, lang=lang)
     assert _syntax_lines(text) == listed
     assert find_html_errors(text) == []
@@ -245,7 +249,7 @@ def test_subscriber_help_has_no_administrative_commands():
 
 def test_usage_filters_by_prefix():
     text = usage_text(REGISTRAR, scope=Scope.GROUP, chat_active=True, prefix=("chat",), lang="en")
-    assert _syntax_lines(text) == {"/upb chat register", "/upb chat unregister"}
+    assert _syntax_lines(text) == {"/upb chat unregister"}  # register is not advertised when active
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
     assert _syntax_lines(text) == {"/upb notify on", "/upb notify off"}
     text = usage_text(ROOT, scope=Scope.PRIVATE, chat_active=True, prefix=("admin",), lang="en")
@@ -373,7 +377,7 @@ def test_startup_report():
 def test_all_rendered_texts_pass_the_html_validator(lang):
     texts: list[str] = [
         t(key, lang, syntax="/x <a|b>", id="<1>", n=1, chat_id=-1, time="<t>", ids="1, 2")
-        for key in rendering.CATALOG_KEYS
+        for key in rendering._CATALOG
     ]
     texts += [welcome_text(lang), farewell_text(lang), root_revoked_text("<now>", lang)]
     for actor in ACTORS:
@@ -393,6 +397,6 @@ def test_all_rendered_texts_pass_the_html_validator(lang):
     texts += rendering.admin_list_text(
         [SimpleNamespace(user_id=1, display_name=EVIL, username=None)], lang
     )
-    texts += split_mentions([mention(1, EVIL, None), mention(2, None, None)])
+    texts += split_mentions([mention(1, EVIL), mention(2, None)])
     for text in texts:
         assert find_html_errors(text) == [], text

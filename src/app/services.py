@@ -30,7 +30,6 @@ class RegisterResult:
 class UnregisterResult:
     chat_id: int
     generation: int
-    subscriptions_removed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +220,18 @@ class Services:
             (outcome, bot_id, update_id),
         )
 
+    async def record_update_outcome(
+        self, c: aiosqlite.Connection, bot_id: int, update_id: int,
+        outcome: Literal["ok", "ignored", "error"],
+    ) -> None:
+        """Upsert: works whether or not the claim row exists (it may have rolled back)."""
+        await c.execute(
+            "INSERT INTO processed_updates(bot_id, update_id, processed_at, outcome) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(bot_id, update_id) "
+            "DO UPDATE SET outcome = excluded.outcome",
+            (bot_id, update_id, self._now(), outcome),
+        )
+
     async def prune_processed_updates(self, c: aiosqlite.Connection, *, older_than: str) -> int:
         cursor = await c.execute(
             "DELETE FROM processed_updates WHERE processed_at < ?", (older_than,)
@@ -249,10 +260,6 @@ class Services:
         row = await cursor.fetchone()
         return self._chat_row(row) if row is not None else None
 
-    async def get_chat_lang(self, c: aiosqlite.Connection, chat_id: int) -> Lang:
-        chat = await self.get_chat(c, chat_id)
-        return chat.lang if chat is not None else DEFAULT_LANG
-
     async def set_chat_lang(self, c: aiosqlite.Connection, chat_id: int, lang: Lang) -> None:
         self._check_lang(lang)
         await c.execute("UPDATE chats SET lang = ? WHERE chat_id = ?", (lang, chat_id))
@@ -280,11 +287,7 @@ class Services:
     ) -> UnregisterResult:
         existing = await self.get_chat(c, chat_id)
         if existing is None:
-            return UnregisterResult(chat_id=chat_id, generation=0, subscriptions_removed=0)
-        cursor = await c.execute(
-            "SELECT COUNT(*) FROM subscriptions WHERE chat_id = ?", (chat_id,)
-        )
-        (removed,) = await cursor.fetchone()
+            return UnregisterResult(chat_id=chat_id, generation=0)
         # deleting the chat row cascades subscriptions via ON DELETE CASCADE
         await c.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
         if farewell:
@@ -292,7 +295,6 @@ class Services:
         return UnregisterResult(
             chat_id=chat_id,
             generation=existing.registration_generation,
-            subscriptions_removed=removed,
         )
 
     async def list_chats(
@@ -536,7 +538,7 @@ class Services:
         return group
 
     async def cancel_chat_events(self, c: aiosqlite.Connection, chat_id: int) -> int:
-        # Cancellation-across-generations rule (plan section 8): a chat's pending
+        # Cancellation-across-generations rule (decisions sections 5 and 9): a chat's pending
         # group events are matched by its whole alias group, not just the literal
         # id passed in, so a stale farewell queued under an old id is still found
         # after the chat has since migrated or been re-registered under aliases.
@@ -600,7 +602,7 @@ class Services:
         error: str | None = None,
         retry_at: str | None = None,
     ) -> None:
-        # error is a short safe code (e.g. "rate_limited", "chat_not_found"), never
+        # error is a short safe code (e.g. "rate_limited", "permanent", "ambiguous"), never
         # a response body or secret; attempts counts this call as one delivery try.
         await c.execute(
             "UPDATE outbox SET status = ?, attempts = attempts + 1, next_attempt_at = ?, "

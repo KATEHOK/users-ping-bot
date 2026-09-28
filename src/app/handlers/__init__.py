@@ -1,8 +1,12 @@
 """Dispatch entrypoint: Context + handle_event.
 
-Each handler runs one write transaction: claim_update, contact record, actor load,
-authorization, argument validation, mutation, outbox. Replies are sent only after
-commit and are never re-checked (decisions section 2).
+Each handler runs one write transaction, in this order:
+1. Parse. A group message that is not a /upb command is dropped before any write.
+2. claim_update (a duplicate returns at once), then the sender's contact record.
+3. Group only: canonical chat id (an old migrated id is ignored) and chat row.
+4. Actor load and the single authorization check; a denial is silent and recorded 'ignored'.
+5. Argument validation, mutation, outbox rows.
+Replies are sent only after commit and are never re-checked (decisions section 2).
 """
 
 import logging
@@ -74,6 +78,6 @@ async def handle_event(ctx: Context, event: IncomingEvent) -> None:
         logger.error("handler_error update_id=%s exc=%s", event.update_id, type(exc).__name__)
         try:
             async with ctx.db.transaction() as c:
-                await ctx.services.claim_update(c, ctx.bot_id, event.update_id, "error")
+                await ctx.services.record_update_outcome(c, ctx.bot_id, event.update_id, "error")
         except Exception as err:
             logger.error("error_record_failed exc=%s", type(err).__name__)

@@ -39,7 +39,7 @@ EXIT_UNAUTHORIZED = 3
 PRUNE_KEEP = timedelta(days=2)
 PRUNE_INTERVAL = 3600.0
 
-_QUIET_LOGGERS = ("aiohttp", "aiogram", "urllib3", "requests")
+_QUIET_LOGGERS = ("aiohttp", "aiogram", "aiosqlite", "urllib3", "requests")
 
 
 def configure_logging(level_name: str) -> None:
@@ -49,15 +49,22 @@ def configure_logging(level_name: str) -> None:
     logging.basicConfig(level=level)
     logging.getLogger().setLevel(level)
     for name in _QUIET_LOGGERS:
-        # their debug output can carry request URLs, and with them the token
+        # their debug output can carry request URLs (the token) or SQL parameters (names)
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
 
-def _install_stop_handlers(stop: asyncio.Event) -> None:
+def _install_stop_handlers(stop: asyncio.Event, signalled: asyncio.Event) -> None:
+    """SIGTERM/SIGINT set both events. `signalled` is set by nothing else: serve() sets
+    `stop` itself to wind its loops down, so only `signalled` can cut the fatal pause short."""
+
+    def on_signal() -> None:
+        signalled.set()
+        stop.set()
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(sig, on_signal)
         except NotImplementedError:
             pass  # signal handlers unsupported on this platform
 
@@ -106,7 +113,11 @@ async def prune_once(ctx: Context) -> int:
 
 async def prune_loop(ctx: Context, stop: asyncio.Event) -> None:
     while not await wait_or_stop(ctx.clock, stop, PRUNE_INTERVAL):
-        await prune_once(ctx)
+        try:
+            await prune_once(ctx)
+        except Exception as exc:
+            # e.g. a locked database: try again next interval
+            logger.error("prune_error exc=%s", type(exc).__name__)
 
 
 # --- run ---
@@ -134,7 +145,7 @@ async def serve(
     clock: Clock,
     stop: asyncio.Event,
 ) -> int:
-    """Run until stopped or fatal. Returns the process exit code (after the fatal pause)."""
+    """Run until stopped or fatal. Returns the process exit code; the caller owns the fatal pause."""
     services = Services(clock=clock)
     delivery = Delivery(db, services, transport, clock=clock, stop=stop)
     ctx = Context(
@@ -172,11 +183,7 @@ async def serve(
             if not task.cancelled() and task.exception() is not None and fatal is None:
                 fatal = task.exception()
 
-    if fatal is None:
-        return 0
-    code = _exit_code(fatal)
-    await clock.sleep(FATAL_PAUSE)
-    return code
+    return 0 if fatal is None else _exit_code(fatal)
 
 
 async def _run() -> int:
@@ -188,24 +195,28 @@ async def _run() -> int:
     configure_logging(cfg.log_level)
 
     stop = asyncio.Event()
-    _install_stop_handlers(stop)
+    signalled = asyncio.Event()
+    _install_stop_handlers(stop, signalled)
     try:
         token = await asyncio.to_thread(vault.load_bot_token, cfg)
     except Exception as exc:
         logger.error("vault_error exc=%s", type(exc).__name__)
-        await wait_or_stop(SYSTEM_CLOCK, stop, FATAL_PAUSE)  # a signal cuts the pause short
+        await wait_or_stop(SYSTEM_CLOCK, signalled, FATAL_PAUSE)  # a signal cuts the pause short
         return EXIT_FATAL
 
-    return await _serve_with_token(cfg, token, stop)
+    return await _serve_with_token(cfg, token, stop, signalled)
 
 
-async def _serve_with_token(cfg: Config, token: str, stop: asyncio.Event) -> int:
+async def _serve_with_token(
+    cfg: Config, token: str, stop: asyncio.Event, signalled: asyncio.Event
+) -> int:
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    code = 0
     try:
         try:
             me = await bot.get_me()
             async with open_database(cfg.db_path) as db:
-                return await serve(
+                code = await serve(
                     db=db,
                     bot=bot,
                     transport=AiogramTransport(bot),
@@ -217,10 +228,12 @@ async def _serve_with_token(cfg: Config, token: str, stop: asyncio.Event) -> int
                 )
         except Exception as exc:
             code = _exit_code(exc)
-            await wait_or_stop(SYSTEM_CLOCK, stop, FATAL_PAUSE)
-            return code
     finally:
         await bot.session.close()
+    if code != 0:
+        # resources are already closed; only a real signal ends the pause early
+        await wait_or_stop(SYSTEM_CLOCK, signalled, FATAL_PAUSE)
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:

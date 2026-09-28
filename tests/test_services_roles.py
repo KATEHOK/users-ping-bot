@@ -15,7 +15,7 @@ async def test_grant_admin_created(db: Database):
 
 
 async def test_grant_admin_by_id_before_first_contact(db: Database):
-    # plan section 5: admin can be granted before the user ever wrote to the bot
+    # decisions section 4: admin can be granted before the user ever wrote to the bot
     services = Services()
     async with db.transaction() as c:
         result = await services.grant_admin(c, 777)

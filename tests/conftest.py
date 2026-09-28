@@ -11,7 +11,7 @@ from app.clock import Clock
 from app.db import Database, apply_migrations
 from app.models import IncomingEvent
 
-# Plan section 15 requires that the whole suite runs against temp databases and
+# Decisions section 17 requires that the whole suite runs against temp databases and
 # fake transports only: no production .env, no network sockets. The two guards
 # below fail loudly (rather than silently letting a stray real access through)
 # so a future test cannot accidentally reintroduce either dependency.
@@ -31,6 +31,7 @@ _PRODUCTION_ENV_VARS = (
     "VAULT_TIMEOUT",
     "UPB_DB_PATH",
     "UPB_LOG_LEVEL",
+    "UPB_PING_COOLDOWN_SECONDS",
 )
 
 _REAL_ENV_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, ".env"))

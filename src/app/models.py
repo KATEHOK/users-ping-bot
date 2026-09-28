@@ -63,7 +63,6 @@ class Actor:
 class ParsedCommand:
     cmd: Cmd
     args: tuple[str, ...]
-    raw: str
 
 
 @dataclass(frozen=True, slots=True)

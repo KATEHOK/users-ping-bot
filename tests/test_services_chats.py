@@ -78,7 +78,6 @@ async def test_unregister_chat_cascades_subscriptions(db: Database):
         result = await services.unregister_chat(c, -100)
 
     assert result.chat_id == -100
-    assert result.subscriptions_removed == 2
 
     async with db.reader() as c:
         assert await services.get_chat(c, -100) is None
@@ -90,7 +89,6 @@ async def test_unregister_nonexistent_chat_is_noop(db: Database):
     services = Services()
     async with db.transaction() as c:
         result = await services.unregister_chat(c, -999)
-    assert result.subscriptions_removed == 0
     assert result.generation == 0
 
 
@@ -152,17 +150,16 @@ async def test_chat_lang_defaults_to_en_and_resets_after_reregistration(db: Data
     services = Services()
     await _touch_and_register(services, db, 1, -100)
     async with db.reader() as c:
-        assert await services.get_chat_lang(c, -100) == "en"
+        assert (await services.get_chat(c, -100)).lang == "en"
     async with db.transaction() as c:
         await services.set_chat_lang(c, -100, "ru")
     async with db.reader() as c:
-        assert await services.get_chat_lang(c, -100) == "ru"
+        assert (await services.get_chat(c, -100)).lang == "ru"
     async with db.transaction() as c:
         await services.unregister_chat(c, -100)
         await services.register_chat(c, -100, "Chat", 1)
     async with db.reader() as c:
-        assert await services.get_chat_lang(c, -100) == "en"
-        assert await services.get_chat_lang(c, -555) == "en"  # unknown chat: default
+        assert (await services.get_chat(c, -100)).lang == "en"
 
 
 async def test_set_lang_rejects_unknown_language(db: Database):

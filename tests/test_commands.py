@@ -35,7 +35,6 @@ def test_group_command_addressed_forms(text, expected_cmd, expected_args):
     assert parsed is not None
     assert parsed.cmd is expected_cmd
     assert parsed.args == expected_args
-    assert parsed.raw == text
 
 
 def test_group_command_addressed_to_us_explicitly():

@@ -19,7 +19,7 @@ from app.models import Cmd, SubscriberRef
 from app.services import Services
 from app.vault import VaultClient
 
-from conftest import FakeClock, RecordingTransport, make_event
+from conftest import FakeClock, RecordingTransport, make_admin, make_event
 
 CHAT = 100
 MSG = 7
@@ -562,6 +562,7 @@ async def test_fake_token_and_vault_markers_never_land_in_db_outbox_or_logs(tmp_
             clock=clock,
         )
 
+        await make_admin(database, services, 1)  # without a role every command is silently denied
         await handle_event(ctx, _group_event("/upb chat register", update_id=1, user_id=1))
         await handle_event(ctx, _group_event("/upb notify on", update_id=2, user_id=2))
         await handle_event(ctx, _group_event("/upb notify on", update_id=3, user_id=3))
@@ -584,8 +585,16 @@ async def test_fake_token_and_vault_markers_never_land_in_db_outbox_or_logs(tmp_
     check = sqlite3.connect(str(db_path))
     try:
         outbox_rows = check.execute("SELECT payload, last_error FROM outbox").fetchall()
+        outcomes = check.execute(
+            "SELECT outcome, COUNT(*) FROM processed_updates GROUP BY outcome"
+        ).fetchall()
     finally:
         check.close()
+
+    # the sweeps below must run over real data, not empty sets
+    assert outcomes == [("ok", 6)]
+    assert len(transport.calls) >= 5  # welcome, 2 subscribe, ping, unsubscribe, farewell
+    assert outbox_rows, "the farewell must have gone through the outbox"
     for payload, last_error in outbox_rows:
         for marker in markers:
             assert marker not in (payload or "")

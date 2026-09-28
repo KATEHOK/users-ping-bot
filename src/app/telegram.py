@@ -89,8 +89,16 @@ class AiogramTransport:
             member = await self._bot.get_chat_member(chat_id, self._bot.id)
         except Exception as exc:
             raise map_error(exc) from None
-        if member.status in ("left", "kicked"):
+        if _bot_gone(member):
             raise PermanentSend()
+
+
+def _bot_gone(member: object) -> bool:
+    """left, kicked, or restricted with is_member=False: no longer in the chat."""
+    status = getattr(member, "status", None)
+    if status in ("left", "kicked"):
+        return True
+    return status == "restricted" and getattr(member, "is_member", True) is False
 
 
 def _display_name(user: types.User) -> str | None:
@@ -163,8 +171,7 @@ def _membership_event(
     kind: Literal["my_chat_member", "chat_member"],
 ) -> IncomingEvent:
     chat = cmu.chat
-    new_status = cmu.new_chat_member.status
-    left = new_status in ("left", "kicked")
+    left = _bot_gone(cmu.new_chat_member)
     return IncomingEvent(
         kind=kind,
         update_id=update_id,
@@ -194,8 +201,10 @@ async def run_polling(
     """Own controlled long-poll loop, no stored offset.
 
     The first getUpdates carries no offset: Telegram hands back whatever it still holds
-    and claim_update makes replays harmless. Afterwards the offset lives in memory and is
-    advanced only once every update of the batch has been handled (committed).
+    and claim_update makes replays harmless. Afterwards the offset lives in memory and
+    advances past each update right after its handler returns (a poison update is recorded
+    as an error and skipped). On stop the rest of a batch is left unhandled and unconfirmed,
+    so Telegram redelivers it after a restart.
     """
     offset: int | None = None
     failures = 0
@@ -235,6 +244,8 @@ async def run_polling(
 
         failures = 0
         for update in updates:
+            if stop.is_set():
+                break  # shutting down: the rest stays unconfirmed and is redelivered
             event = to_event(update)
             if event is not None:
                 await handle_event(ctx, event)
