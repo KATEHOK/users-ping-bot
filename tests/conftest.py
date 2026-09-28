@@ -2,6 +2,7 @@ import builtins
 import os
 import re
 import socket as socket_module
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -312,3 +313,10 @@ async def subscribe(db, services, chat_id: int, user_id: int) -> None:
     async with db.transaction() as c:
         await services.touch_user(c, user_id, display_name=f"U{user_id}")
         await services.subscribe(c, chat_id, user_id)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # --basetemp may point into an ignored directory that a fresh checkout lacks
+    basetemp = config.option.basetemp
+    if basetemp:
+        Path(basetemp).resolve().parent.mkdir(parents=True, exist_ok=True)
