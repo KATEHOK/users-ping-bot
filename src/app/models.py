@@ -2,6 +2,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
+Lang = Literal["en", "ru"]
+LANGS: tuple[Lang, ...] = ("en", "ru")
+DEFAULT_LANG: Lang = "en"
+
 
 class Role(StrEnum):
     ROOT = "root"
@@ -22,6 +26,8 @@ class Cmd(StrEnum):
     PING = "ping"
     LIST = "list"
     HELP = "help"
+    LANG = "lang"
+    USAGE = "usage"  # bare/partial/unknown /upb input: help for the typed prefix
     # private
     P_HELP = "p_help"
     ADMIN_CREATE = "admin_create"
@@ -29,6 +35,8 @@ class Cmd(StrEnum):
     ADMIN_LIST = "admin_list"
     CHAT_LIST = "chat_list"
     CHAT_REMOVE = "chat_remove"
+    P_LANG = "p_lang"
+    P_USAGE = "p_usage"  # bare/partial /admin, /chat, /lang: help for the typed prefix
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +44,7 @@ class Actor:
     user_id: int
     role: Role | None = None
     is_subscriber: bool = False  # subscriber of the chat in question
+    is_chat_owner: bool = False  # root, or the admin who registered the chat in question
 
     @property
     def is_root(self) -> bool:
@@ -83,6 +92,6 @@ class IncomingEvent:
 @dataclass(frozen=True, slots=True)
 class SubscriberRef:
     user_id: int
-    subscription_id: int
-    display_name: str | None
-    username: str | None
+    subscription_id: int = 0  # iter2: dropped; construct with keywords only
+    display_name: str | None = None
+    username: str | None = None

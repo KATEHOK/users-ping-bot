@@ -22,6 +22,8 @@ def expected(cmd: Cmd, actor_label: str, *, scope: Scope, chat_active: bool) -> 
     s = spec(cmd)
     if s.scope is not scope:
         return False  # wrong scope entirely: never runnable
+    if cmd in (Cmd.LANG, Cmd.USAGE, Cmd.P_LANG, Cmd.P_USAGE):
+        return False  # iter2 placeholders: rules land with the presentation rework
 
     is_staff = actor_label in ("root", "admin")
     is_root = actor_label == "root"

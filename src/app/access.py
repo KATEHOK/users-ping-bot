@@ -57,6 +57,9 @@ CATALOG: tuple[CommandSpec, ...] = (
         "/upb help",
         "Show the commands available to you here (alias: /upb usage).",
     ),
+    # iter2 placeholders: syntax and rules are defined by the presentation rework
+    CommandSpec(Cmd.LANG, Scope.GROUP, "/upb lang <en|ru>", "Set the reply language for this chat."),
+    CommandSpec(Cmd.USAGE, Scope.GROUP, "/upb", "Show help for the typed command prefix."),
     # --- private ---
     CommandSpec(
         Cmd.P_HELP,
@@ -94,6 +97,11 @@ CATALOG: tuple[CommandSpec, ...] = (
         "/chat remove <chat_id>",
         "Remove a chat's registration and drop its subscriptions.",
     ),
+)
+
+CATALOG += (
+    CommandSpec(Cmd.P_LANG, Scope.PRIVATE, "/lang <en|ru>", "Set your reply language."),
+    CommandSpec(Cmd.P_USAGE, Scope.PRIVATE, "/admin, /chat", "Show help for the typed command prefix."),
 )
 
 _BY_CMD: dict[Cmd, CommandSpec] = {s.cmd: s for s in CATALOG}
