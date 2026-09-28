@@ -1,303 +1,234 @@
+import asyncio
 import logging
+from datetime import timedelta
 
 import pytest
 
 from app.clock import iso
-from app.db import Database, open_database
-from app.delivery import AmbiguousSend, Delivery, PermanentSend, RateLimited
+from app.delivery import (
+    OUTBOX_MAX_ATTEMPTS,
+    AmbiguousSend,
+    ChatMigrated,
+    Delivery,
+    PermanentSend,
+    RateLimited,
+    Unauthorized,
+)
 from app.services import Services
 
-from conftest import FakeClock, RecordingTransport
+from conftest import FakeClock, RecordingTransport, make_root, register_chat
 
-CHAT_A = 300
-CHAT_B = 301
+CHAT = -500
 
 
-def _mk_delivery(db, clock=None):
+def _mk(db, clock=None, stop=None):
     clock = clock or FakeClock()
     services = Services(clock=clock)
     transport = RecordingTransport()
-    return Delivery(db, services, transport, clock=clock), services, transport, clock
+    delivery = Delivery(db, services, transport, clock=clock, stop=stop)
+    return delivery, services, transport, clock
 
 
-@pytest.mark.asyncio
-async def test_farewell_is_delivered_and_marked_sent(db):
-    delivery, services, transport, clock = _mk_delivery(db)
+async def _queue(db, services, *, key="k1", etype="chat_farewell", target=CHAT, kind="chat", payload=None):
     async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        result = await services.unregister_chat(c, CHAT_A)
+        return await services.queue_event(
+            c,
+            event_key=key,
+            event_type=etype,
+            target_kind=kind,
+            target_id=target,
+            generation=1,
+            payload=payload if payload is not None else {"lang": "en"},
+        )
 
-    delivered = await delivery.run_outbox_once()
 
-    assert delivered == 1
-    assert len(transport.calls) == 1
-    assert transport.calls[0]["chat_id"] == CHAT_A
-    assert transport.calls[0]["reply_to_message_id"] is None  # standalone, no reply
+async def _event(db, services, event_id):
     async with db.reader() as c:
-        rows = await services.due_events(c, iso(clock.now()))
-    assert rows == []  # sent event is no longer due
+        return await services.get_event(c, event_id)
 
 
-@pytest.mark.asyncio
-async def test_root_revoked_notice_carries_event_time(db):
-    delivery, services, transport, clock = _mk_delivery(db)
+@pytest.mark.parametrize("lang,text", [("en", "Chat unregistered. Bye!"), ("ru", "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u0430 \u0441\u043d\u044f\u0442\u0430. \u0414\u043e \u0432\u0441\u0442\u0440\u0435\u0447\u0438!")])
+async def test_farewell_is_sent_in_the_payload_language(db, lang, text):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services, payload={"lang": lang})
+    assert await delivery.run_outbox_once() == 1
+    assert [(c["chat_id"], c["text"], c["reply_to_message_id"]) for c in transport.calls] == [
+        (CHAT, text, None)
+    ]
+    assert (await _event(db, services, eid)).status == "sent"
+
+
+async def test_unregister_through_services_carries_the_chat_language(db):
+    delivery, services, transport, _c = _mk(db)
+    await register_chat(db, services, CHAT, 1)
     async with db.transaction() as c:
-        await services.touch_user(c, 10, private_contact=True)
-        await services.set_root(c, 10)
-    clock.advance(3600)
-    async with db.transaction() as c:
-        # setting a new root queues a root_revoked notice for the old one
-        await services.set_root(c, 11)
-
+        await services.set_chat_lang(c, CHAT, "ru")
+        await services.unregister_chat(c, CHAT)
     await delivery.run_outbox_once()
-
-    assert len(transport.calls) == 1
-    assert transport.calls[0]["chat_id"] == 10
-    assert transport.calls[0]["reply_to_message_id"] is None
+    assert transport.calls[0]["text"] == "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u0430 \u0441\u043d\u044f\u0442\u0430. \u0414\u043e \u0432\u0441\u0442\u0440\u0435\u0447\u0438!"
 
 
-@pytest.mark.asyncio
-async def test_skips_event_cancelled_after_it_was_fetched(db):
-    delivery, services, transport, clock = _mk_delivery(db)
+@pytest.mark.parametrize("lang", ["en", "ru"])
+async def test_root_revoked_names_the_event_time_in_the_payload_language(db, lang):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(
+        db, services, key="r", etype="root_revoked", target=42, kind="user", payload={"lang": lang}
+    )
+    await delivery.run_outbox_once()
+    created = (await _event(db, services, eid)).created_at
+    expected = f"Root role revoked at {created}." if lang == "en" else f"\u0420\u043e\u043b\u044c root \u0441\u043d\u044f\u0442\u0430: {created}."
+    assert transport.calls[0]["text"] == expected
+    assert transport.calls[0]["chat_id"] == 42
+
+
+async def test_set_root_queues_a_notice_in_the_users_language(db):
+    delivery, services, transport, _c = _mk(db)
+    await make_root(db, services, 1, contact=True)
     async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        await services.unregister_chat(c, CHAT_A)
-        # re-registering cancels the pending farewell of the previous generation
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
+        await services.set_user_lang(c, 1, "ru")
+        await services.touch_user(c, 2)
+        await services.set_root(c, 2)
+    await delivery.run_outbox_once()
+    assert transport.calls[0]["chat_id"] == 1
+    assert transport.calls[0]["text"].startswith("\u0420\u043e\u043b\u044c root \u0441\u043d\u044f\u0442\u0430:")
 
-    delivered = await delivery.run_outbox_once()
 
-    assert delivered == 0
+async def test_whole_row_is_reread_before_the_attempt(db):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services)
+    async with db.reader() as c:
+        stale = await services.due_events(c, iso(FakeClock().now()))
+    async with db.transaction() as c:
+        await services.cancel_chat_events(c, CHAT)
+    assert stale[0].status == "pending"
+    assert await delivery._deliver_one(stale[0]) is False
     assert transport.calls == []
+    assert (await _event(db, services, eid)).status == "cancelled"
 
 
-@pytest.mark.asyncio
-async def test_one_unreachable_chat_does_not_block_others(db):
-    delivery, services, transport, clock = _mk_delivery(db)
-    async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        await services.register_chat(c, CHAT_B, "Chat B", 1)
-        await services.unregister_chat(c, CHAT_A)
-        await services.unregister_chat(c, CHAT_B)
-
-    transport.fail_chat(CHAT_A, PermanentSend())
-
-    delivered = await delivery.run_outbox_once()
-
-    assert delivered == 1  # CHAT_B still got its farewell
-    chat_ids_sent = {call["chat_id"] for call in transport.calls}
-    assert CHAT_A in chat_ids_sent
-    assert CHAT_B in chat_ids_sent
-
-
-@pytest.mark.asyncio
-async def test_permanent_failure_ends_event_as_failed(db):
-    delivery, services, transport, clock = _mk_delivery(db)
-    async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        result = await services.unregister_chat(c, CHAT_A)
-
-    transport.fail_chat(CHAT_A, PermanentSend())
-    delivered = await delivery.run_outbox_once()
-
-    assert delivered == 0
+async def test_retargeted_row_is_sent_to_the_current_target(db):
+    delivery, services, transport, _c = _mk(db)
+    await _queue(db, services)
     async with db.reader() as c:
-        cursor = await c.execute(
-            "SELECT status, last_error FROM outbox WHERE target_kind='chat' AND target_id=?",
-            (CHAT_A,),
-        )
-        status, last_error = await cursor.fetchone()
-    assert status == "failed"
-    assert last_error == "permanent"
-
-
-@pytest.mark.asyncio
-async def test_temporary_failure_is_retried_with_backoff(db):
-    delivery, services, transport, clock = _mk_delivery(db)
+        stale = await services.due_events(c, iso(FakeClock().now()))
     async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        await services.unregister_chat(c, CHAT_A)
-
-    transport.raise_next(RateLimited(retry_after=5.0))
-    delivered = await delivery.run_outbox_once()
-    assert delivered == 0
-
-    async with db.reader() as c:
-        cursor = await c.execute(
-            "SELECT status, attempts, next_attempt_at, last_error FROM outbox "
-            "WHERE target_kind='chat' AND target_id=?",
-            (CHAT_A,),
-        )
-        status, attempts, next_attempt_at, last_error = await cursor.fetchone()
-    assert status == "pending"
-    assert attempts == 1
-    assert next_attempt_at is not None
-    assert next_attempt_at > iso(clock.now())
-    assert last_error == "rate_limited"
-
-    # not due yet: a run right now must not retry it
-    delivered_again = await delivery.run_outbox_once()
-    assert delivered_again == 0
-    assert len(transport.calls) == 1
-
-    # advance past next_attempt_at and it becomes due again
-    clock.advance(3600)
-    delivered_final = await delivery.run_outbox_once()
-    assert delivered_final == 1
-    assert len(transport.calls) == 2
+        await services.migrate_chat(c, CHAT, -1000)
+    await delivery._deliver_one(stale[0])
+    assert transport.calls[0]["chat_id"] == -1000
 
 
-@pytest.mark.asyncio
-async def test_ambiguous_outbox_failure_is_retried_as_temporary(db):
-    delivery, services, transport, clock = _mk_delivery(db)
-    async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        await services.unregister_chat(c, CHAT_A)
-
-    transport.raise_next(AmbiguousSend())
-    delivered = await delivery.run_outbox_once()
-    assert delivered == 0
-
-    async with db.reader() as c:
-        cursor = await c.execute(
-            "SELECT status, last_error FROM outbox WHERE target_kind='chat' AND target_id=?",
-            (CHAT_A,),
-        )
-        status, last_error = await cursor.fetchone()
-    assert status == "pending"
-    assert last_error == "ambiguous"
+async def test_three_attempts_then_failed_with_a_log_line(db, caplog):
+    delivery, services, transport, clock = _mk(db)
+    eid = await _queue(db, services)
+    transport.queue_raises([AmbiguousSend()] * 10)
+    with caplog.at_level(logging.ERROR):
+        for _ in range(6):
+            await delivery.run_outbox_once()
+            clock.advance(4000)
+    ev = await _event(db, services, eid)
+    assert (ev.status, ev.attempts) == ("failed", OUTBOX_MAX_ATTEMPTS)
+    assert len(transport.calls) == 3
+    assert any("outbox_failed" in r.getMessage() and f"event_id={eid}" in r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.asyncio
-async def test_unexpected_error_in_one_event_does_not_stop_the_batch(db):
-    delivery, services, transport, clock = _mk_delivery(db)
-    async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        await services.register_chat(c, CHAT_B, "Chat B", 1)
-        await services.unregister_chat(c, CHAT_A)
-        await services.unregister_chat(c, CHAT_B)
-
-    transport.fail_chat(CHAT_A, RuntimeError("boom"))
-
-    delivered = await delivery.run_outbox_once()
-
-    assert delivered == 1  # CHAT_B still delivered despite CHAT_A raising unexpectedly
-    chat_ids_sent = {call["chat_id"] for call in transport.calls}
-    assert CHAT_B in chat_ids_sent
+async def test_permanent_error_fails_at_once_and_logs(db, caplog):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services)
+    transport.queue_raises([PermanentSend()])
+    with caplog.at_level(logging.ERROR):
+        await delivery.run_outbox_once()
+    ev = await _event(db, services, eid)
+    assert (ev.status, ev.attempts, ev.last_error) == ("failed", 1, "permanent")
+    assert any("outbox_failed" in r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.asyncio
-async def test_root_revoked_permanent_failure_leaves_role_change_untouched(db):
-    # punch-list P2: a root_revoked notice hits a PermanentSend (the demoted
-    # root blocked the bot); the role change that queued the notice must stand
-    # regardless -- the outbox worker only ever calls services.mark_event, it
-    # never re-reads or reverts role state on any delivery outcome.
-    delivery, services, transport, clock = _mk_delivery(db)
-    async with db.transaction() as c:
-        await services.touch_user(c, 10, private_contact=True)
-        await services.set_root(c, 10)
-    async with db.transaction() as c:
-        await services.set_root(c, 11)  # queues a root_revoked notice for user 10
-
-    transport.fail_chat(10, PermanentSend())
-    delivered = await delivery.run_outbox_once()
-
-    assert delivered == 0
-    async with db.reader() as c:
-        cursor = await c.execute(
-            "SELECT status, last_error FROM outbox WHERE event_type = 'root_revoked'"
-        )
-        status, last_error = await cursor.fetchone()
-        root = await services.get_root(c)
-        role_10 = await services.get_role(c, 10)
-    assert status == "failed"
-    assert last_error == "permanent"
-    assert root == 11  # new root stands
-    assert role_10 is None  # demoted root stays demoted; nothing was rolled back
-
-
-@pytest.mark.asyncio
-async def test_run_outbox_once_skips_event_cancelled_between_fetch_and_final_check(tmp_path):
-    # punch-list P3: drives Delivery.run_outbox_once() itself (not just the
-    # services-level status transition) through fetch-then-cancel, using a
-    # genuinely separate connection for the cancelling write.
-    path = str(tmp_path / "cancel_race.sqlite3")
-    async with open_database(path) as boot:
-        async with boot.transaction() as c:
-            svc = Services()
-            await svc.touch_user(c, 1)
-            await svc.register_chat(c, CHAT_A, "Chat A", 1)
-            await svc.unregister_chat(c, CHAT_A)  # queues a pending farewell
-
-    db_worker = Database(path)
-    db_canceller = Database(path)
-    await db_worker.connect()
-    await db_canceller.connect()
-    clock = FakeClock()
-    services = Services(clock=clock)
-    transport = RecordingTransport()
-    delivery = Delivery(db_worker, services, transport, clock=clock)
-
-    real_due_events = services.due_events
-    cancelled_event_id: list[int] = []
-
-    async def due_events_then_race_cancel(c, now_iso, limit=10):
-        events = await real_due_events(c, now_iso, limit=limit)
-        assert len(events) == 1  # exactly the farewell the worker was meant to fetch
-        cancelled_event_id.append(events[0].event_id)
-        # a second, independent connection cancels the event right after the
-        # worker fetched it -- before the worker's own per-event re-check
-        async with db_canceller.transaction() as c2:
-            await Services(clock=clock).cancel_chat_events(c2, CHAT_A)
-        return events
-
-    services.due_events = due_events_then_race_cancel
-
-    try:
-        delivered = await delivery.run_outbox_once()
-    finally:
-        await db_worker.close()
-        await db_canceller.close()
-
-    assert delivered == 0
-    assert transport.calls == []  # zero transport calls for the cancelled event
-
-    check = Database(path)
-    await check.connect()
-    try:
-        async with check.reader() as c:
-            status = await services.event_status(c, cancelled_event_id[0])
-    finally:
-        await check.close()
-    assert status == "cancelled"  # stays cancelled; the worker's re-check never flips it
-
-
-@pytest.mark.asyncio
-async def test_no_fake_token_marker_leaks_through_outbox(db, caplog):
-    caplog.set_level(logging.INFO, logger="app.delivery")
-    delivery, services, transport, clock = _mk_delivery(db)
-    async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.register_chat(c, CHAT_A, "Chat A", 1)
-        await services.unregister_chat(c, CHAT_A)
-
-    fake_token = "FAKE-TOKEN-MARKER-77bb"
-    transport.raise_next(PermanentSend(f"response body contained {fake_token}"))
-
+async def test_rate_limit_honours_retry_after(db):
+    delivery, services, transport, clock = _mk(db)
+    eid = await _queue(db, services)
+    transport.queue_raises([RateLimited(600.0)])
     await delivery.run_outbox_once()
+    ev = await _event(db, services, eid)
+    assert ev.status == "pending" and ev.attempts == 1
+    assert ev.next_attempt_at == iso(clock.now() + timedelta(seconds=600))
+    assert await delivery.run_outbox_once() == 0  # not due yet
+    clock.advance(601)
+    assert await delivery.run_outbox_once() == 1
 
-    for call in transport.calls:
-        assert fake_token not in call["text"]
-    for record in caplog.records:
-        assert fake_token not in record.getMessage()
+
+async def test_chat_migrated_retargets_and_retries_on_the_new_id(db):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services)
+    transport.fail_chat(CHAT, ChatMigrated(-1000))
+    await delivery.run_outbox_once()
+    ev = await _event(db, services, eid)
+    assert (ev.status, ev.target_id) == ("pending", -1000)
     async with db.reader() as c:
-        cursor = await c.execute("SELECT last_error FROM outbox WHERE target_id=?", (CHAT_A,))
-        (last_error,) = await cursor.fetchone()
-    assert fake_token not in (last_error or "")
+        assert await services.resolve_chat_id(c, CHAT) == -1000
+    await delivery.run_outbox_once()  # next cycle
+    assert [c["chat_id"] for c in transport.calls] == [CHAT, -1000]
+    assert (await _event(db, services, eid)).status == "sent"
+
+
+async def test_contradictory_migration_cannot_loop_forever(db):
+    delivery, services, transport, clock = _mk(db)
+    eid = await _queue(db, services)
+    async with db.transaction() as c:
+        await services.migrate_chat(c, CHAT, -7)
+    # the row was retargeted to -7; force it back to simulate a stuck target
+    async with db.transaction() as c:
+        await c.execute("UPDATE outbox SET target_id = ?", (CHAT,))
+    transport.fail_chat(CHAT, ChatMigrated(-8))
+    for _ in range(6):
+        await delivery.run_outbox_once()
+        clock.advance(10)
+    assert (await _event(db, services, eid)).status == "failed"
+    assert len(transport.calls) == 3
+
+
+async def test_unknown_event_type_is_failed_without_a_send(db):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services, etype="mystery")
+    await delivery.run_outbox_once()
+    assert transport.calls == []
+    assert (await _event(db, services, eid)).status == "failed"
+
+
+async def test_one_bad_event_does_not_stop_the_batch(db, monkeypatch):
+    delivery, services, transport, _c = _mk(db)
+    await _queue(db, services, key="a", target=-1)
+    await _queue(db, services, key="b", target=-2)
+    original = delivery._render_outbox_text
+    n = {"i": 0}
+
+    def flaky(event):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise RuntimeError("boom")
+        return original(event)
+
+    monkeypatch.setattr(delivery, "_render_outbox_text", flaky)
+    assert await delivery.run_outbox_once() == 1
+    assert [c["chat_id"] for c in transport.calls] == [-2]
+
+
+async def test_unauthorized_in_the_outbox_is_fatal(db):
+    delivery, services, transport, _c = _mk(db)
+    await _queue(db, services)
+    transport.queue_raises([Unauthorized()])
+    with pytest.raises(Unauthorized):
+        await delivery.run_outbox_once()
+
+
+async def test_outbox_loop_stops_promptly_on_stop(db):
+    stop = asyncio.Event()
+
+    class Blocking(FakeClock):
+        async def sleep(self, seconds):
+            await asyncio.Event().wait()
+
+    delivery, services, transport, _c = _mk(db, Blocking(), stop)
+    task = asyncio.create_task(delivery.outbox_loop(stop))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    stop.set()
+    await asyncio.wait_for(task, 2)

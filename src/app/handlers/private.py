@@ -1,39 +1,29 @@
-"""Private-chat command handlers (plan section 5)."""
+"""Private-chat command handlers (decisions section 4)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-import aiosqlite
+from typing import TYPE_CHECKING
 
 from .. import access, commands, rendering
-from ..models import Actor, Cmd, IncomingEvent, Role, Scope
+from ..models import Cmd, IncomingEvent, Role, Scope
+from ..rendering import t
 
 if TYPE_CHECKING:
     from . import Context
 
-NO_ADMINS_TEXT = "No admins."
-NO_CHATS_TEXT = "No registered chats."
-
-
-@dataclass(slots=True)
-class _Outcome:
-    kind: str
-    payload: Any = None
-
 
 async def handle(ctx: Context, event: IncomingEvent) -> None:
+    from . import mark_ignored
+
+    assert event.user_id is not None
     parsed = commands.parse_private_command(event.text, event.entities, bot_username=ctx.bot_username)
-    cmd = parsed.cmd if parsed is not None else None
-    outcome: _Outcome | None = None
+    replies: list[str] = []
 
     async with ctx.db.transaction() as c:
         if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
-            return  # duplicate: complete no-op
+            return  # duplicate
 
-        # every private message of an identified user gets its contact recorded,
-        # including plain text and commands the author has no right to (plan section 8)
+        # every private message of an identified user records the contact
         await ctx.services.touch_user(
             c,
             event.user_id,
@@ -42,128 +32,80 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             private_contact=True,
         )
 
-        if cmd is None:
-            return  # unknown command / plain text: silence, contact already recorded
+        if parsed is None:
+            await mark_ignored(c, ctx, event.update_id)
+            return
 
+        cmd = parsed.cmd
         actor = await ctx.services.load_actor(c, event.user_id)
         if not access.can_run(cmd, actor, scope=Scope.PRIVATE, chat_active=True):
-            return  # silent path: still committed the claim + contact touch above
+            await mark_ignored(c, ctx, event.update_id)
+            return
 
+        lang = await ctx.services.get_user_lang(c, event.user_id)
         try:
-            arg_value = commands.validate_args(cmd, parsed.args)
+            arg = commands.validate_args(cmd, parsed.args)
         except ValueError:
-            outcome = _Outcome("syntax_error", cmd)
+            replies.append(t("bad_args", lang, syntax=access.spec(cmd).syntax))
         else:
-            outcome = await _execute(ctx, c, cmd, arg_value, actor)
+            replies = await _execute(ctx, c, cmd, arg, parsed.args, actor, lang)
 
-    if outcome is not None:
-        await _deliver(ctx, event, outcome)
+        if not replies:
+            await mark_ignored(c, ctx, event.update_id)
+
+    for text in replies:
+        if not await ctx.delivery.send_reply(
+            event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
+        ):
+            break
 
 
-async def _execute(
-    ctx: Context, c: aiosqlite.Connection, cmd: Cmd, arg_value: int | None, actor: Actor
-) -> _Outcome:
+async def _execute(ctx, c, cmd: Cmd, arg, args, actor, lang) -> list[str]:
+    svc = ctx.services
+
     if cmd is Cmd.P_HELP:
-        return _Outcome("help", actor)
+        return [rendering.help_text(actor, scope=Scope.PRIVATE, chat_active=True, lang=lang)]
+
+    if cmd is Cmd.P_LANG:
+        await svc.set_user_lang(c, actor.user_id, arg)
+        return [t("lang_set", arg)]
 
     if cmd is Cmd.ADMIN_CREATE:
-        assert arg_value is not None
-        result = await ctx.services.grant_admin(c, arg_value)
-        return _Outcome("admin_create", (arg_value, result))
+        result = await svc.grant_admin(c, arg)
+        if result.status == "is_root":
+            return [t("root_cli_only", lang)]
+        return [t("admin_created" if result.status == "created" else "admin_exists", lang, id=arg)]
 
     if cmd is Cmd.ADMIN_REMOVE:
-        assert arg_value is not None
-        role = await ctx.services.get_role(c, arg_value)
-        if role is Role.ROOT:
-            # /admin remove <root_id> never touches root: only the CLI does
-            return _Outcome("admin_remove_is_root", arg_value)
-        result = await ctx.services.revoke_admin(c, arg_value)
-        return _Outcome("admin_remove", (arg_value, result))
+        if await svc.get_role(c, arg) is Role.ROOT:
+            return [t("root_cli_only", lang)]  # root changes only through the CLI
+        result = await svc.revoke_admin(c, arg)
+        if not result.revoked:
+            return [t("admin_absent", lang, id=arg)]
+        return [t("admin_removed", lang, id=arg, n=len(result.chat_ids))]
 
     if cmd is Cmd.ADMIN_LIST:
-        rows = await ctx.services.list_admins(c)
-        return _Outcome("admin_list", rows)
+        return rendering.admin_list_text(await svc.list_admins(c), lang) or [t("admins_empty", lang)]
 
     if cmd is Cmd.CHAT_LIST:
-        rows = await ctx.services.list_chats(c)
-        return _Outcome("chat_list", rows)
+        if actor.is_root:
+            rows = await svc.list_chats(c)
+        else:
+            rows = await svc.list_chats(c, registered_by=actor.user_id)
+        return rendering.chat_list_text(rows, lang, show_registrar=actor.is_root) or [
+            t("chats_empty", lang)
+        ]
 
     if cmd is Cmd.CHAT_REMOVE:
-        assert arg_value is not None
-        canonical = await ctx.services.resolve_chat_id(c, arg_value)
-        chat = await ctx.services.get_chat(c, canonical)
-        if chat is None:
-            return _Outcome("chat_remove_noop", arg_value)
-        result = await ctx.services.remove_chat_cascade(c, canonical)
-        return _Outcome("chat_remove", result)
+        result = await svc.remove_chat(c, arg)  # resolves an aliased (migrated) id itself
+        if result.chat_ids:
+            return [t("chat_removed", lang, chat_id=result.chat_ids[0])]
+        return [t("chat_absent", lang, chat_id=arg)]
+
+    if cmd is Cmd.P_USAGE:
+        text = rendering.usage_text(
+            actor, scope=Scope.PRIVATE, chat_active=True, prefix=args, lang=lang
+        )
+        return [text] if text else []
 
     raise AssertionError(f"unhandled private command {cmd!r}")
-
-
-async def _deliver(ctx: Context, event: IncomingEvent, outcome: _Outcome) -> None:
-    chat_id = event.chat_id
-    reply_to = event.message_id
-
-    async def reply(text: str) -> None:
-        await ctx.delivery.send_reply(chat_id, text, reply_to=reply_to, thread_id=None)
-
-    if outcome.kind == "syntax_error":
-        cmd: Cmd = outcome.payload
-        await reply(f"Invalid arguments. Usage: {access.spec(cmd).syntax}")
-
-    elif outcome.kind == "help":
-        actor: Actor = outcome.payload
-        await reply(rendering.help_text(actor, scope=Scope.PRIVATE, chat_active=True))
-
-    elif outcome.kind == "admin_create":
-        user_id, result = outcome.payload
-        if result.status == "created":
-            await reply(f"Granted admin to user {user_id}.")
-        elif result.status == "exists":
-            await reply(f"User {user_id} is already an admin.")
-        else:  # "is_root"
-            await reply("That user is root; root is assigned only via the CLI.")
-
-    elif outcome.kind == "admin_remove_is_root":
-        user_id = outcome.payload
-        await reply(f"User {user_id} is root; root is changed only via the CLI.")
-
-    elif outcome.kind == "admin_remove":
-        user_id, result = outcome.payload
-        if result.revoked:
-            for cid in result.chat_ids:
-                ctx.delivery.cancel_chat(cid)
-            await reply(
-                f"Revoked admin from user {user_id} and removed {len(result.chat_ids)} chat(s)."
-            )
-        else:
-            await reply(f"User {user_id} is not an admin.")
-
-    elif outcome.kind == "admin_list":
-        rows = outcome.payload
-        for chunk in rendering.admin_list_text(rows) or [NO_ADMINS_TEXT]:
-            await reply(chunk)
-
-    elif outcome.kind == "chat_list":
-        rows = outcome.payload
-        for chunk in rendering.chat_list_text(rows) or [NO_CHATS_TEXT]:
-            await reply(chunk)
-
-    elif outcome.kind == "chat_remove_noop":
-        chat_id_arg = outcome.payload
-        await reply(f"No active registration found for chat {chat_id_arg}.")
-
-    elif outcome.kind == "chat_remove":
-        result = outcome.payload
-        for cid in result.chat_ids:
-            ctx.delivery.cancel_chat(cid)
-        if result.admin_demoted is not None:
-            await reply(
-                f"Removed {len(result.chat_ids)} chat(s) and revoked admin "
-                f"from user {result.admin_demoted}."
-            )
-        else:
-            await reply(f"Removed {len(result.chat_ids)} chat(s).")
-
-    else:
-        raise AssertionError(f"unhandled outcome kind {outcome.kind!r}")

@@ -1,160 +1,129 @@
-"""Group command handlers (plan sections 4, 6, 9)."""
+"""Group command handlers (decisions sections 1-3)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-import aiosqlite
+from typing import TYPE_CHECKING
 
 from .. import access, commands, rendering
-from ..models import Actor, Cmd, IncomingEvent, Scope
-from ..services import ChatRow
+from ..models import DEFAULT_LANG, Cmd, IncomingEvent, Scope, SubscriberRef
+from ..rendering import t
 
 if TYPE_CHECKING:
     from . import Context
 
-ALREADY_REGISTERED_TEXT = "This chat is already registered."
-SUBSCRIBED_TEXT = "You are now subscribed to pings in this chat."
-UNSUBSCRIBED_TEXT = "You will no longer receive pings in this chat."
+_COOLDOWN_GC_SIZE = 1000
 
 
-@dataclass(slots=True)
-class _Outcome:
-    kind: str
-    payload: Any = None
+def _now(ctx: Context) -> float:
+    return ctx.clock.now().timestamp()
 
 
-async def _authorize(
-    ctx: Context, c: aiosqlite.Connection, event: IncomingEvent, cmd: Cmd
-) -> tuple[bool, Actor, ChatRow | None, int]:
-    chat_id = await ctx.services.resolve_chat_id(c, event.chat_id)
-    blocked = await ctx.services.is_blocked(c, chat_id)
-    chat_row = None if blocked else await ctx.services.get_chat(c, chat_id)
-    chat_active = chat_row is not None
-    actor = await ctx.services.load_actor(c, event.user_id, chat_id=chat_id)
-    ok = (not blocked) and access.can_run(cmd, actor, scope=Scope.GROUP, chat_active=chat_active)
-    return ok, actor, chat_row, chat_id
+def _ping_limited(ctx: Context, chat_id: int, user_id: int, is_root: bool) -> bool:
+    if is_root or ctx.ping_cooldown_seconds <= 0:
+        return False
+    last = ctx.ping_last.get((chat_id, user_id))
+    return last is not None and _now(ctx) - last < ctx.ping_cooldown_seconds
+
+
+def _note_ping(ctx: Context, chat_id: int, user_id: int) -> None:
+    now = _now(ctx)
+    if len(ctx.ping_last) >= _COOLDOWN_GC_SIZE:
+        cutoff = now - ctx.ping_cooldown_seconds
+        for key in [k for k, v in ctx.ping_last.items() if v <= cutoff]:
+            del ctx.ping_last[key]
+    ctx.ping_last[(chat_id, user_id)] = now
 
 
 async def handle(ctx: Context, event: IncomingEvent) -> None:
+    from . import mark_ignored
+
     parsed = commands.parse_group_command(event.text, event.entities, bot_username=ctx.bot_username)
     if parsed is None:
-        return  # not a recognised /upb subcommand: no permission ever hinges on it
+        return  # not a /upb command: never recorded
 
     cmd = parsed.cmd
-    outcome: _Outcome | None = None
+    assert event.user_id is not None
+    replies: list[str] = []
+    ping: list[SubscriberRef] | None = None
+    ping_key: tuple[int, int] | None = None
 
     async with ctx.db.transaction() as c:
         if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
-            return  # duplicate: complete no-op, not even the contact touch below
+            return  # duplicate
 
         await ctx.services.touch_user(
             c, event.user_id, username=event.username, display_name=event.display_name
         )
 
-        # the only check that matters is the one taken right here, inside this
-        # transaction, immediately before mutating (plan section 9's last-check rule)
-        ok, actor, chat_row, chat_id = await _authorize(ctx, c, event, cmd)
-        if not ok:
-            return  # silent path: claim_update + contact touch still commit
+        chat_id = await ctx.services.resolve_chat_id(c, event.chat_id)
+        if chat_id != event.chat_id:
+            await mark_ignored(c, ctx, event.update_id)  # migrated old group
+            return
 
-        outcome = await _execute(ctx, c, cmd, event, chat_id, actor, chat_row)
+        chat = await ctx.services.get_chat(c, chat_id)
+        active = chat is not None
+        lang = chat.lang if chat is not None else DEFAULT_LANG
+        actor = await ctx.services.load_actor(c, event.user_id, chat_id=chat_id)
 
-    if outcome is not None:
-        await _deliver(ctx, event, outcome)
+        # the only authorization check of this reaction
+        if not access.can_run(cmd, actor, scope=Scope.GROUP, chat_active=active):
+            await mark_ignored(c, ctx, event.update_id)
+            return
 
+        new_lang = lang
+        if cmd is Cmd.LANG:
+            try:
+                new_lang = commands.validate_args(cmd, parsed.args)  # type: ignore[assignment]
+            except ValueError:
+                replies.append(t("bad_args", lang, syntax=access.spec(cmd).syntax))
+                cmd = Cmd.USAGE  # nothing more to do below
+        elif cmd is Cmd.PING and _ping_limited(ctx, chat_id, event.user_id, actor.is_root):
+            await mark_ignored(c, ctx, event.update_id)
+            return
 
-async def _execute(
-    ctx: Context,
-    c: aiosqlite.Connection,
-    cmd: Cmd,
-    event: IncomingEvent,
-    chat_id: int,
-    actor: Actor,
-    chat_row: ChatRow | None,
-) -> _Outcome:
-    if cmd is Cmd.CHAT_REGISTER:
-        result = await ctx.services.register_chat(c, chat_id, event.chat_title, event.user_id)
-        return _Outcome("register", result)
-
-    if cmd is Cmd.CHAT_UNREGISTER:
-        await ctx.services.unregister_chat(c, chat_id)  # farewell queued by services itself
-        return _Outcome("unregister", chat_id)
-
-    if cmd is Cmd.NOTIFY_ON:
-        result = await ctx.services.subscribe(c, chat_id, event.user_id)
-        return _Outcome("notify_on", result)
-
-    if cmd is Cmd.NOTIFY_OFF:
-        removed = await ctx.services.unsubscribe(c, chat_id, event.user_id)
-        generation = chat_row.registration_generation if chat_row is not None else 0
-        grant = ctx.delivery.grants.issue(
-            update_id=event.update_id,
-            user_id=event.user_id,
-            chat_id=chat_id,
-            message_id=event.message_id,
-            generation=generation,
-        )
-        return _Outcome("notify_off", (removed, grant))
-
-    if cmd is Cmd.PING:
-        snapshot = await ctx.services.list_subscribers(c, chat_id)
-        generation = chat_row.registration_generation if chat_row is not None else 0
-        return _Outcome("ping", (snapshot, generation))
-
-    if cmd is Cmd.LIST:
-        snapshot = await ctx.services.list_subscribers(c, chat_id)
-        return _Outcome("list", snapshot)
-
-    if cmd is Cmd.HELP:
-        return _Outcome("help", actor)
-
-    raise AssertionError(f"unhandled group command {cmd!r}")
-
-
-async def _deliver(ctx: Context, event: IncomingEvent, outcome: _Outcome) -> None:
-    # replies always go back to the chat/message the command actually arrived in,
-    # even though the mutation above may have applied to a resolved canonical id
-    chat_id = event.chat_id
-    reply_to = event.message_id
-    thread_id = event.thread_id
-
-    if outcome.kind == "register":
-        result = outcome.payload
-        text = rendering.welcome_text() if result.created else ALREADY_REGISTERED_TEXT
-        await ctx.delivery.send_reply(chat_id, text, reply_to=reply_to, thread_id=thread_id)
-
-    elif outcome.kind == "unregister":
-        ctx.delivery.cancel_chat(outcome.payload)
-        # the farewell itself is a queued outbox event, delivered by the outbox loop
-
-    elif outcome.kind == "notify_on":
-        ctx.delivery.grants.revoke_user(chat_id, event.user_id)
-        await ctx.delivery.send_reply(chat_id, SUBSCRIBED_TEXT, reply_to=reply_to, thread_id=thread_id)
-
-    elif outcome.kind == "notify_off":
-        _removed, grant = outcome.payload
-        await ctx.delivery.confirm_notify_off(grant, UNSUBSCRIBED_TEXT)
-
-    elif outcome.kind == "ping":
-        snapshot, generation = outcome.payload
-        await ctx.delivery.run_ping(
-            chat_id, event.user_id, event.message_id, thread_id, generation, snapshot
-        )
-
-    elif outcome.kind == "list":
-        subs = outcome.payload
-        if not subs:
-            await ctx.delivery.send_reply(chat_id, rendering.PONG, reply_to=reply_to, thread_id=thread_id)
+        if cmd is Cmd.CHAT_REGISTER:
+            result = await ctx.services.register_chat(c, chat_id, event.chat_title, event.user_id)
+            replies.append(rendering.welcome_text(lang) if result.created else t("already_registered", lang))
+        elif cmd is Cmd.CHAT_UNREGISTER:
+            await ctx.services.unregister_chat(c, chat_id)  # farewell goes through the outbox
+        elif cmd is Cmd.NOTIFY_ON:
+            sub = await ctx.services.subscribe(c, chat_id, event.user_id)
+            replies.append(t("subscribed" if sub.created else "already_subscribed", lang))
+        elif cmd is Cmd.NOTIFY_OFF:
+            removed = await ctx.services.unsubscribe(c, chat_id, event.user_id)
+            replies.append(t("unsubscribed" if removed else "not_subscribed", lang))
+        elif cmd is Cmd.PING:
+            ping = await ctx.services.list_subscribers(c, chat_id, exclude_user_id=event.user_id)
+            ping_key = (chat_id, event.user_id)
+        elif cmd is Cmd.LIST:
+            subs = await ctx.services.list_subscribers(c, chat_id)
+            replies.extend(rendering.subscriber_list_text(subs, lang) or [t("list_empty", lang)])
+        elif cmd is Cmd.HELP:
+            replies.append(rendering.help_text(actor, scope=Scope.GROUP, chat_active=True, lang=lang))
+        elif cmd is Cmd.LANG:
+            await ctx.services.set_chat_lang(c, chat_id, new_lang)
+            replies.append(t("lang_set", new_lang))
+        elif cmd is Cmd.USAGE:
+            if not replies:  # empty text means nothing to show: silence
+                text = rendering.usage_text(
+                    actor, scope=Scope.GROUP, chat_active=active, prefix=parsed.args, lang=lang
+                )
+                if text:
+                    replies.append(text)
         else:
-            for chunk in rendering.subscriber_list_text(subs):
-                await ctx.delivery.send_reply(chat_id, chunk, reply_to=reply_to, thread_id=thread_id)
+            raise AssertionError(f"unhandled group command {cmd!r}")
 
-    elif outcome.kind == "help":
-        actor = outcome.payload
-        text = rendering.help_text(actor, scope=Scope.GROUP, chat_active=True)
-        await ctx.delivery.send_reply(chat_id, text, reply_to=reply_to, thread_id=thread_id)
+        if not replies and ping is None:
+            await mark_ignored(c, ctx, event.update_id)
 
-    else:
-        raise AssertionError(f"unhandled outcome kind {outcome.kind!r}")
+    # after commit: what is sent is final
+    if ping_key is not None:
+        _note_ping(ctx, *ping_key)
+    send = ctx.delivery
+    if ping is not None:
+        await send.run_ping(event.chat_id, event.message_id, event.thread_id, ping)
+    for text in replies:
+        if not await send.send_reply(
+            event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
+        ):
+            break

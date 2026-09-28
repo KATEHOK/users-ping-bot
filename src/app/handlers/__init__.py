@@ -1,16 +1,22 @@
-"""Dispatch entrypoint: Context + handle_event, running the section-9 order.
+"""Dispatch entrypoint: Context + handle_event.
 
-group.py, private.py and membership.py hold the per-kind logic; every state
-change goes through services.py, every outgoing call goes through delivery.py.
+Each handler runs one write transaction: claim_update, contact record, actor load,
+authorization, argument validation, mutation, outbox. Replies are sent only after
+commit and are never re-checked (decisions section 2).
 """
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
+
+import aiosqlite
 
 from ..clock import Clock
 from ..db import Database
-from ..delivery import Delivery
+from ..delivery import Delivery, Unauthorized
 from ..models import IncomingEvent
 from ..services import Services
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,23 +27,30 @@ class Context:
     bot_id: int
     bot_username: str
     clock: Clock
+    ping_cooldown_seconds: float = 5.0
+    # (canonical chat_id, user_id) -> unix time of the last accepted ping; memory only
+    ping_last: dict[tuple[int, int], float] = field(default_factory=dict)
 
 
-# imported after Context is defined: group/private/membership only need Context for
-# type annotations (under `from __future__ import annotations`), so this ordering
-# avoids a real circular-import cycle between the package and its submodules.
+# imported after Context is defined: the submodules only need it for annotations
 from . import group, membership, private  # noqa: E402
 
 
-async def handle_event(ctx: Context, event: IncomingEvent) -> None:
+async def mark_ignored(c: aiosqlite.Connection, ctx: Context, update_id: int) -> None:
+    """Flip the claimed update to outcome 'ignored' (services has no API for it)."""
+    await c.execute(
+        "UPDATE processed_updates SET outcome = 'ignored' WHERE bot_id = ? AND update_id = ?",
+        (ctx.bot_id, update_id),
+    )
+
+
+async def _dispatch(ctx: Context, event: IncomingEvent) -> None:
     if event.kind == "message":
-        # migration service messages carry no text and no identified acting user,
-        # so they are dispatched before the bot/anonymous/edited filter below
+        # migration service messages carry no text and no identified sender
         if event.migrate_to_chat_id is not None or event.migrate_from_chat_id is not None:
             await membership.handle_migration(ctx, event)
             return
-        # step 1 (plan section 9): reject anything not from an identified human user,
-        # and never re-run a command from an edited message
+        # only identified humans; an edited message never re-runs a command
         if event.is_bot or event.user_id is None or event.edited:
             return
         if event.chat_type == "private":
@@ -52,4 +65,19 @@ async def handle_event(ctx: Context, event: IncomingEvent) -> None:
 
     if event.kind in ("my_chat_member", "chat_member"):
         await membership.handle_membership(ctx, event)
-        return
+
+
+async def handle_event(ctx: Context, event: IncomingEvent) -> None:
+    """Never raises (except a fatal Unauthorized): a poison update is recorded as 'error'."""
+    try:
+        await _dispatch(ctx, event)
+    except Unauthorized:
+        raise
+    except Exception as exc:
+        # the handler transaction has already rolled back; class only, never str(exc)
+        logger.error("handler_error update_id=%s exc=%s", event.update_id, type(exc).__name__)
+        try:
+            async with ctx.db.transaction() as c:
+                await ctx.services.claim_update(c, ctx.bot_id, event.update_id, "error")
+        except Exception as err:
+            logger.error("error_record_failed exc=%s", type(err).__name__)

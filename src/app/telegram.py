@@ -10,7 +10,15 @@ from typing import Literal
 
 from aiogram import Bot, exceptions, types
 
-from .delivery import AmbiguousSend, PermanentSend, RateLimited
+from .delivery import (
+    AmbiguousSend,
+    ChatMigrated,
+    PermanentSend,
+    RateLimited,
+    SendError,
+    Unauthorized,
+    wait_or_stop,
+)
 from .handlers import Context, handle_event
 from .models import IncomingEvent
 
@@ -18,16 +26,40 @@ logger = logging.getLogger(__name__)
 
 POLL_TIMEOUT = 30
 POLL_ERROR_BACKOFF = 5.0
+MAX_POLL_FAILURES = 10
 ALLOWED_UPDATES = ["message", "my_chat_member", "chat_member"]
 
 
-class AiogramTransport:
-    """Transport implementation backed by a live aiogram Bot.
+class PollingFailed(Exception):
+    """getUpdates failed MAX_POLL_FAILURES times in a row. Fatal."""
 
-    Every aiogram exception is translated to exactly one of RateLimited /
-    AmbiguousSend / PermanentSend, carrying only a pre-sanitized short code:
-    never the response body, never the token, never str(exc).
+
+def map_error(exc: BaseException) -> SendError | Unauthorized:
+    """Translate an aiogram failure into our own error type.
+
+    Only the exception class and structured numeric fields are read: never str(exc),
+    the response body or the request URL (a network error text may carry the token).
     """
+    if isinstance(exc, exceptions.TelegramRetryAfter):
+        return RateLimited(float(exc.retry_after))
+    if isinstance(exc, exceptions.TelegramMigrateToChat):
+        return ChatMigrated(int(exc.migrate_to_chat_id))
+    if isinstance(exc, exceptions.TelegramUnauthorizedError):
+        return Unauthorized()
+    if isinstance(
+        exc,
+        (
+            exceptions.TelegramForbiddenError,
+            exceptions.TelegramNotFound,
+            exceptions.TelegramBadRequest,
+        ),
+    ):
+        return PermanentSend()  # chat gone, bot blocked/kicked, reply target deleted
+    return AmbiguousSend()  # network/server/conflict trouble: outcome unclear
+
+
+class AiogramTransport:
+    """Transport backed by a live aiogram Bot; failures are mapped by map_error."""
 
     def __init__(self, bot: Bot) -> None:
         self._bot = bot
@@ -49,22 +81,16 @@ class AiogramTransport:
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=thread_id,
             )
-        except exceptions.TelegramRetryAfter as exc:
-            raise RateLimited(float(exc.retry_after)) from None
-        except (
-            exceptions.TelegramForbiddenError,
-            exceptions.TelegramNotFound,
-            exceptions.TelegramBadRequest,
-        ):
-            # chat gone, bot blocked/kicked, message-to-reply-to deleted: never retried
-            raise PermanentSend() from None
-        except exceptions.TelegramAPIError:
-            # network/server/conflict/auth trouble: outcome unclear, never auto-retried
-            raise AmbiguousSend() from None
-        except Exception:
-            # defensive catch-all: an unexpected failure is treated the same way,
-            # never left to propagate a raw exception (and its message) upward
-            raise AmbiguousSend() from None
+        except Exception as exc:
+            raise map_error(exc) from None
+
+    async def probe_chat(self, chat_id: int) -> None:
+        try:
+            member = await self._bot.get_chat_member(chat_id, self._bot.id)
+        except Exception as exc:
+            raise map_error(exc) from None
+        if member.status in ("left", "kicked"):
+            raise PermanentSend()
 
 
 def _display_name(user: types.User) -> str | None:
@@ -123,7 +149,7 @@ def _message_event(update_id: int, msg: types.Message, *, edited: bool) -> Incom
         display_name=display_name,
         is_bot=is_bot,
         message_id=msg.message_id,
-        thread_id=msg.message_thread_id,
+        thread_id=msg.message_thread_id if msg.is_topic_message else None,
         text=msg.text,
         entities=entities,
         edited=edited,
@@ -162,18 +188,17 @@ def to_event(update: types.Update) -> IncomingEvent | None:
     return None  # update kind we did not ask for / do not act on
 
 
-async def run_polling(ctx: Context, bot: Bot, stop: asyncio.Event) -> None:
-    """Own controlled long-poll loop.
+async def run_polling(
+    ctx: Context, bot: Bot, stop: asyncio.Event, *, max_failures: int = MAX_POLL_FAILURES
+) -> None:
+    """Own controlled long-poll loop, no stored offset.
 
-    The confirming offset (the one passed as `offset=` on the next call, which itself
-    tells Telegram it may forget everything below it) is only advanced, and persisted
-    to polling_state, after every update of the current batch has been committed by
-    handle_event. A crash-replayed batch is safe because handle_event's claim_update
-    makes each individual update idempotent; nothing here re-derives "already seen"
-    from update_id ordering, so a lower id returned after an idle gap is still processed.
+    The first getUpdates carries no offset: Telegram hands back whatever it still holds
+    and claim_update makes replays harmless. Afterwards the offset lives in memory and is
+    advanced only once every update of the batch has been handled (committed).
     """
-    async with ctx.db.reader() as c:
-        offset = await ctx.services.get_offset(c, ctx.bot_id)
+    offset: int | None = None
+    failures = 0
 
     while not stop.is_set():
         poll_task = asyncio.ensure_future(
@@ -185,7 +210,7 @@ async def run_polling(ctx: Context, bot: Bot, stop: asyncio.Event) -> None:
         )
 
         if poll_task not in done:
-            # shutting down: let the in-flight long-poll request drop, nothing to commit
+            # shutting down: let the in-flight long-poll request drop
             poll_task.cancel()
             stop_task.cancel()
             break
@@ -196,21 +221,21 @@ async def run_polling(ctx: Context, bot: Bot, stop: asyncio.Event) -> None:
             updates = poll_task.result()
         except asyncio.CancelledError:
             raise
-        except Exception:
-            # network/API hiccup: back off and retry the same offset, nothing was lost
-            logger.info("poll_error")
-            await ctx.clock.sleep(POLL_ERROR_BACKOFF)
+        except Exception as exc:
+            if isinstance(exc, exceptions.TelegramUnauthorizedError):
+                raise Unauthorized() from None
+            failures += 1
+            # class only: the text of a network error may contain the request URL
+            logger.warning("poll_error exc=%s consecutive=%d", type(exc).__name__, failures)
+            if failures >= max_failures:
+                raise PollingFailed() from None
+            if await wait_or_stop(ctx.clock, stop, POLL_ERROR_BACKOFF):
+                break
             continue
 
-        if not updates:
-            continue
-
+        failures = 0
         for update in updates:
             event = to_event(update)
             if event is not None:
                 await handle_event(ctx, event)
             offset = update.update_id + 1
-
-        # only now, with every update above committed, confirm the batch
-        async with ctx.db.transaction() as c:
-            await ctx.services.set_offset(c, ctx.bot_id, offset)

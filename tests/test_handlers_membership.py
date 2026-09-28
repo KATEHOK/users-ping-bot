@@ -1,271 +1,274 @@
-import pytest
+import logging
 
-from app.delivery import Delivery
-from app.handlers import Context, handle_event
-from app.services import Services
+from app.handlers import handle_event
 
-from conftest import FakeClock, RecordingTransport, make_event
+from conftest import (
+    BOT_ID,
+    group_event,
+    make_admin,
+    make_event,
+    make_root,
+    mk_ctx,
+    private_event,
+    register_chat,
+    subscribe,
+)
 
-BOT_ID = 999
-BOT_USERNAME = "upb_bot"
-REGISTRAR = 1
-
-
-def _mk_ctx(db, clock=None):
-    clock = clock or FakeClock()
-    services = Services(clock=clock)
-    transport = RecordingTransport()
-    delivery = Delivery(db, services, transport, clock=clock)
-    ctx = Context(
-        db=db,
-        services=services,
-        delivery=delivery,
-        bot_id=BOT_ID,
-        bot_username=BOT_USERNAME,
-        clock=clock,
-    )
-    return ctx, services, transport, clock
+CHAT = 500
+OTHER = 501
+ADMIN = 1
+ROOT = 10
+SUB = 20
+SUB2 = 21
 
 
-async def _register_chat(db, services, chat_id, registrar_id=REGISTRAR):
-    async with db.transaction() as c:
-        await services.touch_user(c, registrar_id)
-        return await services.register_chat(c, chat_id, "Chat", registrar_id)
+async def _world(db, services):
+    await make_root(db, services, ROOT)
+    await make_admin(db, services, ADMIN)
+    await register_chat(db, services, CHAT, ADMIN)
+    await register_chat(db, services, OTHER, ADMIN)
+    for chat in (CHAT, OTHER):
+        await subscribe(db, services, chat, SUB)
+    await subscribe(db, services, CHAT, SUB2)
 
 
-async def _subscribe(db, services, chat_id, user_id):
-    async with db.transaction() as c:
-        await services.touch_user(c, user_id, display_name=f"U{user_id}")
-        return await services.subscribe(c, chat_id, user_id)
+def _left(uid, *, user, chat_id=CHAT):
+    return make_event(kind="member_left", update_id=uid, chat_id=chat_id, left_user_id=user, user_id=None, text=None)
 
 
-def _my_chat_member_event(*, update_id, chat_id, bot_removed):
+def _my_member(uid, *, removed, chat_id=CHAT):
     return make_event(
-        kind="my_chat_member",
-        chat_type="group",
-        chat_id=chat_id,
-        update_id=update_id,
-        user_id=None,
-        text=None,
-        bot_removed=bot_removed,
+        kind="my_chat_member", update_id=uid, chat_id=chat_id, user_id=SUB, bot_removed=removed,
+        left_user_id=BOT_ID if removed else None, text=None,
     )
 
 
-def _chat_member_event(*, update_id, chat_id, left_user_id):
+def _member(uid, *, left_user=None, chat_id=CHAT):
+    return make_event(kind="chat_member", update_id=uid, chat_id=chat_id, user_id=SUB, left_user_id=left_user, text=None)
+
+
+def _migrate(uid, *, chat_id, to=None, frm=None, title=None):
     return make_event(
-        kind="chat_member",
-        chat_type="group",
-        chat_id=chat_id,
-        update_id=update_id,
-        user_id=None,
-        text=None,
-        left_user_id=left_user_id,
+        kind="message", update_id=uid, chat_id=chat_id, user_id=None, text=None,
+        migrate_to_chat_id=to, migrate_from_chat_id=frm, chat_title=title,
     )
 
 
-def _member_left_event(*, update_id, chat_id, left_user_id):
-    return make_event(
-        kind="member_left",
-        chat_type="group",
-        chat_id=chat_id,
-        update_id=update_id,
-        user_id=None,
-        text=None,
-        left_user_id=left_user_id,
-    )
+async def _q(db, sql, *params):
+    async with db.reader() as c:
+        cur = await c.execute(sql, params)
+        return await cur.fetchall()
 
 
-def _migration_event(*, update_id, chat_id, migrate_to=None, migrate_from=None):
-    return make_event(
-        kind="message",
-        chat_type="supergroup" if migrate_from else "group",
-        chat_id=chat_id,
-        update_id=update_id,
-        user_id=None,
-        text=None,
-        migrate_to_chat_id=migrate_to,
-        migrate_from_chat_id=migrate_from,
-    )
+# --- bot removed ---
 
 
-# --- bot removed / re-added ---
-
-
-@pytest.mark.asyncio
-async def test_bot_removed_unregisters_and_clears_subscriptions_no_transport_calls(db):
-    ctx, services, transport, clock = _mk_ctx(db)
-    CHAT = 900
-    await _register_chat(db, services, CHAT)
-    await _subscribe(db, services, CHAT, 9001)
-
-    await handle_event(ctx, _my_chat_member_event(update_id=1, chat_id=CHAT, bot_removed=True))
-
+async def test_bot_removed_unregisters_that_chat_only_without_farewell_or_reply(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _my_member(1, removed=True))
     async with db.reader() as c:
         assert await services.get_chat(c, CHAT) is None
-        assert await services.list_subscribers(c, CHAT) == []
-    assert transport.calls == []  # never tries to message an unreachable chat
-
-
-@pytest.mark.asyncio
-async def test_bot_readded_restores_nothing_stays_silent(db):
-    ctx, services, transport, clock = _mk_ctx(db)
-    CHAT = 901
-    await _register_chat(db, services, CHAT)
-    await _subscribe(db, services, CHAT, 9002)
-    await handle_event(ctx, _my_chat_member_event(update_id=1, chat_id=CHAT, bot_removed=True))
-
-    await handle_event(ctx, _my_chat_member_event(update_id=2, chat_id=CHAT, bot_removed=False))
-
-    async with db.reader() as c:
-        assert await services.get_chat(c, CHAT) is None
-        assert await services.list_subscribers(c, CHAT) == []
+        assert not await services.is_subscribed(c, CHAT, SUB)
+        assert await services.get_chat(c, OTHER) is not None
+        assert await services.is_subscribed(c, OTHER, SUB)
+        assert await services.get_role(c, ADMIN) is not None
+    assert await _q(db, "SELECT COUNT(*) FROM outbox") == [(0,)]
     assert transport.calls == []
 
 
-# --- ordinary members leaving ---
-
-
-@pytest.mark.asyncio
-async def test_member_left_service_message_clears_only_that_subscription(db):
-    ctx, services, transport, clock = _mk_ctx(db)
-    CHAT = 902
-    await _register_chat(db, services, CHAT)
-    await _subscribe(db, services, CHAT, 9101)
-    await _subscribe(db, services, CHAT, 9102)
-
-    await handle_event(ctx, _member_left_event(update_id=1, chat_id=CHAT, left_user_id=9101))
-
+async def test_bot_removed_by_left_chat_member_service_message(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _left(1, user=BOT_ID))
     async with db.reader() as c:
-        assert await services.subscription_id_of(c, CHAT, 9101) is None
-        assert await services.subscription_id_of(c, CHAT, 9102) is not None
-        assert await services.get_chat(c, CHAT) is not None  # chat itself stays registered
+        assert await services.get_chat(c, CHAT) is None
+    assert await _q(db, "SELECT COUNT(*) FROM outbox") == [(0,)]
 
 
-@pytest.mark.asyncio
-async def test_chat_member_leaving_clears_subscription(db):
-    ctx, services, transport, clock = _mk_ctx(db)
-    CHAT = 903
-    await _register_chat(db, services, CHAT)
-    await _subscribe(db, services, CHAT, 9201)
-
-    await handle_event(ctx, _chat_member_event(update_id=1, chat_id=CHAT, left_user_id=9201))
-
+async def test_readding_the_bot_restores_nothing(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _my_member(1, removed=True))
+    await handle_event(ctx, _my_member(2, removed=False))
     async with db.reader() as c:
-        assert await services.subscription_id_of(c, CHAT, 9201) is None
+        assert await services.get_chat(c, CHAT) is None
+        assert not await services.is_subscribed(c, CHAT, SUB)
+    # silence until a new registration, even for subscribers
+    await handle_event(ctx, group_event("/upb all", update_id=3, user_id=SUB))
+    await handle_event(ctx, group_event("/upb notify on", update_id=4, user_id=SUB))
+    assert transport.calls == []
+    await handle_event(ctx, group_event("/upb chat register", update_id=5, user_id=ADMIN))
+    assert len(transport.calls) == 1
 
 
-@pytest.mark.asyncio
-async def test_chat_member_restriction_change_does_not_unsubscribe(db):
-    ctx, services, transport, clock = _mk_ctx(db)
-    CHAT = 904
-    await _register_chat(db, services, CHAT)
-    await _subscribe(db, services, CHAT, 9301)
+# --- member left ---
 
-    # a restriction change on a remaining member carries no left_user_id
-    await handle_event(ctx, _chat_member_event(update_id=1, chat_id=CHAT, left_user_id=None))
 
+async def test_member_left_drops_only_that_subscription_in_that_chat(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _left(1, user=SUB))
     async with db.reader() as c:
-        assert await services.subscription_id_of(c, CHAT, 9301) is not None
+        assert not await services.is_subscribed(c, CHAT, SUB)
+        assert await services.is_subscribed(c, CHAT, SUB2)
+        assert await services.is_subscribed(c, OTHER, SUB)
+        assert await services.get_chat(c, CHAT) is not None
+    assert transport.calls == []
 
 
-# --- migration ordering (plan section 10) ---
-
-
-@pytest.mark.asyncio
-async def test_migrate_then_old_id_leave_keeps_migrated_state(db):
-    OLD, NEW = 910, 911
-    ctx, services, transport, clock = _mk_ctx(db)
-    await _register_chat(db, services, OLD)
-    await _subscribe(db, services, OLD, 9401)
-
-    await handle_event(ctx, _migration_event(update_id=1, chat_id=OLD, migrate_to=NEW))
-
-    # restart: fresh Context/Services/Delivery over the same database
-    ctx2, services2, transport2, clock2 = _mk_ctx(db)
-
-    # a stale "bot left the old chat" event arrives after the migration
-    await handle_event(ctx2, _my_chat_member_event(update_id=2, chat_id=OLD, bot_removed=True))
-
+async def test_chat_member_update_with_leave_unsubscribes_and_restriction_does_not(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _member(1, left_user=None))  # restricted, still a member
     async with db.reader() as c:
-        assert await services2.resolve_chat_id(c, OLD) == NEW
-        new_chat = await services2.get_chat(c, NEW)
-        assert new_chat is not None
-        assert await services2.subscription_id_of(c, NEW, 9401) is not None
-
-
-@pytest.mark.asyncio
-async def test_old_id_leave_then_migrate_leaves_new_chat_inactive(db):
-    OLD, NEW = 920, 921
-    ctx, services, transport, clock = _mk_ctx(db)
-    await _register_chat(db, services, OLD)
-    await _subscribe(db, services, OLD, 9501)
-
-    await handle_event(ctx, _my_chat_member_event(update_id=1, chat_id=OLD, bot_removed=True))
-
+        assert await services.is_subscribed(c, CHAT, SUB)
+    await handle_event(ctx, _member(2, left_user=SUB))
     async with db.reader() as c:
-        assert await services.get_chat(c, OLD) is None
+        assert not await services.is_subscribed(c, CHAT, SUB)
 
-    # restart
-    ctx2, services2, transport2, clock2 = _mk_ctx(db)
 
-    await handle_event(ctx2, _migration_event(update_id=2, chat_id=OLD, migrate_to=NEW))
-
+async def test_leaving_admin_keeps_role_and_chat_ownership(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _left(1, user=ADMIN))
     async with db.reader() as c:
-        assert await services2.resolve_chat_id(c, OLD) == NEW  # alias still recorded
-        assert await services2.get_chat(c, NEW) is None  # registration NOT resurrected
-        assert await services2.list_subscribers(c, NEW) == []
+        assert (await services.get_chat(c, CHAT)).registered_by == ADMIN
 
 
-@pytest.mark.asyncio
-async def test_repeated_migration_pair_is_a_noop(db):
-    OLD, NEW = 930, 931
-    ctx, services, transport, clock = _mk_ctx(db)
-    await _register_chat(db, services, OLD)
-    await _subscribe(db, services, OLD, 9601)
-
-    # two real updates for the same pair: one seen in the old chat, one in the new
-    await handle_event(ctx, _migration_event(update_id=1, chat_id=OLD, migrate_to=NEW))
-    await handle_event(ctx, _migration_event(update_id=2, chat_id=NEW, migrate_from=OLD))
-
+async def test_duplicate_membership_update_is_a_no_op(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _left(1, user=SUB))
+    await subscribe(db, services, CHAT, SUB)
+    await handle_event(ctx, _left(1, user=SUB))
     async with db.reader() as c:
-        assert await services.list_conflicts(c) == []
-        assert await services.resolve_chat_id(c, OLD) == NEW
-        assert await services.subscription_id_of(c, NEW, 9601) is not None
-        subs = await services.list_subscribers(c, NEW)
-    assert len(subs) == 1  # not moved/duplicated twice
+        assert await services.is_subscribed(c, CHAT, SUB)
 
 
-@pytest.mark.asyncio
-async def test_leave_then_readd_without_migration_does_not_restore(db):
-    CHAT = 940
-    ctx, services, transport, clock = _mk_ctx(db)
-    await _register_chat(db, services, CHAT)
-    await _subscribe(db, services, CHAT, 9701)
-
-    await handle_event(ctx, _my_chat_member_event(update_id=1, chat_id=CHAT, bot_removed=True))
-
-    ctx2, services2, transport2, clock2 = _mk_ctx(db)
-    await handle_event(ctx2, _my_chat_member_event(update_id=2, chat_id=CHAT, bot_removed=False))
-
+async def test_membership_events_for_an_aliased_old_id_are_ignored(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    async with db.transaction() as c:
+        await services.migrate_chat(c, CHAT, -1000)
+    await handle_event(ctx, _my_member(1, removed=True))
+    await handle_event(ctx, _left(2, user=SUB))
+    await handle_event(ctx, _my_member(3, removed=True, chat_id=CHAT))
     async with db.reader() as c:
-        assert await services2.get_chat(c, CHAT) is None
-        assert await services2.list_subscribers(c, CHAT) == []
+        assert await services.get_chat(c, -1000) is not None
+        assert await services.is_subscribed(c, -1000, SUB)
+    assert await _q(db, "SELECT COUNT(*) FROM processed_updates WHERE outcome = 'ignored'") == [(3,)]
 
 
-# --- dedup ---
+# --- cascades through the command handlers (decisions 5) ---
 
 
-@pytest.mark.asyncio
-async def test_replayed_bot_removal_update_does_not_duplicate_effect(db):
-    CHAT = 950
-    ctx, services, transport, clock = _mk_ctx(db)
-    await _register_chat(db, services, CHAT)
-    event = _my_chat_member_event(update_id=1, chat_id=CHAT, bot_removed=True)
+async def test_admin_remove_sends_a_farewell_per_chat_in_each_chat_language(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, group_event("/upb lang ru", update_id=1, user_id=ADMIN, chat_id=OTHER))
+    transport.calls.clear()
+    await handle_event(ctx, private_event("/admin remove 1", update_id=2, user_id=ROOT))
+    transport.calls.clear()
+    await ctx.delivery.run_outbox_once()
+    got = sorted((c["chat_id"], c["text"]) for c in transport.calls)
+    assert got == [(CHAT, "Chat unregistered. Bye!"), (OTHER, "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u0430 \u0441\u043d\u044f\u0442\u0430. \u0414\u043e \u0432\u0441\u0442\u0440\u0435\u0447\u0438!")]
+    assert await _q(db, "SELECT COUNT(*) FROM chats") == [(0,)]
+    assert await _q(db, "SELECT COUNT(*) FROM subscriptions") == [(0,)]
 
-    await handle_event(ctx, event)
-    await handle_event(ctx, event)  # exact replay
 
+async def test_set_root_cascade_keeps_the_new_roots_chats(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, 502, ROOT)
+    await make_admin(db, services, 11)
+    async with db.transaction() as c:
+        result = await services.set_root(c, 11)
+    assert result.dropped_chat_ids == [502]
+    await ctx.delivery.run_outbox_once()
+    assert [c["chat_id"] for c in transport.calls] == [502]
+
+
+# --- migration (decisions 7.1, 7.2, 7.4) ---
+
+
+async def test_migration_moves_registration_language_and_subscriptions(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    async with db.transaction() as c:
+        await services.set_chat_lang(c, CHAT, "ru")
+    await handle_event(ctx, _migrate(1, chat_id=CHAT, to=-1000))
+    await handle_event(ctx, _migrate(2, chat_id=-1000, frm=CHAT, title="New"))  # second side: no-op
     async with db.reader() as c:
-        due = await services.due_events(c, "9999-01-01T00:00:00+00:00")
-    # farewell=False path: nothing queued either time, replay or not
-    assert due == []
+        assert await services.get_chat(c, CHAT) is None
+        new = await services.get_chat(c, -1000)
+        assert (new.registered_by, new.lang) == (ADMIN, "ru")
+        assert await services.is_subscribed(c, -1000, SUB) and await services.is_subscribed(c, -1000, SUB2)
+        assert await services.resolve_chat_id(c, CHAT) == -1000
+    assert transport.calls == []
+    await handle_event(ctx, group_event("/upb list", update_id=3, user_id=SUB, chat_id=-1000))
+    assert len(transport.calls) == 1
+
+
+async def test_migration_from_side_first_uses_the_new_title(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _migrate(1, chat_id=-1000, frm=CHAT, title="Renamed"))
+    async with db.reader() as c:
+        assert (await services.get_chat(c, -1000)).title == "Renamed"
+
+
+async def test_migration_into_a_registered_destination_keeps_the_destination(db, caplog):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await make_admin(db, services, 2)
+    await register_chat(db, services, -1000, 2, "Dest")
+    with caplog.at_level(logging.WARNING):
+        await handle_event(ctx, _migrate(1, chat_id=CHAT, to=-1000))
+    async with db.reader() as c:
+        assert await services.get_chat(c, CHAT) is None
+        assert (await services.get_chat(c, -1000)).registered_by == 2
+        assert not await services.is_subscribed(c, -1000, SUB)  # the old subscriptions are not merged
+    assert "destination already registered" in caplog.text
+    assert transport.calls == []  # no farewell to a chat that moved
+    assert await _q(db, "SELECT COUNT(*) FROM outbox") == [(0,)]
+
+
+async def test_migration_of_an_unregistered_chat_only_records_the_alias(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await handle_event(ctx, _migrate(1, chat_id=777, to=-7770))
+    async with db.reader() as c:
+        assert await services.resolve_chat_id(c, 777) == -7770
+        assert await services.get_chat(c, -7770) is None
+
+
+async def test_contradictory_migration_changes_nothing_and_warns(db, caplog):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _migrate(1, chat_id=CHAT, to=-1000))
+    with caplog.at_level(logging.WARNING):
+        await handle_event(ctx, _migrate(2, chat_id=CHAT, to=-2000))
+    async with db.reader() as c:
+        assert await services.get_chat(c, -1000) is not None
+        assert await services.get_chat(c, -2000) is None
+        assert await services.resolve_chat_id(c, CHAT) == -1000
+    assert "contradictory" in caplog.text
+
+
+async def test_migration_retargets_pending_farewells(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    async with db.transaction() as c:
+        await services.unregister_chat(c, OTHER)
+    await handle_event(ctx, _migrate(1, chat_id=OTHER, to=-1001))
+    await ctx.delivery.run_outbox_once()
+    assert [c["chat_id"] for c in transport.calls] == [-1001]
+
+
+async def test_migration_events_do_not_need_a_user_and_are_deduplicated(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    ev = _migrate(1, chat_id=CHAT, to=-1000)
+    await handle_event(ctx, ev)
+    await handle_event(ctx, ev)
+    assert await _q(db, "SELECT COUNT(*) FROM processed_updates") == [(1,)]

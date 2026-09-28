@@ -153,7 +153,18 @@ class RecordingTransport:
         self._raise: Exception | None = None
         self._raise_queue: list[Exception] = []
         self._fail_chats: dict[int, Exception] = {}
+        self._probe_results: dict[int, Exception] = {}
+        self.probes: list[int] = []
         _transports.append(self)
+
+    def set_probe(self, chat_id: int, exc: Exception) -> None:
+        # probe_chat(chat_id) raises exc; chats without an entry are healthy
+        self._probe_results[chat_id] = exc
+
+    async def probe_chat(self, chat_id: int) -> None:
+        self.probes.append(chat_id)
+        if chat_id in self._probe_results:
+            raise self._probe_results[chat_id]
 
     def raise_next(self, exc: Exception) -> None:
         self._raise = exc
@@ -221,3 +232,87 @@ async def db(tmp_path):
         yield database
     finally:
         await database.close()
+
+
+# --- shared runtime-test helpers (plain functions, not fixtures) ---
+
+BOT_ID = 999
+BOT_USERNAME = "upb_bot"
+
+
+def mk_ctx(db, clock=None, *, cooldown: float = 0.0):
+    from app.delivery import Delivery
+    from app.handlers import Context
+    from app.services import Services
+
+    clock = clock or FakeClock()
+    services = Services(clock=clock)
+    transport = RecordingTransport()
+    delivery = Delivery(db, services, transport, clock=clock)
+    ctx = Context(
+        db=db,
+        services=services,
+        delivery=delivery,
+        bot_id=BOT_ID,
+        bot_username=BOT_USERNAME,
+        clock=clock,
+        ping_cooldown_seconds=cooldown,
+    )
+    return ctx, services, transport, clock
+
+
+def _entities(text: str) -> tuple[tuple[str, int, int], ...]:
+    first = text.split(" ", 1)[0]
+    return (("bot_command", 0, len(first)),)
+
+
+def group_event(text: str, *, update_id: int, user_id: int, chat_id: int = 500, **kwargs: Any):
+    defaults: dict[str, Any] = dict(
+        kind="message",
+        chat_type="group",
+        chat_id=chat_id,
+        update_id=update_id,
+        user_id=user_id,
+        username=f"user{user_id}",
+        display_name=f"User{user_id}",
+        message_id=update_id,
+        text=text,
+        entities=_entities(text),
+        chat_title="Chat",
+    )
+    defaults.update(kwargs)
+    return make_event(**defaults)
+
+
+def private_event(text: str, *, update_id: int, user_id: int, **kwargs: Any):
+    defaults: dict[str, Any] = dict(
+        chat_type="private",
+        chat_id=user_id,
+        entities=_entities(text) if text.startswith("/") else (),
+    )
+    defaults.update(kwargs)
+    return group_event(text, update_id=update_id, user_id=user_id, **defaults)
+
+
+async def make_root(db, services, user_id: int, *, contact: bool = False) -> None:
+    async with db.transaction() as c:
+        await services.touch_user(c, user_id, private_contact=contact)
+        await services.set_root(c, user_id)
+
+
+async def make_admin(db, services, user_id: int) -> None:
+    async with db.transaction() as c:
+        await services.touch_user(c, user_id)
+        await services.grant_admin(c, user_id)
+
+
+async def register_chat(db, services, chat_id: int, registrar_id: int, title: str = "Chat") -> None:
+    async with db.transaction() as c:
+        await services.touch_user(c, registrar_id)
+        await services.register_chat(c, chat_id, title, registrar_id)
+
+
+async def subscribe(db, services, chat_id: int, user_id: int) -> None:
+    async with db.transaction() as c:
+        await services.touch_user(c, user_id, display_name=f"U{user_id}")
+        await services.subscribe(c, chat_id, user_id)

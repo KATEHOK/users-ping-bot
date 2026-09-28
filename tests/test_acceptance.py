@@ -378,33 +378,19 @@ async def test_permission_check_after_other_connections_commit_observes_new_righ
         await db_b.close()
 
     assert len(transport.calls) == 1
-    assert "Granted admin to user 500" in transport.calls[0]["text"]
+    assert "Admin granted: 500." in transport.calls[0]["text"]
 
 
 @pytest.mark.asyncio
-async def test_ping_last_check_boundary_write_lands_between_check_and_send(tmp_path):
-    """Punch-list P1, bullet 4 (plan section 9's last-check boundary).
-
-    Connection A runs the ping; connection B is a fully independent connection
-    to the same file that commits an unsubscribe while A's first chunk send is
-    in flight. The plan's own promise is narrow: the chunk A already built
-    from its last check is allowed to go out as-is; only the *next* re-check
-    (before building the following chunk) must see B's write. It does not
-    promise the in-flight chunk itself reflects B's commit -- that would be a
-    stronger guarantee than the plan makes.
-
-    Both connections run on the same event loop, so B's write is driven from
-    an explicit await point inside A's send call rather than a true OS-level
-    race; SQLite's own file locking would serialize a genuinely concurrent
-    write the same way, so the outcome checked here does not depend on that.
-    """
+async def test_ping_snapshot_is_final_when_another_connection_unsubscribes_mid_ping(tmp_path):
+    """Decisions 6.1: recipients are fixed at the command and never re-filtered."""
     path = str(tmp_path / "boundary.sqlite3")
     async with open_database(path) as boot:
         async with boot.transaction() as c:
             svc = Services()
             await svc.touch_user(c, 1)
-            await svc.grant_admin(c, 1)  # initiator needs a ground to ping at all
-            reg = await svc.register_chat(c, -500, "Chat", 1)
+            await svc.grant_admin(c, 1)
+            await svc.register_chat(c, -500, "Chat", 1)
             for uid in (90001, 90002, 90003):
                 await svc.touch_user(c, uid, display_name=f"User{uid}")
                 await svc.subscribe(c, -500, uid)
@@ -425,8 +411,6 @@ async def test_ping_last_check_boundary_write_lands_between_check_and_send(tmp_p
         nonlocal raced
         if not raced:
             raced = True
-            # connection B's commit lands here: after A already built and
-            # peeled this chunk from its last check, before this send returns
             async with db_b.transaction() as c:
                 await Services(clock=clock).unsubscribe(c, chat_id, 90002)
         await original_send(chat_id, text, **kwargs)
@@ -435,12 +419,8 @@ async def test_ping_last_check_boundary_write_lands_between_check_and_send(tmp_p
 
     try:
         async with db_a.reader() as c:
-            subs = await services_a.list_subscribers(c, -500)
-        snapshot = [
-            SubscriberRef(s.user_id, s.subscription_id, s.display_name, s.username)
-            for s in subs
-        ]
-        await delivery.run_ping(-500, 1, MSG, THREAD, reg.generation, snapshot, chunk_limit=10)
+            snapshot = await services_a.list_subscribers(c, -500)
+        await delivery.run_ping(-500, MSG, THREAD, snapshot, chunk_limit=10)
     finally:
         await db_a.close()
         await db_b.close()
@@ -448,77 +428,13 @@ async def test_ping_last_check_boundary_write_lands_between_check_and_send(tmp_p
     seen: list[int] = []
     for call in transport.calls:
         seen.extend(_ids_in(call["text"]))
-    assert 90001 in seen  # already-checked fragment: sent regardless of B's later write
-    assert 90003 in seen  # untouched recipient still reached by the next chunk
-    assert 90002 not in seen  # the NEXT re-check saw B's commit and excluded it
-
-
-# --- notify-off is not blocked behind a stalled/retrying ping ---
-
-
-class _PausingClock(FakeClock):
-    """A FakeClock whose sleep() genuinely suspends until the test releases it."""
-
-    def __init__(self):
-        super().__init__()
-        self.sleep_started = asyncio.Event()
-        self.may_continue = asyncio.Event()
-
-    async def sleep(self, seconds: float) -> None:
-        self.advance(seconds)
-        self.sleep_started.set()
-        await self.may_continue.wait()
+    assert seen == [90001, 90002, 90003]  # the late unsubscribe changes nothing
+    assert len(transport.calls) == 3
+    assert all(call["reply_to_message_id"] == MSG for call in transport.calls)
 
 
 @pytest.mark.asyncio
-async def test_notify_off_confirms_while_a_different_ping_is_stalled_in_a_429_wait(db):
-    clock = _PausingClock()
-    services = Services(clock=clock)
-    transport = RecordingTransport()
-    delivery = Delivery(db, services, transport, clock=clock)
-
-    async with db.transaction() as c:
-        await services.touch_user(c, 1)
-        await services.grant_admin(c, 1)  # the initiator needs a ground to ping at all
-        result = await services.register_chat(c, CHAT, "Chat", 1)
-        for uid in (60001, 60002):
-            await services.touch_user(c, uid, display_name=f"User{uid}")
-            await services.subscribe(c, CHAT, uid)
-        await services.touch_user(c, 70001)
-        await services.subscribe(c, CHAT, 70001)
-
-    async with db.reader() as c:
-        subs = await services.list_subscribers(c, CHAT)
-    snapshot = [SubscriberRef(s.user_id, s.subscription_id, s.display_name, s.username) for s in subs]
-
-    # the ping's very first chunk hits a long rate limit and is now genuinely
-    # suspended inside its backoff wait, not merely "about to run"
-    transport.queue_raises([RateLimited(retry_after=30.0)])
-
-    grant = delivery.grants.issue(
-        update_id=999, user_id=70001, chat_id=CHAT, message_id=42, generation=result.generation
-    )
-
-    ping_task = asyncio.create_task(
-        delivery.run_ping(CHAT, 1, MSG, THREAD, result.generation, snapshot, chunk_limit=10)
-    )
-    await clock.sleep_started.wait()  # ping is now blocked in the 429 backoff
-
-    delivered = await delivery.confirm_notify_off(grant, "Unsubscribed.")
-
-    assert delivered is True  # the confirmation did not wait for the ping to finish
-    confirm_calls = [call for call in transport.calls if call["reply_to_message_id"] == 42]
-    assert len(confirm_calls) == 1
-
-    clock.may_continue.set()  # release the ping, let the test finish cleanly
-    await asyncio.wait_for(ping_task, timeout=2.0)
-
-
-# --- an out-of-band role change (CLI/admin-remove-equivalent) stops a running ping ---
-
-
-@pytest.mark.asyncio
-async def test_admin_losing_role_mid_ping_stops_remainder_at_next_recheck(db):
+async def test_role_loss_mid_ping_does_not_cancel_the_remainder(db):
     clock = FakeClock()
     services = Services(clock=clock)
     transport = RecordingTransport()
@@ -527,35 +443,29 @@ async def test_admin_losing_role_mid_ping_stops_remainder_at_next_recheck(db):
     async with db.transaction() as c:
         await services.touch_user(c, 1)
         await services.touch_user(c, 9001)
-        await services.grant_admin(c, 9001)  # initiator: admin, no personal subscription
-        result = await services.register_chat(c, CHAT, "Chat", 1)
+        await services.grant_admin(c, 9001)
+        await services.register_chat(c, CHAT, "Chat", 1)
         for uid in (50001, 50002, 50003):
             await services.touch_user(c, uid, display_name=f"User{uid}")
             await services.subscribe(c, CHAT, uid)
-
     async with db.reader() as c:
-        subs = await services.list_subscribers(c, CHAT)
-    snapshot = [SubscriberRef(s.user_id, s.subscription_id, s.display_name, s.username) for s in subs]
+        snapshot = await services.list_subscribers(c, CHAT)
 
     original_send = transport.send_message
 
     async def send_and_revoke_admin(chat_id, text, **kwargs):
         await original_send(chat_id, text, **kwargs)
         if len(transport.calls) == 1:
-            # equivalent of `/admin remove 9001` or a CLI role change landing
-            # between two chunks of the same ping
             async with db.transaction() as c:
                 await services.revoke_admin(c, 9001)
 
     transport.send_message = send_and_revoke_admin
-
-    await delivery.run_ping(CHAT, 9001, MSG, THREAD, result.generation, snapshot, chunk_limit=10)
+    await delivery.run_ping(CHAT, MSG, THREAD, snapshot, chunk_limit=10)
 
     seen: list[int] = []
     for call in transport.calls:
         seen.extend(_ids_in(call["text"]))
-    assert len(transport.calls) >= 1  # the chunk already sent before the role change stands
-    assert len(seen) < 3  # the remainder was cancelled at the very next re-check
+    assert seen == [50001, 50002, 50003]  # authorization was taken once, before the reaction
 
 
 # --- a database error at the permission-check point must never grant access ---
@@ -573,23 +483,20 @@ async def test_db_error_during_permission_check_denies_access_and_sends_nothing(
     monkeypatch.setattr(services, "load_actor", _boom)
 
     event = _group_event("/upb all", update_id=1, user_id=ACTOR)
-    with pytest.raises(RuntimeError):
-        await handle_event(ctx, event)
+    await handle_event(ctx, event)  # the poison update never escapes
 
     assert transport.calls == []  # never turns into a reply, not even an error message
 
     monkeypatch.undo()  # restore load_actor before reading back through it
     async with db.reader() as c:
-        assert await services.subscription_id_of(c, CHAT, ACTOR) is None  # nothing granted
-        cursor = await c.execute(
-            "SELECT COUNT(*) FROM processed_updates WHERE update_id = ?", (1,)
-        )
-        (count,) = await cursor.fetchone()
-    assert count == 0  # the whole transaction rolled back: no partial commit
+        assert not await services.is_subscribed(c, CHAT, ACTOR)  # nothing granted
+        cursor = await c.execute("SELECT outcome FROM processed_updates WHERE update_id = 1")
+        rows = await cursor.fetchall()
+    assert rows == [("error",)]  # rolled back, then recorded on its own
 
-    # retrying the identical update once the DB is healthy is processed normally
-    # (still silent, since ACTOR genuinely has no rights -- not stuck denying forever)
+    # the same update is not replayed; a fresh one from the healthy DB is silent (no rights)
     await handle_event(ctx, event)
+    await handle_event(ctx, _group_event("/upb all", update_id=2, user_id=ACTOR))
     assert transport.calls == []
 
 
