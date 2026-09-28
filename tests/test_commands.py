@@ -55,16 +55,6 @@ def test_group_command_case_insensitive_bot_suffix():
     assert parse_group_command(text, ent(text), bot_username=BOT).cmd is Cmd.LIST
 
 
-def test_bare_upb_with_no_subcommand_is_none():
-    text = "/upb"
-    assert parse_group_command(text, ent(text), bot_username=BOT) is None
-
-
-def test_upb_with_unknown_subcommand_is_none():
-    text = "/upb frobnicate"
-    assert parse_group_command(text, ent(text), bot_username=BOT) is None
-
-
 def test_text_starting_with_slash_but_no_entity_is_none():
     text = "/upb notify on"
     assert parse_group_command(text, (), bot_username=BOT) is None
@@ -123,21 +113,6 @@ def test_private_command_at_bot_suffix_accepted():
 
 def test_private_command_addressed_to_other_bot_is_none():
     text = "/help@other_bot"
-    assert parse_private_command(text, ent(text), bot_username=BOT) is None
-
-
-def test_private_admin_with_no_subcommand_is_none():
-    text = "/admin"
-    assert parse_private_command(text, ent(text), bot_username=BOT) is None
-
-
-def test_private_admin_unknown_subcommand_is_none():
-    text = "/admin frobnicate"
-    assert parse_private_command(text, ent(text), bot_username=BOT) is None
-
-
-def test_private_chat_with_no_subcommand_is_none():
-    text = "/chat"
     assert parse_private_command(text, ent(text), bot_username=BOT) is None
 
 
@@ -211,3 +186,130 @@ def test_validate_args_other_commands_return_none(cmd):
     assert validate_args(cmd, ("whatever",)) is None
 
 
+
+
+# --- prefix help ---
+
+
+@pytest.mark.parametrize(
+    "text,prefix",
+    [
+        ("/upb", ()),
+        ("/upb qwe", ("qwe",)),
+        ("/UPB Qwe extra", ("qwe",)),
+        ("/upb notify", ("notify",)),
+        ("/upb notify xyz", ("notify",)),
+        ("/upb chat", ("chat",)),
+        ("/upb chat xyz", ("chat",)),
+        ("/upb lang", ("lang",)),
+    ],
+)
+def test_group_prefix_help(text, prefix):
+    parsed = parse_group_command(text, ent(text), bot_username=BOT)
+    assert parsed is not None and parsed.cmd is Cmd.USAGE
+    assert parsed.args == prefix
+
+
+def test_group_prefix_help_respects_bot_addressing():
+    text = f"/upb@{BOT}"
+    assert parse_group_command(text, ent(text), bot_username=BOT).cmd is Cmd.USAGE
+    other = "/upb@other_bot"
+    assert parse_group_command(other, ent(other), bot_username=BOT) is None
+
+
+def test_typo_in_command_name_is_not_ours():
+    text = "/ubb notify on"
+    assert parse_group_command(text, ent(text), bot_username=BOT) is None
+
+
+@pytest.mark.parametrize(
+    "text,prefix",
+    [
+        ("/admin", ("admin",)),
+        ("/admin xyz", ("admin",)),
+        ("/chat", ("chat",)),
+        ("/chat xyz", ("chat",)),
+        ("/lang", ("lang",)),
+    ],
+)
+def test_private_prefix_help(text, prefix):
+    parsed = parse_private_command(text, ent(text), bot_username=BOT)
+    assert parsed is not None and parsed.cmd is Cmd.P_USAGE
+    assert parsed.args == prefix
+
+
+def test_private_prefix_help_wrong_bot_is_none():
+    text = "/admin@other_bot"
+    assert parse_private_command(text, ent(text), bot_username=BOT) is None
+
+
+# --- lang ---
+
+
+def test_group_lang_parses_with_code_argument():
+    text = "/upb lang ru"
+    parsed = parse_group_command(text, ent(text), bot_username=BOT)
+    assert parsed.cmd is Cmd.LANG and parsed.args == ("ru",)
+
+
+def test_private_lang_parses_with_code_argument():
+    text = "/lang en"
+    parsed = parse_private_command(text, ent(text), bot_username=BOT)
+    assert parsed.cmd is Cmd.P_LANG and parsed.args == ("en",)
+
+
+@pytest.mark.parametrize("cmd", [Cmd.LANG, Cmd.P_LANG])
+def test_validate_lang(cmd):
+    assert validate_args(cmd, ("en",)) == "en"
+    assert validate_args(cmd, ("RU",)) == "ru"
+    for bad in ((), ("de",), ("en", "ru"), ("",), ("e n",)):
+        with pytest.raises(ValueError):
+            validate_args(cmd, bad)
+
+
+# --- strict ids ---
+
+BAD_IDS = [
+    "1_000",
+    "+5",
+    " 5",
+    "5 ",
+    "5\n",
+    "1.0",
+    "0x10",
+    "\u0663\u0664",  # Arabic-Indic digits
+    "\uff11\uff12",  # fullwidth digits
+    "",
+    "-",
+    "9223372036854775808",
+    "-9223372036854775809",
+    "9" * 5000,
+]
+
+
+@pytest.mark.parametrize("bad", BAD_IDS)
+@pytest.mark.parametrize("cmd", [Cmd.ADMIN_CREATE, Cmd.ADMIN_REMOVE, Cmd.CHAT_REMOVE])
+def test_validate_rejects_malformed_or_overflowing_ids(cmd, bad):
+    with pytest.raises(ValueError):
+        validate_args(cmd, (bad,))
+
+
+def test_validate_int64_bounds_are_accepted():
+    assert validate_args(Cmd.ADMIN_CREATE, ("9223372036854775807",)) == 2**63 - 1
+    assert validate_args(Cmd.CHAT_REMOVE, ("-9223372036854775808",)) == -(2**63)
+
+
+def test_admin_ids_must_be_strictly_positive_but_chat_ids_may_be_zero_or_negative():
+    for cmd in (Cmd.ADMIN_CREATE, Cmd.ADMIN_REMOVE):
+        for bad in ("0", "-1", "-0"):
+            with pytest.raises(ValueError):
+                validate_args(cmd, (bad,))
+    assert validate_args(Cmd.CHAT_REMOVE, ("0",)) == 0
+    assert validate_args(Cmd.CHAT_REMOVE, ("-100123",)) == -100123
+
+
+def test_permission_is_separate_from_syntax():
+    # parsing never validates arguments: a malformed id still parses as the command
+    text = "/admin create 1_000"
+    parsed = parse_private_command(text, ent(text), bot_username=BOT)
+    assert parsed.cmd is Cmd.ADMIN_CREATE and parsed.args == ("1_000",)

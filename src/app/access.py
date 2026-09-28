@@ -9,100 +9,35 @@ from .models import Actor, Cmd, Scope
 class CommandSpec:
     cmd: Cmd
     scope: Scope
-    syntax: str
-    summary: str
+    syntax: str  # descriptions live in the rendering catalogue (cmd_* keys)
 
 
 CATALOG: tuple[CommandSpec, ...] = (
     # --- group ---
-    CommandSpec(
-        Cmd.CHAT_REGISTER,
-        Scope.GROUP,
-        "/upb chat register",
-        "Register this chat for ping notifications.",
-    ),
-    CommandSpec(
-        Cmd.CHAT_UNREGISTER,
-        Scope.GROUP,
-        "/upb chat unregister",
-        "Unregister this chat and clear its subscribers.",
-    ),
-    CommandSpec(
-        Cmd.NOTIFY_ON,
-        Scope.GROUP,
-        "/upb notify on",
-        "Subscribe yourself to pings in this chat.",
-    ),
-    CommandSpec(
-        Cmd.NOTIFY_OFF,
-        Scope.GROUP,
-        "/upb notify off",
-        "Unsubscribe yourself from pings in this chat.",
-    ),
-    CommandSpec(
-        Cmd.PING,
-        Scope.GROUP,
-        "/upb all",
-        "Ping every subscriber of this chat (alias: /upb notify all).",
-    ),
-    CommandSpec(
-        Cmd.LIST,
-        Scope.GROUP,
-        "/upb list",
-        "List subscribers of this chat.",
-    ),
-    CommandSpec(
-        Cmd.HELP,
-        Scope.GROUP,
-        "/upb help",
-        "Show the commands available to you here (alias: /upb usage).",
-    ),
-    # iter2 placeholders: syntax and rules are defined by the presentation rework
-    CommandSpec(Cmd.LANG, Scope.GROUP, "/upb lang <en|ru>", "Set the reply language for this chat."),
-    CommandSpec(Cmd.USAGE, Scope.GROUP, "/upb", "Show help for the typed command prefix."),
+    CommandSpec(Cmd.CHAT_REGISTER, Scope.GROUP, "/upb chat register"),
+    CommandSpec(Cmd.CHAT_UNREGISTER, Scope.GROUP, "/upb chat unregister"),
+    CommandSpec(Cmd.NOTIFY_ON, Scope.GROUP, "/upb notify on"),
+    CommandSpec(Cmd.NOTIFY_OFF, Scope.GROUP, "/upb notify off"),
+    CommandSpec(Cmd.PING, Scope.GROUP, "/upb all"),
+    CommandSpec(Cmd.LIST, Scope.GROUP, "/upb list"),
+    CommandSpec(Cmd.HELP, Scope.GROUP, "/upb help"),
+    CommandSpec(Cmd.LANG, Scope.GROUP, "/upb lang <en|ru>"),
+    # internal: help for a bare/partial/unknown /upb; never listed in help
+    CommandSpec(Cmd.USAGE, Scope.GROUP, "/upb"),
     # --- private ---
-    CommandSpec(
-        Cmd.P_HELP,
-        Scope.PRIVATE,
-        "/help",
-        "Show the commands available to you in a private chat (aliases: /usage, /start).",
-    ),
-    CommandSpec(
-        Cmd.ADMIN_CREATE,
-        Scope.PRIVATE,
-        "/admin create <user_id>",
-        "Grant the admin role to a user.",
-    ),
-    CommandSpec(
-        Cmd.ADMIN_REMOVE,
-        Scope.PRIVATE,
-        "/admin remove <user_id>",
-        "Revoke the admin role and drop all of that admin's chats.",
-    ),
-    CommandSpec(
-        Cmd.ADMIN_LIST,
-        Scope.PRIVATE,
-        "/admin list",
-        "List all users with the admin role.",
-    ),
-    CommandSpec(
-        Cmd.CHAT_LIST,
-        Scope.PRIVATE,
-        "/chat list",
-        "List all registered chats.",
-    ),
-    CommandSpec(
-        Cmd.CHAT_REMOVE,
-        Scope.PRIVATE,
-        "/chat remove <chat_id>",
-        "Remove a chat's registration and drop its subscriptions.",
-    ),
+    CommandSpec(Cmd.P_HELP, Scope.PRIVATE, "/help"),
+    CommandSpec(Cmd.P_LANG, Scope.PRIVATE, "/lang <en|ru>"),
+    CommandSpec(Cmd.ADMIN_CREATE, Scope.PRIVATE, "/admin create <user_id>"),
+    CommandSpec(Cmd.ADMIN_REMOVE, Scope.PRIVATE, "/admin remove <user_id>"),
+    CommandSpec(Cmd.ADMIN_LIST, Scope.PRIVATE, "/admin list"),
+    CommandSpec(Cmd.CHAT_LIST, Scope.PRIVATE, "/chat list"),
+    CommandSpec(Cmd.CHAT_REMOVE, Scope.PRIVATE, "/chat remove <chat_id>"),
+    # internal: help for a bare/partial /admin, /chat, /lang; never listed in help
+    CommandSpec(Cmd.P_USAGE, Scope.PRIVATE, "/admin, /chat"),
 )
 
-CATALOG += (
-    CommandSpec(Cmd.P_LANG, Scope.PRIVATE, "/lang <en|ru>", "Set your reply language."),
-    CommandSpec(Cmd.P_USAGE, Scope.PRIVATE, "/admin, /chat", "Show help for the typed command prefix."),
-)
+# Internal entries: reachable by typing a prefix, but never listed as commands.
+INTERNAL: frozenset[Cmd] = frozenset({Cmd.USAGE, Cmd.P_USAGE})
 
 _BY_CMD: dict[Cmd, CommandSpec] = {s.cmd: s for s in CATALOG}
 
@@ -119,20 +54,18 @@ def can_run(cmd: Cmd, actor: Actor, *, scope: Scope, chat_active: bool) -> bool:
 
     if scope is Scope.GROUP:
         if not chat_active:
-            # Unregistered group: only staff may register it. Nothing else, not even for root.
-            return cmd is Cmd.CHAT_REGISTER and actor.is_staff
-        if cmd in (Cmd.CHAT_REGISTER, Cmd.CHAT_UNREGISTER):
-            return actor.is_staff
-        if cmd is Cmd.NOTIFY_ON:
-            return True  # explicit self-join exception: anybody may subscribe themselves
-        if cmd is Cmd.NOTIFY_OFF:
-            return actor.is_subscriber or actor.is_staff
-        if cmd in (Cmd.PING, Cmd.LIST, Cmd.HELP):
-            return actor.is_subscriber or actor.is_staff
+            # Free chat: any admin or root may register it; nothing else is available.
+            return cmd in (Cmd.CHAT_REGISTER, Cmd.USAGE) and actor.is_staff
+        if cmd in (Cmd.CHAT_REGISTER, Cmd.CHAT_UNREGISTER, Cmd.LANG):
+            return actor.is_chat_owner
+        if cmd in (Cmd.NOTIFY_ON, Cmd.USAGE):
+            return True
+        if cmd in (Cmd.NOTIFY_OFF, Cmd.PING, Cmd.LIST, Cmd.HELP):
+            return actor.is_subscriber or actor.is_chat_owner
         return False
 
-    # scope is PRIVATE: answers only root/admin, never a bare subscription
-    if cmd in (Cmd.P_HELP, Cmd.CHAT_LIST):
+    # PRIVATE: only root/admin, never a bare subscription or chat ownership
+    if cmd in (Cmd.P_HELP, Cmd.P_LANG, Cmd.P_USAGE, Cmd.CHAT_LIST):
         return actor.is_staff
     if cmd in (Cmd.ADMIN_CREATE, Cmd.ADMIN_REMOVE, Cmd.ADMIN_LIST, Cmd.CHAT_REMOVE):
         return actor.is_root
@@ -142,7 +75,7 @@ def can_run(cmd: Cmd, actor: Actor, *, scope: Scope, chat_active: bool) -> bool:
 def allowed_commands(
     actor: Actor, *, scope: Scope, chat_active: bool
 ) -> tuple[CommandSpec, ...]:
-    """What help generation consumes; keeps help from drifting off the policy above."""
+    """Every runnable catalogue entry, internal ones included (help filters those out)."""
     return tuple(
         s
         for s in CATALOG

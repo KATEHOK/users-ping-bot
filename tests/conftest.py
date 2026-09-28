@@ -1,5 +1,6 @@
 import builtins
 import os
+import re
 import socket as socket_module
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -78,12 +79,81 @@ class FakeClock(Clock):
         self._monotonic += seconds
 
 
+# Telegram HTML subset: only these tags, `a` carries href only, and &, <, > outside
+# tags must be entities. Unknown tags and stray angle brackets get rejected by Telegram.
+ALLOWED_TAGS = frozenset(
+    "b strong i em u ins s strike del a code pre tg-spoiler span blockquote".split()
+)
+_TAG_RE = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9-]*)((?:\s+[A-Za-z-]+=\"[^\"<>]*\")*)\s*>")
+_ATTR_RE = re.compile(r"\s+([A-Za-z-]+)=\"([^\"]*)\"")
+_ENTITY_RE = re.compile(r"&(?:lt|gt|amp|quot|#[0-9]+|#x[0-9A-Fa-f]+);")
+
+
+def _bare_amp(fragment: str) -> bool:
+    return "&" in _ENTITY_RE.sub("", fragment)
+
+
+def find_html_errors(text: str) -> list[str]:
+    """Violations of the Telegram HTML subset in text (empty list = valid)."""
+    errors: list[str] = []
+    stack: list[str] = []
+    pos = 0
+    while pos < len(text):
+        lt = text.find("<", pos)
+        plain = text[pos : len(text) if lt < 0 else lt]
+        if ">" in plain:
+            errors.append(f"unescaped '>' in {plain!r}")
+        if _bare_amp(plain):
+            errors.append(f"unescaped '&' in {plain!r}")
+        if lt < 0:
+            break
+        m = _TAG_RE.match(text, lt)
+        if m is None:
+            errors.append(f"unescaped '<' at {lt}: {text[lt : lt + 20]!r}")
+            pos = lt + 1
+            continue
+        closing, name, attrs = m.group(1), m.group(2).lower(), m.group(3)
+        if name not in ALLOWED_TAGS:
+            errors.append(f"unsupported tag <{name}>")
+        for attr, value in _ATTR_RE.findall(attrs):
+            if name != "a" or attr != "href":
+                errors.append(f"attribute {attr} not allowed on <{name}>")
+            if _bare_amp(value):
+                errors.append(f"unescaped '&' in attribute {attr}")
+        if closing:
+            if attrs.strip():
+                errors.append(f"closing tag </{name}> has attributes")
+            if not stack or stack[-1] != name:
+                errors.append(f"unbalanced </{name}>")
+            else:
+                stack.pop()
+        else:
+            stack.append(name)
+        pos = m.end()
+    errors.extend(f"unclosed <{name}>" for name in stack)
+    return errors
+
+
+_transports: list["RecordingTransport"] = []
+
+
+@pytest.fixture(autouse=True)
+def _transport_html_valid():
+    _transports.clear()
+    yield
+    bad = [(tr, e) for tr in _transports for e in tr.html_errors]
+    _transports.clear()
+    assert not bad, "invalid Telegram HTML sent: " + "; ".join(e for _, e in bad)
+
+
 class RecordingTransport:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.html_errors: list[str] = []  # collected, never raised: code may swallow send errors
         self._raise: Exception | None = None
         self._raise_queue: list[Exception] = []
         self._fail_chats: dict[int, Exception] = {}
+        _transports.append(self)
 
     def raise_next(self, exc: Exception) -> None:
         self._raise = exc
@@ -107,6 +177,7 @@ class RecordingTransport:
         reply_to_message_id: int | None = None,
         thread_id: int | None = None,
     ) -> None:
+        self.html_errors.extend(f"{e} (text={text!r})" for e in find_html_errors(text))
         self.calls.append(
             {
                 "chat_id": chat_id,
