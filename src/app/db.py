@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,12 @@ from .clock import iso
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
+log = logging.getLogger(__name__)
+
+
+class SchemaTooNewError(Exception):
+    """The database records a schema version this code does not know."""
+
 
 class Database:
     def __init__(self, path: str, *, busy_timeout_ms: int = 5000) -> None:
@@ -18,12 +26,17 @@ class Database:
         self._busy_timeout_ms = busy_timeout_ms
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        self.created_new = False
 
     async def connect(self) -> None:
-        if self._path not in (":memory:", ""):
+        in_memory = self._path in (":memory:", "")
+        self.created_new = not in_memory and not Path(self._path).exists()
+        if not in_memory:
             parent = os.path.dirname(self._path)
             if parent:
                 Path(parent).mkdir(parents=True, exist_ok=True)
+        if self.created_new:
+            log.warning("database file not found, creating a new one: %s", Path(self._path).resolve())
         self._conn = await aiosqlite.connect(self._path)
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA journal_mode=WAL")
@@ -67,7 +80,21 @@ async def open_database(path: str) -> AsyncIterator[Database]:
 
 
 def _split_statements(sql: str) -> list[str]:
-    return [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
+    statements: list[str] = []
+    buf = ""
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            statements.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        # trailing comments only are fine; anything else is a truncated statement
+        stripped = "\n".join(
+            ln for ln in buf.splitlines() if ln.strip() and not ln.strip().startswith("--")
+        )
+        if stripped:
+            raise ValueError("incomplete SQL statement in migration")
+    return statements
 
 
 async def apply_migrations(db: Database) -> list[str]:
@@ -78,6 +105,11 @@ async def apply_migrations(db: Database) -> list[str]:
         )
         cursor = await conn.execute("SELECT version FROM schema_migrations")
         existing = {row[0] for row in await cursor.fetchall()}
+
+    known = {file.stem for file in MIGRATIONS_DIR.glob("*.sql")}
+    unknown = sorted(existing - known)
+    if unknown:
+        raise SchemaTooNewError(f"database has unknown schema versions: {', '.join(unknown)}")
 
     applied: list[str] = []
     for file in sorted(MIGRATIONS_DIR.glob("*.sql")):

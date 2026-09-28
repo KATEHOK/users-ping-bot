@@ -23,6 +23,7 @@ def test_load_config_defaults():
     assert cfg.vault_timeout == 5.0
     assert cfg.db_path == "/data/upb.sqlite3"
     assert cfg.log_level == "INFO"
+    assert cfg.ping_cooldown_seconds == 5.0
 
 
 def test_load_config_overrides():
@@ -34,6 +35,7 @@ def test_load_config_overrides():
             VAULT_TIMEOUT="2.5",
             UPB_DB_PATH="/data/other.sqlite3",
             UPB_LOG_LEVEL="DEBUG",
+            UPB_PING_COOLDOWN_SECONDS="0.5",
         )
     )
     assert cfg.vault_auth_mount == "approle2"
@@ -42,6 +44,7 @@ def test_load_config_overrides():
     assert cfg.vault_timeout == 2.5
     assert cfg.db_path == "/data/other.sqlite3"
     assert cfg.log_level == "DEBUG"
+    assert cfg.ping_cooldown_seconds == 0.5
 
 
 @pytest.mark.parametrize(
@@ -85,3 +88,10 @@ def test_config_import_has_no_side_effects(monkeypatch):
     monkeypatch.delenv("VAULT_ADDR", raising=False)
     with pytest.raises(ConfigError):
         load_config({})
+
+
+def test_ping_cooldown_empty_uses_default_and_bad_value_raises():
+    assert load_config(_env(UPB_PING_COOLDOWN_SECONDS="")).ping_cooldown_seconds == 5.0
+    with pytest.raises(ConfigError) as exc:
+        load_config(_env(UPB_PING_COOLDOWN_SECONDS="soon"))
+    assert "UPB_PING_COOLDOWN_SECONDS" in str(exc.value)

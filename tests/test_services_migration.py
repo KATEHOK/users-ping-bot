@@ -1,11 +1,9 @@
+import logging
+
 import pytest
 
 from app.db import Database
-from app.delivery import Delivery
-from app.models import Role
 from app.services import Services
-
-from conftest import FakeClock, RecordingTransport
 
 
 async def _register(services, db, user_id, chat_id, title="Chat"):
@@ -45,40 +43,78 @@ async def test_resolve_chat_id_tolerates_cycle(db: Database):
     assert result in (-1, -2)
 
 
-async def test_migrate_chat_moves_registration_generation_registrar_and_subscription_ids(
+async def _sub(services, db, chat_id, user_id):
+    async with db.transaction() as c:
+        await services.touch_user(c, user_id)
+        await services.subscribe(c, chat_id, user_id)
+
+
+async def test_migrate_moves_registration_generation_registrar_lang_and_subscriptions(
     db: Database,
 ):
     services = Services()
     reg = await _register(services, db, 1, -100, "Group")
     async with db.transaction() as c:
-        await services.touch_user(c, 2)
-        sub = await services.subscribe(c, -100, 2)
+        await services.set_chat_lang(c, -100, "ru")
+    await _sub(services, db, -100, 2)
 
     async with db.transaction() as c:
         result = await services.migrate_chat(c, -100, -200)
-
-    assert result.applied is True
-    assert result.conflict_id is None
+    assert result.action == "moved"
 
     async with db.reader() as c:
         old_row = await services.get_chat(c, -100)
         new_row = await services.get_chat(c, -200)
-        moved_sub_id = await services.subscription_id_of(c, -200, 2)
-        gone_sub_id = await services.subscription_id_of(c, -100, 2)
+        moved = await services.is_subscribed(c, -200, 2)
+        gone = await services.is_subscribed(c, -100, 2)
         canonical = await services.resolve_chat_id(c, -100)
 
     assert old_row is None
     assert new_row is not None
     assert new_row.registered_by == 1
     assert new_row.registration_generation == reg.generation
-    assert moved_sub_id == sub.subscription_id
-    assert gone_sub_id is None
+    assert new_row.lang == "ru"
+    assert moved and not gone
     assert canonical == -200
 
 
-async def test_migrate_chat_with_no_active_registration_retargets_pending_farewell(
-    db: Database,
+async def test_migrate_keeps_destination_and_drops_old_registration_with_warning(
+    db: Database, caplog
 ):
+    services = Services()
+    await _register(services, db, 1, -100, "Old")
+    await _sub(services, db, -100, 5)
+    await _register(services, db, 2, -200, "New")
+    await _sub(services, db, -200, 6)
+
+    with caplog.at_level(logging.WARNING, logger="app.services"):
+        async with db.transaction() as c:
+            result = await services.migrate_chat(c, -100, -200)
+    assert result.action == "kept_destination"
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    async with db.reader() as c:
+        assert await services.get_chat(c, -100) is None
+        new_row = await services.get_chat(c, -200)
+        assert new_row is not None and new_row.registered_by == 2
+        assert await services.is_subscribed(c, -200, 6)
+        assert not await services.is_subscribed(c, -200, 5)  # old subscribers are not merged
+        assert await services.resolve_chat_id(c, -100) == -200
+        cursor = await c.execute("SELECT COUNT(*) FROM outbox")
+        assert (await cursor.fetchone())[0] == 0  # no farewell to a chat that moved
+
+
+async def test_migrate_alias_only_when_old_chat_unregistered(db: Database):
+    services = Services()
+    async with db.transaction() as c:
+        result = await services.migrate_chat(c, -100, -200)
+    assert result.action == "alias_only"
+    async with db.reader() as c:
+        assert await services.get_chat(c, -200) is None
+        assert await services.resolve_chat_id(c, -100) == -200
+
+
+async def test_migrate_retargets_pending_farewell_and_reregistration_cancels_it(db: Database):
     services = Services()
     await _register(services, db, 1, -100)
     async with db.transaction() as c:
@@ -86,7 +122,7 @@ async def test_migrate_chat_with_no_active_registration_retargets_pending_farewe
 
     async with db.transaction() as c:
         result = await services.migrate_chat(c, -100, -200)
-    assert result.applied is True
+    assert result.action == "alias_only"
 
     async with db.reader() as c:
         cursor = await c.execute(
@@ -95,7 +131,6 @@ async def test_migrate_chat_with_no_active_registration_retargets_pending_farewe
         rows = await cursor.fetchall()
     assert rows == [(-200, "pending")]
 
-    # a later registration of the new chat_id cancels the re-targeted farewell
     async with db.transaction() as c:
         await services.touch_user(c, 1)
         await services.register_chat(c, -200, "New group", 1)
@@ -105,209 +140,56 @@ async def test_migrate_chat_with_no_active_registration_retargets_pending_farewe
     assert status == "cancelled"
 
 
+async def test_migrate_retargets_pending_events_when_moving_registration(db: Database):
+    services = Services()
+    await _register(services, db, 1, -100)
+    async with db.transaction() as c:
+        await services.queue_event(
+            c, event_key="x", event_type="chat_farewell", target_kind="chat",
+            target_id=-100, payload={},
+        )
+        await services.migrate_chat(c, -100, -200)
+    async with db.reader() as c:
+        events = await services.due_events(c, "9999-01-01T00:00:00+00:00")
+    assert [e.target_id for e in events] == [-200]
+
+
 async def test_repeated_migration_is_noop(db: Database):
     services = Services()
     await _register(services, db, 1, -100)
     async with db.transaction() as c:
         first = await services.migrate_chat(c, -100, -200)
-    assert first.applied is True
-
-    async with db.transaction() as c:
-        second = await services.migrate_chat(c, -100, -200)
-    assert second.applied is False
-    assert second.conflict_id is None
-
-    async with db.reader() as c:
-        assert await services.list_conflicts(c) == []
-
-
-async def test_paired_migration_updates_change_nothing_after_first(db: Database):
-    services = Services()
-    await _register(services, db, 1, -100)
-    async with db.transaction() as c:
-        await services.touch_user(c, 2)
-        sub = await services.subscribe(c, -100, 2)
-
-    async with db.transaction() as c:
-        await services.migrate_chat(c, -100, -200)
+    assert first.action == "moved"
     async with db.reader() as c:
         row_after_first = await services.get_chat(c, -200)
 
     async with db.transaction() as c:
-        await services.migrate_chat(c, -100, -200)  # duplicate update, different update_id
+        second = await services.migrate_chat(c, -100, -200)
+    assert second.action == "noop"
     async with db.reader() as c:
-        row_after_second = await services.get_chat(c, -200)
-        sub_id = await services.subscription_id_of(c, -200, 2)
-
-    assert row_after_first == row_after_second
-    assert sub_id == sub.subscription_id
+        assert await services.get_chat(c, -200) == row_after_first
 
 
-async def test_migration_contradictory_alias_opens_conflict_and_blocks_both_sides(
-    db: Database,
-):
+async def test_contradictory_alias_warns_and_changes_nothing(db: Database, caplog):
     services = Services()
     await _register(services, db, 1, -100)
     async with db.transaction() as c:
         await services.migrate_chat(c, -100, -200)
+    await _register(services, db, 2, -300)
 
-    async with db.transaction() as c:
-        # a second, contradictory migration for the same old_chat_id
-        result = await services.migrate_chat(c, -100, -300)
-    assert result.applied is False
-    assert result.conflict_id is not None
-
-    async with db.reader() as c:
-        blocked_old = await services.is_blocked(c, -100)
-        blocked_new = await services.is_blocked(c, -200)
-        blocked_other = await services.is_blocked(c, -300)
-    assert blocked_old is True
-    assert blocked_new is True
-    assert blocked_other is True
-
-
-async def test_migration_destination_conflict_cancels_scope_events_and_persists(
-    db: Database, tmp_path
-):
-    path = str(tmp_path / "persist.sqlite3")
-    from app.db import apply_migrations
-
-    database = Database(path)
-    await database.connect()
-    await apply_migrations(database)
-    services = Services()
-    try:
-        await _register(services, database, 1, -100, "Old")
-        await _register(services, database, 2, -200, "Independent")  # unrelated registration
-
-        async with database.transaction() as c:
-            result = await services.migrate_chat(c, -100, -200)
-        assert result.applied is False
-        assert result.conflict_id is not None
-
-        async with database.reader() as c:
-            events_cancelled_count = await services.cancel_chat_events(c, -100)  # already 0 left
-        assert events_cancelled_count == 0  # nothing pending anymore (both cancelled already)
-    finally:
-        await database.close()
-
-    # reopen a fresh Database instance on the same file: block must survive
-    database2 = Database(path)
-    await database2.connect()
-    try:
-        async with database2.reader() as c:
-            blocked = await services.is_blocked(c, -100)
-            blocked_dest = await services.is_blocked(c, -200)
-        assert blocked is True
-        assert blocked_dest is True
-    finally:
-        await database2.close()
-
-
-async def test_conflict_scope_lists_connected_group_and_overlapping_conflicts(db: Database):
-    services = Services()
-    async with db.transaction() as c:
-        first_id = await services.open_conflict(c, [-100, -200], "manual")
-    async with db.transaction() as c:
-        await c.execute(
-            "INSERT INTO chat_aliases(old_chat_id, new_chat_id, created_at) VALUES (-200, -300, 't')"
-        )
-        second_id = await services.open_conflict(c, [-300, -400], "manual")
-
-    async with db.reader() as c:
-        scope = await services.conflict_scope(c, first_id)
-
-    assert scope.chat_ids == sorted([-100, -200, -300, -400])
-    assert sorted(scope.conflict_ids) == sorted([first_id, second_id])
-    assert (-200, -300) in scope.alias_pairs
-
-
-async def test_reset_conflict_removes_only_its_scope(db: Database):
-    services = Services()
-    await _register(services, db, 1, -100, "A")
-    await _register(services, db, 1, -300, "Untouched")
-    async with db.transaction() as c:
-        await services.touch_user(c, 5)
-        await services.grant_admin(c, 5)
-        await services.subscribe(c, -100, 5)
-        await services.subscribe(c, -300, 5)
-        conflict_id = await services.open_conflict(c, [-100, -200], "manual")
-
-    async with db.transaction() as c:
-        result = await services.reset_conflict(c, conflict_id)
-
-    assert sorted(result.chat_ids) == [-200, -100]
-    assert result.chats_removed == 1  # only -100 had a chats row; -200 never existed
-    assert result.subscriptions_removed == 1
-
-    async with db.reader() as c:
-        assert await services.get_chat(c, -100) is None
-        untouched = await services.get_chat(c, -300)
-        assert untouched is not None
-        assert await services.subscription_id_of(c, -300, 5) is not None  # unrelated sub kept
-        assert await services.get_role(c, 5) is Role.ADMIN  # global role untouched
-        assert await services.is_blocked(c, -100) is False
-        conflicts = await services.list_conflicts(c, status="resolved")
-    assert len(conflicts) == 1
-    assert conflicts[0].conflict_id == conflict_id
-
-
-async def test_reset_conflict_does_not_activate_a_chat(db: Database):
-    services = Services()
-    async with db.transaction() as c:
-        conflict_id = await services.open_conflict(c, [-100, -200], "manual")
-    async with db.transaction() as c:
-        await services.reset_conflict(c, conflict_id)
-    async with db.reader() as c:
-        assert await services.get_chat(c, -100) is None
-        assert await services.get_chat(c, -200) is None
-
-
-async def test_reset_conflict_keeps_processed_updates_and_repeat_update_is_safe(db: Database):
-    services = Services()
-    await _register(services, db, 1, -100)
-    async with db.transaction() as c:
-        assert await services.claim_update(c, 7, 42) is True
-        conflict_id = await services.open_conflict(c, [-100], "manual")
-
-    async with db.transaction() as c:
-        await services.reset_conflict(c, conflict_id)
-
-    async with db.reader() as c:
-        cursor = await c.execute(
-            "SELECT COUNT(*) FROM processed_updates WHERE bot_id = 7 AND update_id = 42"
-        )
-        (count,) = await cursor.fetchone()
-    assert count == 1  # processed_updates untouched by reset
-
-    # repeat of the old update is a safe no-op
-    async with db.transaction() as c:
-        claimed_again = await services.claim_update(c, 7, 42)
-    assert claimed_again is False
-
-
-async def test_failure_inside_reset_conflict_leaves_conflict_open_and_db_unchanged(
-    db: Database,
-):
-    services = Services()
-    await _register(services, db, 1, -100)
-    async with db.transaction() as c:
-        conflict_id = await services.open_conflict(c, [-100], "manual")
-
-    with pytest.raises(RuntimeError):
+    with caplog.at_level(logging.WARNING, logger="app.services"):
         async with db.transaction() as c:
-            await services.reset_conflict(c, conflict_id)
-            raise RuntimeError("boom mid-reset")
+            result = await services.migrate_chat(c, -100, -300)
+    assert result.action == "contradictory"
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
 
     async with db.reader() as c:
-        conflicts = await services.list_conflicts(c, status="open")
-        chat = await services.get_chat(c, -100)
-    assert len(conflicts) == 1
-    assert conflicts[0].conflict_id == conflict_id
-    assert chat is not None  # nothing was actually removed
+        assert await services.resolve_chat_id(c, -100) == -200
+        assert await services.get_chat(c, -200) is not None
+        assert await services.get_chat(c, -300) is not None
 
 
-async def test_failure_inside_migrate_chat_leaves_no_alias_and_no_conflict(db: Database):
+async def test_failure_inside_migrate_chat_leaves_no_alias(db: Database):
     services = Services()
     await _register(services, db, 1, -100)
 
@@ -317,67 +199,5 @@ async def test_failure_inside_migrate_chat_leaves_no_alias_and_no_conflict(db: D
             raise RuntimeError("boom mid-migration")
 
     async with db.reader() as c:
-        canonical = await services.resolve_chat_id(c, -100)
-        old_row = await services.get_chat(c, -100)
-        conflicts = await services.list_conflicts(c)
-    assert canonical == -100  # no alias committed
-    assert old_row is not None  # old registration untouched
-    assert conflicts == []
-
-
-async def test_revoke_admin_inside_blocked_scope_applies_but_queues_no_farewell(db: Database):
-    # punch-list P4: an admin's only chat sits inside an open conflict's blocked
-    # scope; the CLI/Telegram revocation must still apply (role gone, chat gone)
-    # while the conflict itself stays open and nothing is sent into that chat.
-    services = Services()
-    async with db.transaction() as c:
-        await services.touch_user(c, 5)
-        await services.grant_admin(c, 5)
-        await services.register_chat(c, -100, "Blocked chat", 5)
-        conflict_id = await services.open_conflict(c, [-100, -200], "manual")
-
-    async with db.reader() as c:
-        chat_before = await services.get_chat(c, -100)
-    assert chat_before is not None
-    assert chat_before.blocked is True  # registration untouched by opening the conflict
-
-    async with db.transaction() as c:
-        revoke_result = await services.revoke_admin(c, 5)
-    assert revoke_result.revoked is True
-    assert revoke_result.chat_ids == [-100]
-
-    async with db.reader() as c:
-        role_after = await services.get_role(c, 5)
-        chat_after = await services.get_chat(c, -100)
-        conflicts = await services.list_conflicts(c, status="open")
-        cursor = await c.execute(
-            "SELECT COUNT(*) FROM outbox WHERE target_kind = 'chat' AND target_id = -100"
-        )
-        (farewell_rows,) = await cursor.fetchone()
-
-    assert role_after is None  # revocation applied despite the block
-    assert chat_after is None  # the chat's registration is gone too
-    assert any(row.conflict_id == conflict_id for row in conflicts)  # conflict stays open
-    assert farewell_rows == 0  # no farewell -- deliverable or not -- was ever queued
-
-    # confirm at the transport level too: an outbox run sends nothing for -100
-    clock = FakeClock()
-    transport = RecordingTransport()
-    delivery = Delivery(db, Services(clock=clock), transport, clock=clock)
-    delivered = await delivery.run_outbox_once()
-    assert delivered == 0
-    assert transport.calls == []
-
-
-async def test_is_blocked_true_for_any_id_in_the_alias_group(db: Database):
-    services = Services()
-    async with db.transaction() as c:
-        conflict_id = await services.open_conflict(c, [-100], "manual")
-        await c.execute(
-            "INSERT INTO chat_aliases(old_chat_id, new_chat_id, created_at) VALUES (-50, -100, 't')"
-        )
-    async with db.reader() as c:
-        assert await services.is_blocked(c, -100) is True
-        assert await services.is_blocked(c, -50) is True  # alias into the blocked id
-        assert await services.is_blocked(c, -999) is False
-    assert conflict_id is not None
+        assert await services.resolve_chat_id(c, -100) == -100
+        assert await services.get_chat(c, -100) is not None

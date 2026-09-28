@@ -23,12 +23,13 @@ class Config:
     vault_timeout: float = 5.0
     db_path: str = "/data/upb.sqlite3"
     log_level: str = "INFO"
+    ping_cooldown_seconds: float = 5.0
 
     def __repr__(self) -> str:
         return (
             "Config(vault_addr=%r, vault_role_id=%s, vault_secret_id=%s, "
             "vault_secret_path=%r, vault_auth_mount=%r, vault_kv_mount=%r, "
-            "vault_ca_path=%r, vault_timeout=%r, db_path=%r, log_level=%r)"
+            "vault_ca_path=%r, vault_timeout=%r, db_path=%r, log_level=%r, ping_cooldown_seconds=%r)"
             % (
                 self.vault_addr,
                 _mask(self.vault_role_id),
@@ -40,6 +41,7 @@ class Config:
                 self.vault_timeout,
                 self.db_path,
                 self.log_level,
+                self.ping_cooldown_seconds,
             )
         )
 
@@ -79,6 +81,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         vault_timeout=_optional_float(env, "VAULT_TIMEOUT", 5.0),
         db_path=env.get("UPB_DB_PATH") or _DEFAULT_DB_PATH,
         log_level=env.get("UPB_LOG_LEVEL") or "INFO",
+        ping_cooldown_seconds=_optional_float(env, "UPB_PING_COOLDOWN_SECONDS", 5.0),
     )
 
 

@@ -1,4 +1,4 @@
-"""Local operator CLI: root assignment and migration-conflict maintenance.
+"""Local operator CLI: root assignment, backup and verification.
 
 A separate process/connection from the bot: it only uses `config.load_db_path`
 and `db.open_database`, so it applies/verifies the schema itself and works
@@ -17,11 +17,9 @@ import sys
 from pathlib import Path
 from typing import Callable, Coroutine, Sequence
 
-import aiosqlite
-
 from . import config
 from .db import MIGRATIONS_DIR, open_database
-from .services import ConflictScope, ResetResult, Services, SetRootResult
+from .services import Services, SetRootResult
 
 
 class CliError(Exception):
@@ -47,18 +45,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_set_root = sub.add_parser("set-root", help="assign the global root user")
     p_set_root.add_argument("telegram_user_id", type=_positive_int)
 
-    p_mc = sub.add_parser("migration-conflicts", help="inspect/reset migration conflicts")
-    mc_sub = p_mc.add_subparsers(dest="action", required=True)
-
-    mc_sub.add_parser("list", help="list open conflicts")
-
-    p_show = mc_sub.add_parser("show", help="show the full connected scope of a conflict")
-    p_show.add_argument("conflict_id", type=_positive_int)
-
-    p_reset = mc_sub.add_parser("reset", help="preview or apply a conflict reset")
-    p_reset.add_argument("conflict_id", type=_positive_int)
-    p_reset.add_argument("--apply", action="store_true")
-
     p_backup = sub.add_parser(
         "backup", help="write a consistent snapshot of the live database via the backup API"
     )
@@ -71,10 +57,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("path")
 
     return parser
-
-
-def _format_ids(ids: Sequence[int]) -> str:
-    return ",".join(str(i) for i in ids)
 
 
 def _print_set_root_result(new_root_id: int, result: SetRootResult) -> None:
@@ -95,81 +77,6 @@ async def _cmd_set_root(user_id: int) -> int:
         async with db.transaction() as c:
             result = await services.set_root(c, user_id)
     _print_set_root_result(user_id, result)
-    return 0
-
-
-async def _cmd_conflicts_list() -> int:
-    services = Services()
-    db_path = config.load_db_path()
-    async with open_database(db_path) as db:
-        async with db.reader() as c:
-            conflicts = await services.list_conflicts(c, status="open")
-    if not conflicts:
-        print("no open migration conflicts")
-        return 0
-    for row in conflicts:
-        print(
-            f"conflict_id={row.conflict_id} chat_ids=[{_format_ids(row.chat_ids)}] "
-            f"reason={row.reason} created_at={row.created_at}"
-        )
-    return 0
-
-
-async def _require_open_conflict(
-    services: Services, c: aiosqlite.Connection, conflict_id: int
-) -> None:
-    open_ids = {row.conflict_id for row in await services.list_conflicts(c, status="open")}
-    if conflict_id not in open_ids:
-        raise CliError(f"conflict {conflict_id} not found or already resolved", code=2)
-
-
-async def _cmd_conflicts_show(conflict_id: int) -> int:
-    services = Services()
-    db_path = config.load_db_path()
-    async with open_database(db_path) as db:
-        async with db.reader() as c:
-            await _require_open_conflict(services, c, conflict_id)
-            scope = await services.conflict_scope(c, conflict_id)
-    print(f"chat_ids=[{_format_ids(scope.chat_ids)}]")
-    print(f"alias_pairs=[{','.join(f'{o}->{n}' for o, n in scope.alias_pairs)}]")
-    print(f"conflict_ids=[{_format_ids(scope.conflict_ids)}]")
-    return 0
-
-
-def _print_reset_preview(scope: ConflictScope) -> None:
-    print("PREVIEW ONLY -- nothing was changed")
-    print(f"would resolve conflict_ids=[{_format_ids(scope.conflict_ids)}]")
-    print(f"would remove chats=[{_format_ids(scope.chat_ids)}]")
-    print(f"would remove alias_pairs=[{','.join(f'{o}->{n}' for o, n in scope.alias_pairs)}]")
-    print("roles, users and processed_updates are never touched by this operation")
-
-
-def _print_reset_applied(result: ResetResult) -> None:
-    print("APPLIED -- the scope below was removed")
-    print(f"conflict_ids_resolved=[{_format_ids(result.conflict_ids)}]")
-    print(f"chat_ids=[{_format_ids(result.chat_ids)}]")
-    print(f"chats_removed={result.chats_removed}")
-    print(f"subscriptions_removed={result.subscriptions_removed}")
-    print(f"events_cancelled={result.events_cancelled}")
-    print(f"aliases_removed={result.aliases_removed}")
-
-
-async def _cmd_conflicts_reset(conflict_id: int, apply: bool) -> int:
-    services = Services()
-    db_path = config.load_db_path()
-    async with open_database(db_path) as db:
-        if not apply:
-            async with db.reader() as c:
-                await _require_open_conflict(services, c, conflict_id)
-                scope = await services.conflict_scope(c, conflict_id)
-            _print_reset_preview(scope)
-            return 0
-
-        async with db.reader() as c:
-            await _require_open_conflict(services, c, conflict_id)
-        async with db.transaction() as c:
-            result = await services.reset_conflict(c, conflict_id)
-    _print_reset_applied(result)
     return 0
 
 
@@ -302,14 +209,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "set-root":
         return _run(_cmd_set_root(args.telegram_user_id))
-
-    if args.command == "migration-conflicts":
-        if args.action == "list":
-            return _run(_cmd_conflicts_list())
-        if args.action == "show":
-            return _run(_cmd_conflicts_show(args.conflict_id))
-        if args.action == "reset":
-            return _run(_cmd_conflicts_reset(args.conflict_id, args.apply))
 
     if args.command == "backup":
         return _run_sync(_cmd_backup, args.destination_path, args.force)

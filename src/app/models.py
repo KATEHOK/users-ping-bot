@@ -92,6 +92,5 @@ class IncomingEvent:
 @dataclass(frozen=True, slots=True)
 class SubscriberRef:
     user_id: int
-    subscription_id: int = 0  # iter2: dropped; construct with keywords only
     display_name: str | None = None
     username: str | None = None

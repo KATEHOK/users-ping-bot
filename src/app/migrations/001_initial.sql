@@ -3,6 +3,7 @@ CREATE TABLE users (
     username TEXT,
     display_name TEXT,
     private_contact_at TEXT,
+    lang TEXT NOT NULL DEFAULT 'en',
     updated_at TEXT NOT NULL
 );
 
@@ -19,13 +20,13 @@ CREATE TABLE chats (
     title TEXT,
     registered_by INTEGER NOT NULL REFERENCES users(user_id),
     registered_at TEXT NOT NULL,
-    registration_generation INTEGER NOT NULL
+    registration_generation INTEGER NOT NULL,
+    lang TEXT NOT NULL DEFAULT 'en'
 );
 
 CREATE TABLE subscriptions (
     chat_id INTEGER NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(user_id),
-    subscription_id INTEGER UNIQUE NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (chat_id, user_id)
 );
@@ -55,27 +56,13 @@ CREATE TABLE processed_updates (
     PRIMARY KEY (bot_id, update_id)
 );
 
-CREATE TABLE polling_state (
-    bot_id INTEGER PRIMARY KEY,
-    next_offset INTEGER NOT NULL,
-    updated_at TEXT NOT NULL
-);
+CREATE INDEX processed_updates_processed_at ON processed_updates(processed_at);
 
 -- no FK to chats: aliases must survive the old chat row being dropped
 CREATE TABLE chat_aliases (
     old_chat_id INTEGER PRIMARY KEY,
     new_chat_id INTEGER NOT NULL,
     created_at TEXT NOT NULL
-);
-
-CREATE TABLE migration_conflicts (
-    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_ids TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    details TEXT,
-    status TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
-    created_at TEXT NOT NULL,
-    resolved_at TEXT
 );
 
 CREATE TABLE counters (
@@ -89,4 +76,3 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 INSERT INTO counters (name, value) VALUES ('generation', 0);
-INSERT INTO counters (name, value) VALUES ('subscription_id', 0);

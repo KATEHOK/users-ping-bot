@@ -25,7 +25,7 @@ async def test_reregistering_before_old_farewell_delivered_cancels_stale_event(d
         await services.register_chat(c, -100, "Chat", 1)
 
     async with db.reader() as c:
-        assert await services.event_status(c, stale_event_id) == "cancelled"
+        assert (await services.get_event(c, stale_event_id)).status == "cancelled"
 
 
 async def test_g1_unregister_g2_register_g2_unregister_leaves_only_g2_deliverable(
@@ -96,8 +96,8 @@ async def test_event_status_reflects_cancellation_after_worker_fetched_it(db: Da
         await services.cancel_chat_events(c, -100)
 
     async with db.reader() as c:
-        status = await services.event_status(c, job.event_id)
-    assert status == "cancelled"  # locally held job is not permission to send
+        event = await services.get_event(c, job.event_id)
+    assert event.status == "cancelled"  # locally held job is not permission to send
 
 
 async def test_due_events_orders_oldest_first_and_respects_limit(db: Database):
@@ -158,7 +158,7 @@ async def test_mark_event_sent_is_not_due_again(db: Database):
         await services.mark_event(c, event_id, "sent")
     async with db.reader() as c:
         assert await services.due_events(c, "9999-01-01T00:00:00+00:00") == []
-        assert await services.event_status(c, event_id) == "sent"
+        assert (await services.get_event(c, event_id)).status == "sent"
 
 
 async def test_cancel_chat_events_leaves_sent_events_untouched(db: Database):
@@ -189,8 +189,8 @@ async def test_cancel_chat_events_leaves_sent_events_untouched(db: Database):
 
     assert cancelled == 1
     async with db.reader() as c:
-        assert await services.event_status(c, sent_id) == "sent"
-        assert await services.event_status(c, pending_id) == "cancelled"
+        assert (await services.get_event(c, sent_id)).status == "sent"
+        assert (await services.get_event(c, pending_id)).status == "cancelled"
 
 
 async def test_root_revoked_event_queued_only_with_prior_private_contact(db: Database):
@@ -223,3 +223,95 @@ async def test_no_root_revoked_event_without_prior_contact(db: Database):
         cursor = await c.execute("SELECT COUNT(*) FROM outbox WHERE event_type = 'root_revoked'")
         (count,) = await cursor.fetchone()
     assert count == 0
+
+
+async def test_get_event_rereads_whole_row(db: Database):
+    services = Services()
+    async with db.transaction() as c:
+        event_id = await services.queue_event(
+            c, event_key="k", event_type="chat_farewell", target_kind="chat",
+            target_id=-1, generation=1, payload={"lang": "ru"},
+        )
+    async with db.reader() as c:
+        before = await services.get_event(c, event_id)
+    async with db.transaction() as c:
+        await c.execute("UPDATE outbox SET target_id = -2 WHERE event_id = ?", (event_id,))
+        await services.mark_event(c, event_id, "pending", error="boom")
+    async with db.reader() as c:
+        after = await services.get_event(c, event_id)
+        missing = await services.get_event(c, 999)
+    assert before.target_id == -1 and before.attempts == 0
+    assert after.target_id == -2 and after.attempts == 1 and after.last_error == "boom"
+    assert after.payload == {"lang": "ru"}
+    assert missing is None
+
+
+async def test_farewell_payload_carries_chat_language(db: Database):
+    services = Services()
+    await _register(services, db, 1, -100)
+    await _register(services, db, 1, -200)
+    async with db.transaction() as c:
+        await services.set_chat_lang(c, -100, "ru")
+        await services.unregister_chat(c, -100)
+        await services.unregister_chat(c, -200)
+    async with db.reader() as c:
+        events = await services.due_events(c, "9999-01-01T00:00:00+00:00")
+    assert {e.target_id: e.payload for e in events} == {-100: {"lang": "ru"}, -200: {"lang": "en"}}
+
+
+async def test_unregister_without_farewell_queues_nothing(db: Database):
+    services = Services()
+    await _register(services, db, 1, -100)
+    async with db.transaction() as c:
+        await services.unregister_chat(c, -100, farewell=False)
+    async with db.reader() as c:
+        assert await services.due_events(c, "9999-01-01T00:00:00+00:00") == []
+
+
+async def test_root_revoked_payload_carries_previous_root_language(db: Database):
+    services = Services()
+    async with db.transaction() as c:
+        await services.touch_user(c, 1, private_contact=True)
+        await services.set_root(c, 1)
+        await services.set_user_lang(c, 1, "ru")
+        await services.set_root(c, 2)
+    async with db.reader() as c:
+        (event,) = await services.due_events(c, "9999-01-01T00:00:00+00:00")
+    assert event.event_type == "root_revoked"
+    assert event.payload == {"lang": "ru"}
+
+
+async def test_set_root_cancels_pending_root_revoked_for_new_root(db: Database):
+    services = Services()
+    async with db.transaction() as c:
+        await services.touch_user(c, 1, private_contact=True)
+        await services.touch_user(c, 3, private_contact=True)
+        await services.set_root(c, 1)
+        await services.set_root(c, 2)  # 1 is revoked, notice pending
+        await services.set_root(c, 3)  # 2 never wrote privately: no notice
+    async with db.reader() as c:
+        pending = await services.due_events(c, "9999-01-01T00:00:00+00:00")
+    assert [(e.target_id, e.event_type) for e in pending] == [(1, "root_revoked")]
+
+    async with db.transaction() as c:
+        result = await services.set_root(c, 1)  # 1 is promoted again
+    assert result.changed is True
+    async with db.reader() as c:
+        left = await services.due_events(c, "9999-01-01T00:00:00+00:00")
+        assert [e.target_id for e in left] == [3]  # only the newly revoked root is notified
+        cursor = await c.execute(
+            "SELECT status FROM outbox WHERE event_type = 'root_revoked' AND target_id = 1"
+        )
+        assert [r[0] for r in await cursor.fetchall()] == ["cancelled"]
+
+
+async def test_set_root_same_id_keeps_pending_notices(db: Database):
+    services = Services()
+    async with db.transaction() as c:
+        await services.touch_user(c, 1, private_contact=True)
+        await services.set_root(c, 1)
+        await services.set_root(c, 2)
+        result = await services.set_root(c, 2)
+    assert result.changed is False
+    async with db.reader() as c:
+        assert len(await services.due_events(c, "9999-01-01T00:00:00+00:00")) == 1
