@@ -5,8 +5,8 @@ SHELL := /bin/bash
 
 PYTHON  ?= python3
 VENV    ?= .venv
-SERVICE := ping-pong-bot
-IMAGE   := ping-pong-bot
+SERVICE := users-ping-bot
+IMAGE   := users-ping-bot
 # Image tag: taken from APP_VERSION in .env unless given on the command line.
 APP_VERSION ?= $(shell sed -n 's/^APP_VERSION=//p' .env 2>/dev/null)
 

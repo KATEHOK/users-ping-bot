@@ -91,7 +91,7 @@ make up       # docker compose up -d
 ```sh
 make set-root ID=<telegram_user_id>
 # то же без make:
-docker compose run --rm --entrypoint python ping-pong-bot -m app.cli set-root <telegram_user_id>
+docker compose run --rm --entrypoint python users-ping-bot -m app.cli set-root <telegram_user_id>
 ```
 
 Повторный вызов с тем же id ничего не меняет. Смена root снимает с прежнего роль и все его чаты. Если прежний root когда-либо писал боту, он получит об этом сообщение. Чаты нового root сохраняются.
@@ -115,9 +115,9 @@ docker compose run --rm --entrypoint python ping-pong-bot -m app.cli set-root <t
 ```sh
 mkdir -p backups
 docker compose run --rm --entrypoint python -v "$PWD/backups:/backups" \
-  ping-pong-bot -m app.cli backup /backups/upb-$(date +%F).sqlite3
+  users-ping-bot -m app.cli backup /backups/upb-$(date +%F).sqlite3
 docker compose run --rm --entrypoint python -v "$PWD/backups:/backups" \
-  ping-pong-bot -m app.cli verify /backups/upb-$(date +%F).sqlite3
+  users-ping-bot -m app.cli verify /backups/upb-$(date +%F).sqlite3
 ```
 
 Копия — один самодостаточный файл. На существующий файл бэкап пишет только с `--force`, а на саму рабочую базу не пишет никогда.
@@ -126,7 +126,7 @@ docker compose run --rm --entrypoint python -v "$PWD/backups:/backups" \
 
 ```sh
 docker compose stop
-docker compose run --rm --entrypoint sh -v "$PWD/backups:/backups:ro" ping-pong-bot -c \
+docker compose run --rm --entrypoint sh -v "$PWD/backups:/backups:ro" users-ping-bot -c \
   'rm -f /data/upb.sqlite3-wal /data/upb.sqlite3-shm && cp /backups/<файл> /data/upb.sqlite3'
 docker compose start
 ```
