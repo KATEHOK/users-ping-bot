@@ -79,6 +79,8 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
 
     removed: list[int] = []
     for chat in chats:
+        if ctx.delivery.stop.is_set():
+            break  # signalled: stop probing, the rest is checked on the next start
         try:
             await transport.probe_chat(chat.chat_id)
         except PermanentSend:
@@ -165,6 +167,8 @@ async def serve(
     fatal: BaseException | None = None
     try:
         removed = await reconcile_chats(ctx, transport)
+        if stop.is_set():
+            return 0  # signalled during reconciliation: no report, pruning or loops
         await send_startup_report(ctx, removed)
         await prune_once(ctx)
 

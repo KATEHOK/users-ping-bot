@@ -11,8 +11,9 @@ IMAGE   := users-ping-bot
 APP_VERSION ?= $(shell sed -n 's/^APP_VERSION=//p' .env 2>/dev/null)
 
 CLI = docker compose run --rm --entrypoint python
+SH  = docker compose run --rm --entrypoint sh
 BACKUP_DIR := backups
-BACKUP_FILE ?= $(BACKUP_DIR)/upb-$(shell date +%F_%H%M).sqlite3
+VOLUME_DIR := /data/backups
 
 .PHONY: help venv test build config up stop restart logs ps set-root backup verify
 
@@ -55,17 +56,26 @@ set-root: _need-version ## Assign root: make set-root ID=<telegram_user_id>
 	$(CLI) $(SERVICE) -m app.cli set-root $(ID)
 
 # The snapshot is written inside the data volume (where uid 10001 has rights), verified
-# there, then copied out. Needs the service container to exist (`make up` once).
-BACKUP_NAME = $(notdir $(BACKUP_FILE))
-backup: _need-version ## Snapshot the live database into ./backups and verify the copy
+# there, copied out, and only then is the in-volume staging copy removed (a full volume
+# breaks database writes). A failed copy-out keeps the staging file. Needs the service
+# container to exist (`make up` once). Only the file NAME of BACKUP_FILE is honoured:
+# the copy always lands in ./backups. Default name has seconds: upb-<date>_<hhmmss>.sqlite3.
+BACKUP_NAME := $(if $(BACKUP_FILE),$(notdir $(BACKUP_FILE)),upb-$(shell date +%F_%H%M%S).sqlite3)
+backup: _need-version ## Snapshot into the volume, verify it there, copy to ./backups (BACKUP_FILE=<name> sets the name only)
 	@mkdir -p $(BACKUP_DIR)
-	$(CLI) $(SERVICE) -m app.cli backup /data/backups/$(BACKUP_NAME)
-	$(CLI) $(SERVICE) -m app.cli verify /data/backups/$(BACKUP_NAME)
-	docker compose cp $(SERVICE):/data/backups/$(BACKUP_NAME) $(BACKUP_DIR)/$(BACKUP_NAME)
+	@chmod 0750 $(BACKUP_DIR)
+	$(CLI) $(SERVICE) -m app.cli backup $(VOLUME_DIR)/$(BACKUP_NAME)
+	$(CLI) $(SERVICE) -m app.cli verify $(VOLUME_DIR)/$(BACKUP_NAME)
+	docker compose cp $(SERVICE):$(VOLUME_DIR)/$(BACKUP_NAME) $(BACKUP_DIR)/$(BACKUP_NAME)
+	$(SH) $(SERVICE) -c 'rm -f $(VOLUME_DIR)/$(BACKUP_NAME)'
 
-verify: _need-version ## Check a backup file: make verify FILE=backups/<file>
+# The file is copied into the volume first, so host directory permissions do not matter.
+# The copy stays in the volume; remove it when no longer needed.
+verify: _need-version ## Check a backup file: make verify FILE=backups/<file> (copied into the volume first)
 	@test -n "$(FILE)" || { echo "usage: make verify FILE=backups/<file>" >&2; exit 2; }
-	$(CLI) -v "$(abspath $(dir $(FILE))):/backups:ro" $(SERVICE) -m app.cli verify /backups/$(notdir $(FILE))
+	$(SH) $(SERVICE) -c 'mkdir -p $(VOLUME_DIR)'
+	docker compose cp $(FILE) $(SERVICE):$(VOLUME_DIR)/$(notdir $(FILE))
+	$(CLI) $(SERVICE) -m app.cli verify $(VOLUME_DIR)/$(notdir $(FILE))
 
 .PHONY: _need-version
 _need-version:

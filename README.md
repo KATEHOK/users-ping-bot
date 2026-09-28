@@ -110,26 +110,44 @@ docker compose run --rm --entrypoint python users-ping-bot -m app.cli set-root <
 
 > Не выполняйте `docker compose down -v`: флаг `-v` удаляет том с БД.
 
-**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. `make backup` пишет копию внутрь тома данных (`/data/backups/`), проверяет её там и копирует в `backups/` на хосте; `make verify FILE=backups/<файл>` проверяет готовую копию на хосте. Вручную:
+**Бэкап** — согласованный снимок через SQLite backup API, безопасен при работающем боте. Все шаги идут через том данных, поэтому права на каталоги хоста не важны. `make backup`:
+- создаёт `backups/` и выставляет ему режим 0750 (это же исправляет каталог 0777 от старого `Makefile`);
+- пишет копию внутрь тома (`/data/backups/`) и проверяет её там;
+- копирует проверенную копию в `backups/` на хосте;
+- только после успешного копирования удаляет копию внутри тома (полный том ломает запись в БД). Если копирование не удалось, копия в томе остаётся.
+
+Имя файла — `upb-<дата>_<ччммсс>.sqlite3`. `BACKUP_FILE=<имя>` задаёт только имя файла (каталог из значения отбрасывается: копия всегда в `backups/`). Вручную:
 
 ```sh
-mkdir -p backups
-f=upb-$(date +%F_%H%M).sqlite3
+mkdir -p backups && chmod 0750 backups
+f=upb-$(date +%F_%H%M%S).sqlite3
 docker compose run --rm --entrypoint python users-ping-bot -m app.cli backup /data/backups/$f
 docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/$f
 docker compose cp users-ping-bot:/data/backups/$f backups/$f
+docker compose run --rm --entrypoint sh users-ping-bot -c "rm -f /data/backups/$f"
 ```
 
-`docker compose cp` требует, чтобы контейнер сервиса существовал (после `make up`; запущенный или остановленный — неважно). Копия на хосте принадлежит оператору и читается всеми. Копии внутри тома там и остаются, пока оператор сам их не удалит.
+`docker compose cp` требует, чтобы контейнер сервиса существовал (после `make up`; запущенный или остановленный — неважно). Копия на хосте принадлежит оператору.
+
+`make verify FILE=backups/<файл>` сначала копирует файл с хоста в том (`/data/backups/`), затем проверяет его там; копия в томе остаётся, удалите её сами, когда она не нужна. Вручную:
+
+```sh
+docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups'
+docker compose cp backups/<файл> users-ping-bot:/data/backups/<файл>
+docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/<файл>
+```
 
 Копия — один самодостаточный файл. На существующий файл бэкап пишет только с `--force`, а на рабочую базу и её `-wal`/`-shm`/`-journal` не пишет никогда.
 
-**Восстановление** — при остановленном боте. Старые `-wal`/`-shm` нужно убрать, иначе SQLite применит их к восстановленному файлу:
+**Восстановление** — при остановленном боте, после `make verify` нужной копии. Копия сначала кладётся в том, затем одной командой копируется во временный файл рядом с БД; только если это удалось, убираются старые `-wal`/`-shm` (иначе SQLite применит их к восстановленному файлу) и временный файл переименовывается поверх БД. Сбой копирования оставляет текущую БД нетронутой.
 
 ```sh
 docker compose stop
-docker compose run --rm --entrypoint sh -v "$PWD/backups:/backups:ro" users-ping-bot -c \
-  'rm -f /data/upb.sqlite3-wal /data/upb.sqlite3-shm && cp /backups/<файл> /data/upb.sqlite3'
+docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups'
+docker compose cp backups/<файл> users-ping-bot:/data/backups/<файл>
+docker compose run --rm --entrypoint sh users-ping-bot -c \
+  'cp /data/backups/<файл> /data/upb.sqlite3.restore || { rm -f /data/upb.sqlite3.restore; exit 1; }
+   rm -f /data/upb.sqlite3-wal /data/upb.sqlite3-shm && mv /data/upb.sqlite3.restore /data/upb.sqlite3'
 docker compose start
 ```
 
@@ -141,11 +159,11 @@ docker compose start
 
 **Аварийный выход** — после паузы 60 секунд, чтобы перезапуски не частили логинами в Vault. Пауза идёт после закрытия БД и сессии Telegram; `docker compose stop` её прерывает.
 - код 3 — токен бота отклонён;
-- код 1 — 10 подряд ошибок получения обновлений, ошибка Vault на старте, сбой `getMe` или схема БД новее кода.
+- код 1 — любая другая фатальная ошибка, например: 10 подряд ошибок получения обновлений, ошибка Vault на старте, сбой `getMe`, схема БД новее кода, ошибка БД при сверке чатов или стартовой очистке.
 
 Ошибка конфигурации завершает процесс сразу с кодом 1, без паузы.
 
-**Логи.** Наш код пишет только коды событий и id, без секретов и текстов сообщений. Логгеры библиотек, включая `aiosqlite`, держатся на уровне WARNING даже при `UPB_LOG_LEVEL=DEBUG`.
+**Логи.** Наш код пишет только коды событий и id, без секретов и текстов сообщений. Логгеры `aiohttp`, `aiogram`, `aiosqlite`, `urllib3` и `requests` держатся на уровне WARNING даже при `UPB_LOG_LEVEL=DEBUG`.
 
 **Ресурсы** (`docker-compose.yml`):
 - 0.25 CPU, 192 MiB RAM без swap, 64 процесса, core dump выключен;

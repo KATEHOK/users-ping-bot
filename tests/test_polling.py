@@ -924,3 +924,20 @@ async def test_stop_before_serve_skips_reconcile_report_and_prune(db):
     stop.set()
     assert await _serve(db, FakeBot([], stop), clock, stop, transport) == 0
     assert transport.probes == [] and transport.calls == []
+
+
+async def test_signal_during_reconcile_stops_probing_report_and_prune(db):
+    clock, stop = RecordingClock(), asyncio.Event()
+    ctx, services, _t, _c = mk_ctx(db, clock)
+    await _reg_world(db, services)
+
+    class SignalOnProbe(RecordingTransport):
+        async def probe_chat(self, chat_id: int) -> None:
+            await super().probe_chat(chat_id)
+            stop.set()  # the signal arrives during the first probe
+
+    transport = SignalOnProbe()
+    assert await _serve(db, FakeBot([], stop), clock, stop, transport) == 0
+    assert len(transport.probes) == 1
+    assert transport.calls == []  # no root report
+    assert 3600.0 not in clock.sleeps  # no loops were started

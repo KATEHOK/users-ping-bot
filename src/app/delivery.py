@@ -9,6 +9,7 @@ safe code is logged. The only exception is Unauthorized, which is fatal.
 import asyncio
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol
 
@@ -104,6 +105,17 @@ def _payload_lang(event: OutboxEvent) -> Lang:
     return lang if lang in LANGS else DEFAULT_LANG
 
 
+@dataclass(frozen=True)
+class _Outcome:
+    """What the status write after one attempt should record."""
+
+    sent: bool = False
+    error: str = ""
+    retryable: bool = False
+    retry_after: float | None = None
+    new_chat_id: int | None = None
+
+
 class Delivery:
     def __init__(
         self,
@@ -119,8 +131,10 @@ class Delivery:
         self._transport = transport
         self._clock = clock
         self.stop = stop if stop is not None else asyncio.Event()
-        # sent, but the status write failed: never resend, only retry the write
-        self._sent_unmarked: set[int] = set()
+        # An attempt happened but its status write failed: this process never sends the
+        # event again, it only retries the write. Memory only, so after a restart the
+        # event may go out at most once more.
+        self._unwritten: dict[int, _Outcome] = {}
 
     # --- replies and ping ---
 
@@ -246,15 +260,16 @@ class Delivery:
             event = await self._services.get_event(c, stale.event_id)
         if event is None or event.status != "pending":
             if event is not None:
-                self._sent_unmarked.discard(event.event_id)
+                self._unwritten.pop(event.event_id, None)
             return False
-        if event.event_id in self._sent_unmarked:
-            await self._mark_sent(event)
+        pending = self._unwritten.get(event.event_id)
+        if pending is not None:
+            await self._record(event, pending)
             return False
 
         text = self._render_outbox_text(event)
         if text is None:
-            await self._finish(event, error="unknown_event_type", retryable=False)
+            await self._record(event, _Outcome(error="unknown_event_type"))
             return False
 
         try:
@@ -262,38 +277,45 @@ class Delivery:
                 event.target_id, text, reply_to_message_id=None, thread_id=None
             )
         except RateLimited as exc:
-            await self._finish(event, error="rate_limited", retryable=True, retry_after=exc.retry_after)
-            return False
+            outcome = _Outcome(error="rate_limited", retryable=True, retry_after=exc.retry_after)
         except ChatMigrated as exc:
             if event.target_kind != "chat":
-                await self._finish(event, error="permanent", retryable=False)
+                outcome = _Outcome(error="permanent")
+            else:
+                outcome = _Outcome(
+                    error="chat_migrated", retryable=True, new_chat_id=exc.new_chat_id
+                )
+        except PermanentSend:
+            outcome = _Outcome(error="permanent")
+        except AmbiguousSend:
+            outcome = _Outcome(error="ambiguous", retryable=True)
+        else:
+            await self._record(event, _Outcome(sent=True))
+            return True
+        await self._record(event, outcome)
+        return False
+
+    async def _record(self, event: OutboxEvent, outcome: _Outcome) -> None:
+        """Write the status of an attempt. On failure remember it: no resend, only the write."""
+        try:
+            if outcome.sent:
+                async with self._db.transaction() as c:
+                    await self._services.mark_event(c, event.event_id, "sent")
             else:
                 await self._finish(
-                    event, error="chat_migrated", retryable=True, new_chat_id=exc.new_chat_id
+                    event,
+                    error=outcome.error,
+                    retryable=outcome.retryable,
+                    retry_after=outcome.retry_after,
+                    new_chat_id=outcome.new_chat_id,
                 )
-            return False
-        except PermanentSend:
-            await self._finish(event, error="permanent", retryable=False)
-            return False
-        except AmbiguousSend:
-            await self._finish(event, error="ambiguous", retryable=True)
-            return False
-
-        await self._mark_sent(event)
-        return True
-
-    async def _mark_sent(self, event: OutboxEvent) -> None:
-        """Record a delivered event. On failure remember it so it is never sent again."""
-        try:
-            async with self._db.transaction() as c:
-                await self._services.mark_event(c, event.event_id, "sent")
         except Exception as exc:
-            self._sent_unmarked.add(event.event_id)
+            self._unwritten[event.event_id] = outcome
             logger.error(
-                "outbox_mark_sent_failed event_id=%s exc=%s", event.event_id, type(exc).__name__
+                "outbox_status_write_failed event_id=%s exc=%s", event.event_id, type(exc).__name__
             )
         else:
-            self._sent_unmarked.discard(event.event_id)
+            self._unwritten.pop(event.event_id, None)
 
     async def run_outbox_once(self) -> int:
         now_iso = iso(self._clock.now())

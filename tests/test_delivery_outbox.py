@@ -257,3 +257,41 @@ async def test_failed_sent_mark_never_resends_and_only_the_write_is_retried(db, 
     assert await delivery.run_outbox_once() == 0
     assert len(transport.calls) == 1
     assert (await _event(db, services, eid)).status == "sent"
+
+
+@pytest.mark.parametrize(
+    "exc,status,attempts",
+    [
+        (AmbiguousSend(), "pending", 1),
+        (RateLimited(600), "pending", 1),
+        (PermanentSend(), "failed", 1),
+    ],
+)
+async def test_failed_status_write_after_any_outcome_never_resends(db, caplog, exc, status, attempts):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services)
+    transport.raise_next(exc)
+    real_mark = services.mark_event
+    failing = {"on": True}
+
+    async def flaky(c, event_id, st, **kw):
+        if failing["on"]:
+            raise RuntimeError("database or disk is full")
+        return await real_mark(c, event_id, st, **kw)
+
+    services.mark_event = flaky  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        for _ in range(4):
+            assert await delivery.run_outbox_once() == 0
+    assert len(transport.calls) == 1  # one attempt, however often the write fails
+    assert (await _event(db, services, eid)).status == "pending"
+    assert any(
+        f"event_id={eid}" in r.getMessage() and "RuntimeError" in r.getMessage()
+        for r in caplog.records
+    )
+    failing["on"] = False
+    await delivery.run_outbox_once()
+    assert len(transport.calls) == 1  # the retried write does not send either
+    event = await _event(db, services, eid)
+    assert (event.status, event.attempts) == (status, attempts)
+    assert not delivery._unwritten
