@@ -406,9 +406,9 @@ class Services:
         return row[0] if row is not None else None
 
     async def known_chat_ids(self, c: aiosqlite.Connection) -> list[int]:
-        """Every chat id the DB has seen: registered, migrated away from, or an outbox target."""
+        """Chat ids to sync at startup: registered or an outbox target (old migrated ids have no menu)."""
         cursor = await c.execute(
-            "SELECT chat_id FROM chats UNION SELECT old_chat_id FROM chat_aliases "
+            "SELECT chat_id FROM chats "
             "UNION SELECT target_id FROM outbox WHERE target_kind = 'chat' ORDER BY 1"
         )
         return [r[0] for r in await cursor.fetchall()]

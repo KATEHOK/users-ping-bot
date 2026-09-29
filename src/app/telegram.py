@@ -117,6 +117,13 @@ def _bot_gone(member: object) -> bool:
     return status == "restricted" and getattr(member, "is_member", True) is False
 
 
+def _bot_present(member: object) -> bool:
+    status = getattr(member, "status", None)
+    if status in ("member", "administrator", "creator"):
+        return True
+    return status == "restricted" and getattr(member, "is_member", False) is True
+
+
 def _display_name(user: types.User) -> str | None:
     parts = [p for p in (user.first_name, user.last_name) if p]
     return " ".join(parts) if parts else None
@@ -197,6 +204,11 @@ def _membership_event(
         user_id=cmu.from_user.id if cmu.from_user is not None else None,
         left_user_id=cmu.new_chat_member.user.id if left else None,
         bot_removed=left if kind == "my_chat_member" else False,
+        bot_added=(
+            kind == "my_chat_member"
+            and _bot_present(cmu.new_chat_member)
+            and not _bot_present(cmu.old_chat_member)
+        ),
     )
 
 

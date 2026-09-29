@@ -211,11 +211,12 @@ async def serve(
         removed = await reconcile_chats(ctx, transport)
         if stop.is_set():
             return 0  # signalled during reconciliation: no report, pruning or loops
+        await send_startup_report(ctx, removed)
+        await prune_once(ctx)
+        # menus are cosmetic: synced only after the report, which must not be lost
         await sync_menus(ctx, removed)
         if stop.is_set():
             return 0  # signalled during the menu sync
-        await send_startup_report(ctx, removed)
-        await prune_once(ctx)
 
         tasks = [
             asyncio.ensure_future(delivery.outbox_loop(stop)),

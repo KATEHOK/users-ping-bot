@@ -66,7 +66,8 @@ set-root: _need-version ## Assign root: make set-root ID=<telegram_user_id>
 # file that looks like a finished backup. No existing service container is needed.
 # Only the file NAME of BACKUP_FILE is honoured: the copy always lands in ./backups.
 # An existing ./backups/<name> is never overwritten unless FORCE=1.
-# A leftover staging copy of the same name is overwritten (--force): the host check is the guard.
+# --force is always passed: a leftover staging copy of the same name in the volume is
+# overwritten even without FORCE=1; FORCE=1 only guards the file on the host.
 # Default name has seconds: upb-<date>_<hhmmss>.sqlite3.
 BACKUP_NAME := $(if $(BACKUP_FILE),$(notdir $(BACKUP_FILE)),upb-$(shell date +%F_%H%M%S).sqlite3)
 backup: _need-version ## Snapshot, verify, stream to ./backups (BACKUP_FILE=<name> names it; refuses to overwrite unless FORCE=1)

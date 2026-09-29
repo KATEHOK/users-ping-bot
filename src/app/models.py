@@ -84,6 +84,7 @@ class IncomingEvent:
     # membership / migration
     left_user_id: int | None = None
     bot_removed: bool = False
+    bot_added: bool = False  # my_chat_member: the bot became a member/administrator
     migrate_to_chat_id: int | None = None
     migrate_from_chat_id: int | None = None
 

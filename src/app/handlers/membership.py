@@ -40,10 +40,25 @@ async def handle_member_left(ctx: Context, event: IncomingEvent) -> None:
 
 async def handle_membership(ctx: Context, event: IncomingEvent) -> None:
     """`my_chat_member` (the bot's own status) or `chat_member` (another member's)."""
-    if event.kind == "my_chat_member":
+    if event.kind == "my_chat_member" and event.bot_added:
+        await _joined(ctx, event)
+    elif event.kind == "my_chat_member":
         await _left(ctx, event, is_bot=event.bot_removed)
     else:
         await _left(ctx, event, is_bot=False)
+
+
+async def _joined(ctx: Context, event: IncomingEvent) -> None:
+    """The bot joined a group: drop a stale menu left from an earlier registration."""
+    from . import mark_ignored
+
+    async with ctx.db.transaction() as c:
+        if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
+            return
+        canonical = await ctx.services.resolve_chat_id(c, event.chat_id)
+        await mark_ignored(c, ctx, event.update_id)
+    if canonical == event.chat_id and event.chat_type in ("group", "supergroup"):
+        await ctx.delivery.sync_chat_menu(event.chat_id)
 
 
 async def _left(ctx: Context, event: IncomingEvent, *, is_bot: bool) -> None:

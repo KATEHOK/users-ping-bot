@@ -9,7 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 
 import app.__main__ as entry
 from app import rendering
-from app.delivery import AmbiguousSend, ChatMigrated, PermanentSend, RateLimited
+from app.delivery import AmbiguousSend, ChatMigrated, PermanentSend, RateLimited, Unauthorized
 from app.handlers import handle_event
 from app.telegram import AiogramTransport
 
@@ -253,10 +253,14 @@ async def test_stop_signal_interrupts_the_429_wait(db):
 async def test_menu_failure_never_blocks_the_reply(db, exc, caplog):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
-    transport.fail_menu(exc)
+    marker = "SECRET-TEXT"
+    transport.fail_menu(type(exc)(marker))
     with caplog.at_level(logging.DEBUG):
         await _say(ctx, "/upb chat register", 1, ADMIN)
     assert len(transport.calls) == 1
+    assert marker not in caplog.text
+    kind = "permanent" if isinstance(exc, PermanentSend) else "ambiguous"
+    assert any(r.getMessage().startswith(f"menu_set_{kind} ") for r in caplog.records)
 
 
 async def test_delete_for_a_gone_chat_is_logged_at_info(db, caplog):
@@ -279,6 +283,169 @@ async def test_sync_is_idempotent_and_follows_db_state(db):
     assert [c["op"] for c in transport.menu_calls] == ["set", "set", "delete"]
 
 
+# --- migrated ids ---
+
+
+async def test_delete_on_an_old_migrated_id_is_done_without_migration(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    async with db.transaction() as c:
+        await services.migrate_chat(c, CHAT_ID, -1001)
+    transport.queue_menu_raises([ChatMigrated(-1001)])
+    assert await ctx.delivery.sync_chat_menu(CHAT_ID) is True
+    assert [(c["op"], c["chat_id"]) for c in transport.menu_calls] == [("delete", CHAT_ID)]
+
+
+async def test_live_migration_found_by_a_menu_call_costs_three_calls(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    # set(old) and the best-effort delete(old) both answer with a migrate error
+    transport.queue_menu_raises([ChatMigrated(-1001), ChatMigrated(-1001)])
+    await ctx.delivery.sync_chat_menu(CHAT_ID)
+    got = [(c["op"], c["chat_id"]) for c in transport.menu_calls]
+    assert got == [("set", CHAT_ID), ("delete", CHAT_ID), ("set", -1001)]
+
+
+async def test_live_migration_event_costs_one_delete_and_one_set(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.queue_menu_raises([ChatMigrated(-1001)])  # the delete of the old id
+    event = make_event(
+        kind="message", update_id=1, chat_id=CHAT_ID, user_id=None, text=None,
+        migrate_to_chat_id=-1001,
+    )
+    await handle_event(ctx, event)
+    got = [(c["op"], c["chat_id"]) for c in transport.menu_calls]
+    assert got == [("delete", CHAT_ID), ("set", -1001)]
+
+
+# --- fatal errors ---
+
+
+async def test_unauthorized_from_a_menu_call_in_a_failed_reply_propagates(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.raise_next(ChatMigrated(-1001))
+    transport.fail_menu(Unauthorized())
+    with pytest.raises(Unauthorized):
+        await ctx.delivery.send_reply(CHAT_ID, "x", reply_to=None, thread_id=None)
+
+
+async def test_unauthorized_from_a_menu_call_in_the_outbox_keeps_the_attempt(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await register_chat(db, services, CHAT_ID, ROOT)
+    async with db.transaction() as c:
+        await services.unregister_chat(c, CHAT_ID)  # queues a farewell
+    transport.fail_menu(Unauthorized())
+    with pytest.raises(Unauthorized):
+        await ctx.delivery.run_outbox_once()
+    async with db.reader() as c:
+        cur = await c.execute("SELECT status, attempts FROM outbox WHERE event_type = 'chat_farewell'")
+        assert [tuple(r) for r in await cur.fetchall()] == [("sent", 1)]  # one attempt, no replay
+    assert not ctx.delivery._unwritten
+
+
+async def test_unauthorized_from_the_startup_menu_sync_exits_with_code_3(db):
+    _ctx, services, transport, clock = mk_ctx(db)
+    await register_chat(db, services, -1, ADMIN)
+    transport.fail_menu(Unauthorized())
+    stop = asyncio.Event()
+    code = await asyncio.wait_for(
+        entry.serve(
+            db=db, bot=FakeBot([], stop), transport=transport, bot_id=BOT_ID,
+            bot_username="upb_bot", cooldown=0.0, clock=clock, stop=stop,
+        ),
+        5,
+    )
+    assert code == entry.EXIT_UNAUTHORIZED
+
+
+# --- root change and joining ---
+
+
+@pytest.mark.parametrize("fail", [None, PermanentSend()])
+async def test_cli_root_change_drops_the_menu_once_the_farewell_is_done(db, fail):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await register_chat(db, services, CHAT_ID, ROOT)
+    async with db.transaction() as c:  # what the CLI does: no transport
+        await services.touch_user(c, 11)
+        await services.set_root(c, 11)
+    assert transport.menu_calls == []
+    if fail is not None:
+        transport.fail_chat(CHAT_ID, fail)
+    await ctx.delivery.run_outbox_once()
+    got = [(c["op"], c["chat_id"]) for c in transport.menu_calls]
+    assert got == [("delete", CHAT_ID)]
+
+
+async def test_retryable_farewell_failure_does_not_touch_the_menu_yet(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await register_chat(db, services, CHAT_ID, ROOT)
+    async with db.transaction() as c:
+        await services.unregister_chat(c, CHAT_ID)
+    transport.fail_chat(CHAT_ID, AmbiguousSend())
+    await ctx.delivery.run_outbox_once()
+    assert transport.menu_calls == []
+
+
+def _my_member(uid, *, added):
+    return make_event(
+        kind="my_chat_member", update_id=uid, chat_id=CHAT_ID, chat_type="supergroup",
+        user_id=ADMIN, bot_added=added, text=None,
+    )
+
+
+async def test_bot_added_to_an_unregistered_group_deletes_a_stale_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _my_member(1, added=True))
+    assert [(c["op"], c["chat_id"]) for c in transport.menu_calls] == [("delete", CHAT_ID)]
+    assert transport.calls == []
+    await handle_event(ctx, _my_member(1, added=True))  # a replayed update does nothing
+    assert len(transport.menu_calls) == 1
+
+
+async def test_other_membership_updates_do_not_sync_the_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _my_member(1, added=False))
+    assert transport.menu_calls == []
+
+
+def test_to_event_marks_the_bot_joining_only_on_a_status_change():
+    from datetime import datetime, timezone
+
+    from aiogram.types import (
+        Chat, ChatMemberAdministrator, ChatMemberLeft, ChatMemberMember,
+        ChatMemberUpdated, Update, User,
+    )
+    from app.telegram import to_event
+
+    bot = User(id=BOT_ID, is_bot=True, first_name="b")
+    chat = Chat(id=CHAT_ID, type="supergroup", title="G")
+
+    def upd(old, new):
+        cmu = ChatMemberUpdated(
+            chat=chat, from_user=bot, date=datetime.now(timezone.utc),
+            old_chat_member=old, new_chat_member=new,
+        )
+        return to_event(Update(update_id=1, my_chat_member=cmu))
+
+    left, member = ChatMemberLeft(user=bot), ChatMemberMember(user=bot)
+    admin = ChatMemberAdministrator.model_construct(status="administrator", user=bot)
+    assert upd(left, member).bot_added is True
+    assert upd(left, admin).bot_added is True
+    assert upd(member, admin).bot_added is False
+    assert upd(member, left).bot_added is False
+
+
 # --- startup ---
 
 
@@ -291,7 +458,7 @@ async def test_startup_sync_sets_active_and_deletes_known_inactive(db):
         await services.migrate_chat(c, -2, -200)  # -2 is now a known inactive id
     await entry.sync_menus(ctx, [-9])  # removed by reconciliation
     got = {(c["chat_id"]): c["op"] for c in transport.menu_calls}
-    assert got == {-1: "set", -200: "set", -2: "delete", -9: "delete"}
+    assert got == {-1: "set", -200: "set", -9: "delete"}  # the migrated-away id is skipped
 
 
 async def test_startup_sync_stops_early_on_the_stop_signal(db):
@@ -319,6 +486,31 @@ async def test_serve_syncs_menus_after_reconciliation(db):
     assert code == 0
     got = {c["chat_id"]: c["op"] for c in transport.menu_calls}
     assert got == {-1: "set", -2: "delete"}
+
+
+async def test_signal_during_the_startup_menu_sync_still_sends_the_report(db):
+    _ctx, services, transport, clock = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await register_chat(db, services, -1, ROOT)
+    await register_chat(db, services, -2, ROOT)
+    transport.set_probe(-2, PermanentSend())
+    stop = asyncio.Event()
+    real_set = transport.set_chat_commands
+
+    async def set_and_signal(chat_id, commands):
+        stop.set()  # a stop arrives while the menus are being synced
+        await real_set(chat_id, commands)
+
+    transport.set_chat_commands = set_and_signal
+    code = await asyncio.wait_for(
+        entry.serve(
+            db=db, bot=FakeBot([], stop), transport=transport, bot_id=BOT_ID,
+            bot_username="upb_bot", cooldown=0.0, clock=clock, stop=stop,
+        ),
+        5,
+    )
+    assert code == 0
+    assert [c["chat_id"] for c in transport.calls] == [ROOT]  # the report went out
 
 
 # --- real transport ---

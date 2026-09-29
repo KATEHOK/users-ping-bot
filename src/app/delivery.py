@@ -185,6 +185,8 @@ class Delivery:
                 _log_code(f"{code}_chat_migrated", chat_id=chat_id)
                 try:
                     await self._apply_migration(chat_id, exc.new_chat_id)
+                except Unauthorized:
+                    raise
                 except Exception as err:
                     logger.error("migration_failed exc=%s", type(err).__name__)
                 return False  # the reply / ping is cancelled
@@ -231,7 +233,7 @@ class Delivery:
         Idempotent and never raises (except Unauthorized): failures are logged by code.
         True if the menu now matches the state.
         """
-        return await self._sync_menu(chat_id, migrated=False)
+        return await self._sync_menu(chat_id)
 
     async def sync_chat_menus(self, chat_ids: Sequence[int]) -> None:
         for chat_id in dict.fromkeys(chat_ids):
@@ -239,7 +241,7 @@ class Delivery:
                 return
             await self.sync_chat_menu(chat_id)
 
-    async def _sync_menu(self, chat_id: int, *, migrated: bool) -> bool:
+    async def _sync_menu(self, chat_id: int) -> bool:
         try:
             async with self._db.reader() as c:
                 chat = await self._services.get_chat(c, chat_id)
@@ -265,15 +267,17 @@ class Delivery:
                     return False
             except ChatMigrated as exc:
                 _log_code(f"{code}_chat_migrated", chat_id=chat_id)
-                if migrated:
-                    return False
+                if chat is None:
+                    return True  # an upgraded group has no menu to show
                 try:
+                    # syncs both ids when the registration moved
                     await self._apply_migration(chat_id, exc.new_chat_id)
+                except Unauthorized:
+                    raise
                 except Exception as err:
                     logger.error("migration_failed exc=%s", type(err).__name__)
                     return False
-                await self._sync_menu(chat_id, migrated=True)
-                return await self._sync_menu(exc.new_chat_id, migrated=True)
+                return True
             except AmbiguousSend:
                 _log_code(f"{code}_ambiguous", chat_id=chat_id)
                 return False
@@ -391,6 +395,8 @@ class Delivery:
                     retry_after=outcome.retry_after,
                     new_chat_id=outcome.new_chat_id,
                 )
+        except Unauthorized:
+            raise
         except Exception as exc:
             self._unwritten[event.event_id] = outcome
             logger.error(
@@ -398,6 +404,10 @@ class Delivery:
             )
         else:
             self._unwritten.pop(event.event_id, None)
+            final = outcome.sent or not outcome.retryable or event.attempts + 1 >= OUTBOX_MAX_ATTEMPTS
+            if event.event_type == "chat_farewell" and final:
+                # the chat was dropped (maybe by the CLI, which has no transport): drop its menu
+                await self.sync_chat_menu(event.target_id)
 
     async def run_outbox_once(self) -> int:
         now_iso = iso(self._clock.now())
