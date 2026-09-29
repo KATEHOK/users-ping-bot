@@ -37,6 +37,36 @@ def test_group_command_addressed_forms(text, expected_cmd, expected_args):
     assert parsed.args == expected_args
 
 
+@pytest.mark.parametrize(
+    "text,expected_cmd,expected_args",
+    [
+        ("/all", Cmd.PING, ()),
+        ("/all foo Bar", Cmd.PING, ("foo", "Bar")),
+        ("/on", Cmd.NOTIFY_ON, ()),
+        ("/off", Cmd.NOTIFY_OFF, ()),
+        ("/off extra", Cmd.NOTIFY_OFF, ("extra",)),
+        ("/help", Cmd.HELP, ()),
+        ("/usage", Cmd.HELP, ()),
+        ("/ALL", Cmd.PING, ()),
+        (f"/all@{BOT}", Cmd.PING, ()),
+        (f"/on@{BOT.upper()} x", Cmd.NOTIFY_ON, ("x",)),
+    ],
+)
+def test_group_aliases(text, expected_cmd, expected_args):
+    parsed = parse_group_command(text, ent(text), bot_username=BOT)
+    assert parsed is not None
+    assert (parsed.cmd, parsed.args) == (expected_cmd, expected_args)
+
+
+@pytest.mark.parametrize("text", ["/all@other_bot", "/on@other_bot", "/help@other_bot x"])
+def test_group_alias_addressed_to_different_bot_is_none(text):
+    assert parse_group_command(text, ent(text), bot_username=BOT) is None
+
+
+def test_group_alias_needs_the_entity():
+    assert parse_group_command("/all", (), bot_username=BOT) is None
+
+
 def test_group_command_addressed_to_us_explicitly():
     text = f"/upb@{BOT} notify on"
     parsed = parse_group_command(text, ent(text), bot_username=BOT)
@@ -72,7 +102,7 @@ def test_entity_not_at_offset_zero_is_ignored():
 
 
 def test_other_command_name_in_group_is_none():
-    text = "/help"
+    text = "/list"
     assert parse_group_command(text, ent(text), bot_username=BOT) is None
 
 

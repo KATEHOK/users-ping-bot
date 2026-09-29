@@ -10,17 +10,18 @@ class CommandSpec:
     cmd: Cmd
     scope: Scope
     syntax: str  # descriptions live in the rendering catalogue (cmd_* keys)
+    alias: str = ""  # short group form shown next to the syntax (parsing: commands.py)
 
 
 CATALOG: tuple[CommandSpec, ...] = (
     # --- group ---
     CommandSpec(Cmd.CHAT_REGISTER, Scope.GROUP, "/upb chat register"),
     CommandSpec(Cmd.CHAT_UNREGISTER, Scope.GROUP, "/upb chat unregister"),
-    CommandSpec(Cmd.NOTIFY_ON, Scope.GROUP, "/upb notify on"),
-    CommandSpec(Cmd.NOTIFY_OFF, Scope.GROUP, "/upb notify off"),
-    CommandSpec(Cmd.PING, Scope.GROUP, "/upb all"),
+    CommandSpec(Cmd.NOTIFY_ON, Scope.GROUP, "/upb notify on", "/on"),
+    CommandSpec(Cmd.NOTIFY_OFF, Scope.GROUP, "/upb notify off", "/off"),
+    CommandSpec(Cmd.PING, Scope.GROUP, "/upb all", "/all"),
     CommandSpec(Cmd.LIST, Scope.GROUP, "/upb list"),
-    CommandSpec(Cmd.HELP, Scope.GROUP, "/upb help"),
+    CommandSpec(Cmd.HELP, Scope.GROUP, "/upb help", "/help"),
     CommandSpec(Cmd.LANG, Scope.GROUP, "/upb lang <en|ru>"),
     # internal: help for a bare/partial/unknown /upb; never listed in help
     CommandSpec(Cmd.USAGE, Scope.GROUP, "/upb"),

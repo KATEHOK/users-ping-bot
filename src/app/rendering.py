@@ -141,7 +141,10 @@ def split_text(text: str, *, limit: int = MAX_MESSAGE) -> list[str]:
 
 
 def _command_lines(specs: Sequence[access.CommandSpec], lang: Lang) -> list[str]:
-    return [f"{esc(s.syntax)} - {t('cmd_' + s.cmd.value, lang)}" for s in specs]
+    return [
+        f"{esc(s.syntax)}{f' ({s.alias})' if s.alias else ''} - {t('cmd_' + s.cmd.value, lang)}"
+        for s in specs
+    ]
 
 
 def _listed(specs: Sequence[access.CommandSpec], *, chat_active: bool) -> list[access.CommandSpec]:

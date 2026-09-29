@@ -199,7 +199,7 @@ def _syntax_lines(text: str) -> set[str]:
 def test_help_lists_exactly_the_allowed_commands(actor, scope, chat_active, lang):
     allowed = access.allowed_commands(actor, scope=scope, chat_active=chat_active)
     listed = {
-        esc(s.syntax)
+        esc(s.syntax) + (f" ({s.alias})" if s.alias else "")
         for s in allowed
         if s.cmd not in access.INTERNAL and not (chat_active and s.cmd is Cmd.CHAT_REGISTER)
     }
@@ -215,6 +215,23 @@ def test_help_never_lists_internal_entries(actor, scope, chat_active):
     for cmd in access.INTERNAL:
         assert esc(access.spec(cmd).syntax) + " - " not in text
     assert "/admin, /chat" not in text
+
+
+def test_group_help_shows_short_forms_next_to_full_ones():
+    for lang in LANGS:
+        text = help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang=lang)
+        for line in ("/upb all (/all)", "/upb notify on (/on)", "/upb notify off (/off)", "/upb help (/help)"):
+            assert line + " - " in text
+        assert "/upb list - " in text  # no alias, shown as before
+    private = help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="en")
+    assert "/help - " in private and "(/" not in private
+
+
+def test_usage_shows_alias_and_prefix_matching_ignores_it():
+    text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
+    assert _syntax_lines(text) == {"/upb notify on (/on)", "/upb notify off (/off)"}
+    text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("all",), lang="en")
+    assert "/upb all (/all)" in text  # unknown prefix: everything allowed
 
 
 def test_help_escapes_command_syntax():
@@ -251,7 +268,7 @@ def test_usage_filters_by_prefix():
     text = usage_text(REGISTRAR, scope=Scope.GROUP, chat_active=True, prefix=("chat",), lang="en")
     assert _syntax_lines(text) == {"/upb chat unregister"}  # register is not advertised when active
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
-    assert _syntax_lines(text) == {"/upb notify on", "/upb notify off"}
+    assert _syntax_lines(text) == {"/upb notify on (/on)", "/upb notify off (/off)"}
     text = usage_text(ROOT, scope=Scope.PRIVATE, chat_active=True, prefix=("admin",), lang="en")
     assert _syntax_lines(text) == {
         "/admin create &lt;user_id&gt;",
@@ -268,8 +285,8 @@ def test_usage_examples_per_actor_and_scope():
 
     plain = Actor(user_id=7)
     # bare or unknown: everything allowed
-    assert lines(plain, Scope.GROUP, True, ()) == {"/upb notify on"}
-    assert lines(plain, Scope.GROUP, True, ("qwe",)) == {"/upb notify on"}
+    assert lines(plain, Scope.GROUP, True, ()) == {"/upb notify on (/on)"}
+    assert lines(plain, Scope.GROUP, True, ("qwe",)) == {"/upb notify on (/on)"}
     assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ()) == {"/upb chat register"}
     assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ("qwe",)) == {"/upb chat register"}
     # known prefix with nothing allowed under it: silence, no fallback
@@ -294,7 +311,9 @@ def test_usage_is_empty_only_when_nothing_matches(actor, scope, chat_active, pre
         assert (text == "") == (not allowed)
     if text:
         assert find_html_errors(text) == []
-        assert _syntax_lines(text) <= {esc(s.syntax) for s in allowed}
+        assert _syntax_lines(text) <= {
+            esc(s.syntax) + (f" ({s.alias})" if s.alias else "") for s in allowed
+        }
 
 
 def test_usage_never_falls_back_for_known_prefix():

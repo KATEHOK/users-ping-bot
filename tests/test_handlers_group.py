@@ -253,6 +253,33 @@ async def test_ping_excludes_the_initiator_even_when_subscribed(db):
     assert transport.calls[0]["thread_id"] == 9
 
 
+async def test_all_alias_pings_like_the_full_form(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, "/upb all", REGISTRAR, 1)
+    await _send(ctx, "/all", ROOT, 2)
+    first, second = await _texts(transport)
+    assert _ids(first) == _ids(second) == [SUB, 21]
+
+
+async def test_all_alias_from_a_non_subscriber_is_silent(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, "/all", NOBODY, 1)
+    assert transport.calls == []
+
+
+async def test_short_on_off_help_aliases(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, "/on", NOBODY, 1)
+    await _send(ctx, "/help", NOBODY, 2)
+    await _send(ctx, "/off", NOBODY, 3)
+    texts = await _texts(transport)
+    assert texts[0] == t("subscribed", "en") and texts[2] == t("unsubscribed", "en")
+    assert texts[1].startswith(t("help_title", "en") + "\n")
+
+
 async def test_ping_of_only_the_initiator_answers_pong(db):
     ctx, services, transport, _c = mk_ctx(db)
     await make_admin(db, services, REGISTRAR)

@@ -31,6 +31,16 @@ def _leading_command(
     return name.lower(), text[length:]
 
 
+# Short group forms: /all, /on, /off, /help, /usage. Words after them are the args.
+_GROUP_ALIASES: dict[str, Cmd] = {
+    "all": Cmd.PING,
+    "on": Cmd.NOTIFY_ON,
+    "off": Cmd.NOTIFY_OFF,
+    "help": Cmd.HELP,
+    "usage": Cmd.HELP,
+}
+
+
 def parse_group_command(
     text: str | None,
     entities: tuple[tuple[str, int, int], ...],
@@ -41,6 +51,8 @@ def parse_group_command(
     if leading is None:
         return None
     name, rest = leading
+    if name in _GROUP_ALIASES:
+        return ParsedCommand(_GROUP_ALIASES[name], tuple(rest.split()))
     if name != "upb":
         return None
 

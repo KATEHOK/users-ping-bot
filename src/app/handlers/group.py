@@ -42,7 +42,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
 
     parsed = commands.parse_group_command(event.text, event.entities, bot_username=ctx.bot_username)
     if parsed is None:
-        return  # not a /upb command: never recorded
+        return  # not a /upb command or alias: never recorded
 
     cmd = parsed.cmd
     assert event.user_id is not None
