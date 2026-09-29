@@ -15,8 +15,8 @@ PONG = "pong"
 # key -> (en, ru). Placeholders are str.format fields; their values are HTML-escaped by t().
 _CATALOG: dict[str, tuple[str, str]] = {
     "welcome": (
-        "Chat registered. Subscribe: /upb notify on. Ping: /upb all. Help: /upb help.",
-        "\u0427\u0430\u0442 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d. \u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430: /upb notify on. \u041f\u0438\u043d\u0433: /upb all. \u0421\u043f\u0440\u0430\u0432\u043a\u0430: /upb help.",
+        "Chat registered. Subscribe: <code>/upb notify on</code>. Ping: <code>/upb all</code>. Help: <code>/upb help</code>.",
+        "\u0427\u0430\u0442 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d. \u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430: <code>/upb notify on</code>. \u041f\u0438\u043d\u0433: <code>/upb all</code>. \u0421\u043f\u0440\u0430\u0432\u043a\u0430: <code>/upb help</code>.",
     ),
     "already_registered": ("Chat is already registered.", "\u0427\u0430\u0442 \u0443\u0436\u0435 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d."),
     "subscribed": ("Subscribed.", "\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043e\u0444\u043e\u0440\u043c\u043b\u0435\u043d\u0430."),
@@ -27,7 +27,7 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "farewell": ("Chat unregistered. Bye!", "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u0430 \u0441\u043d\u044f\u0442\u0430. \u0414\u043e \u0432\u0441\u0442\u0440\u0435\u0447\u0438!"),
     "lang_set": ("Language: English.", "\u042f\u0437\u044b\u043a: \u0440\u0443\u0441\u0441\u043a\u0438\u0439."),
     "root_cli_only": ("Root is assigned via CLI only.", "Root \u043d\u0430\u0437\u043d\u0430\u0447\u0430\u0435\u0442\u0441\u044f \u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0435\u0440\u0435\u0437 CLI."),
-    "bad_args": ("Invalid arguments. Usage: {syntax}", "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: {syntax}"),
+    "bad_args": ("Invalid arguments. Usage: <code>{syntax}</code>", "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: <code>{syntax}</code>"),
     "admin_created": ("Admin granted: {id}.", "\u0420\u043e\u043b\u044c admin \u0432\u044b\u0434\u0430\u043d\u0430: {id}."),
     "admin_exists": ("Already admin: {id}.", "\u0420\u043e\u043b\u044c admin \u0443\u0436\u0435 \u0435\u0441\u0442\u044c: {id}."),
     "admin_removed": (
@@ -56,8 +56,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
     ),
     "help_title": ("Commands:", "\u041a\u043e\u043c\u0430\u043d\u0434\u044b:"),
     "help_register_hint": (
-        "To register a group: add the bot there and send /upb chat register.",
-        "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0433\u0440\u0443\u043f\u043f\u044b: \u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u0431\u043e\u0442\u0430 \u0432 \u0433\u0440\u0443\u043f\u043f\u0443 \u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 /upb chat register.",
+        "To register a group: add the bot there and send <code>/upb chat register</code>.",
+        "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0433\u0440\u0443\u043f\u043f\u044b: \u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u0431\u043e\u0442\u0430 \u0432 \u0433\u0440\u0443\u043f\u043f\u0443 \u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 <code>/upb chat register</code>.",
     ),
     "chats_empty": ("No registered chats.", "\u0417\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0445 \u0447\u0430\u0442\u043e\u0432 \u043d\u0435\u0442."),
     "admins_empty": ("No admins.", "\u0410\u0434\u043c\u0438\u043d\u043e\u0432 \u043d\u0435\u0442."),
@@ -142,7 +142,8 @@ def split_text(text: str, *, limit: int = MAX_MESSAGE) -> list[str]:
 
 def _command_lines(specs: Sequence[access.CommandSpec], lang: Lang) -> list[str]:
     return [
-        f"{esc(s.syntax)}{f' ({s.alias})' if s.alias else ''} - {t('cmd_' + s.cmd.value, lang)}"
+        f"<code>{esc(s.syntax + (f' ({s.alias})' if s.alias else ''))}</code> - "
+        f"{t('cmd_' + s.cmd.value, lang)}"
         for s in specs
     ]
 
@@ -215,6 +216,23 @@ def root_revoked_text(when: str, lang: Lang = DEFAULT_LANG) -> str:
     return t("root_revoked", lang, time=when)
 
 
+def split_ids(ids: Sequence[int], *, limit: int = MAX_MESSAGE - 200) -> list[list[int]]:
+    """Groups ids so each group, joined by ', ', fits in limit (room is left for the surrounding text)."""
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_len = 0
+    for i in ids:
+        extra = len(str(i)) + (2 if current else 0)
+        if current and current_len + extra > limit:
+            groups.append(current)
+            current, current_len, extra = [], 0, len(str(i))
+        current.append(i)
+        current_len += extra
+    if current:
+        groups.append(current)
+    return groups
+
+
 def reconcile_interrupted_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
     return t("reconcile_interrupted", lang, ids=", ".join(str(i) for i in chat_ids))
 
@@ -281,7 +299,7 @@ def startup_report_text(
     lang: Lang = DEFAULT_LANG,
 ) -> list[str]:
     lines = [t("startup", lang, n=len(removed_chat_ids))]
-    if removed_chat_ids:
-        lines.append(t("startup_removed", lang, ids=", ".join(str(i) for i in removed_chat_ids)))
+    for group in split_ids(removed_chat_ids):
+        lines.append(t("startup_removed", lang, ids=", ".join(str(i) for i in group)))
     lines += _chat_lines(rows, lang, True)
     return split_text("\n".join(lines))

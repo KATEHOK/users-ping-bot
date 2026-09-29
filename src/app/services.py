@@ -237,6 +237,14 @@ class Services:
         )
         return cursor.rowcount
 
+    async def prune_outbox(self, c: aiosqlite.Connection, *, older_than: str) -> int:
+        """Deletes finished events (sent, failed, cancelled) last touched before older_than."""
+        cursor = await c.execute(
+            "DELETE FROM outbox WHERE status IN ('sent', 'failed', 'cancelled') AND updated_at < ?",
+            (older_than,),
+        )
+        return cursor.rowcount
+
     # --- chats ---
 
     _CHAT_COLS = "chat_id, title, registered_by, registered_at, registration_generation, lang"
@@ -458,6 +466,9 @@ class Services:
             (self._now(), new_root_id),
         )
 
+        if previous_root_id is not None:
+            await self._retarget_reconcile_notices(c, previous_root_id, new_root_id)
+
         # set the new user's role to exactly root; if he was admin, this replaces
         # that row in place, so every chat he registered as admin is kept as-is
         await c.execute(
@@ -472,6 +483,34 @@ class Services:
             dropped_chat_ids=dropped_chat_ids,
             notified_previous=notified_previous,
         )
+
+    async def _retarget_reconcile_notices(
+        self, c: aiosqlite.Connection, old_root_id: int, new_root_id: int
+    ) -> None:
+        """Pending removed-chats notices go to the new root, or are cancelled if it cannot be reached."""
+        cursor = await c.execute(
+            "SELECT event_id, payload FROM outbox WHERE event_type = 'reconcile_removed' "
+            "AND target_kind = 'user' AND target_id = ? AND status = 'pending'",
+            (old_root_id,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+        reachable = await self.has_private_contact(c, new_root_id)
+        lang = await self.get_user_lang(c, new_root_id) if reachable else None
+        for event_id, raw in rows:
+            if reachable:
+                payload = json.loads(raw)
+                payload["lang"] = lang
+                await c.execute(
+                    "UPDATE outbox SET target_id = ?, payload = ?, updated_at = ? WHERE event_id = ?",
+                    (new_root_id, json.dumps(payload), self._now(), event_id),
+                )
+            else:
+                await c.execute(
+                    "UPDATE outbox SET status = 'cancelled', updated_at = ? WHERE event_id = ?",
+                    (self._now(), event_id),
+                )
 
     # --- outbox ---
 

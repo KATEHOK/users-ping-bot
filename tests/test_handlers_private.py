@@ -112,7 +112,7 @@ async def test_lang_persists_per_user_and_replies_in_it(db):
     assert texts[1] == "Alpha | 500"
     assert texts[2] == "User1 (user1) - 1\nname unknown - 2"  # root list is in en
     assert texts[3] == "Language: English."
-    assert texts[4] == "Invalid arguments. Usage: /lang &lt;en|ru&gt;"
+    assert texts[4] == "Invalid arguments. Usage: <code>/lang &lt;en|ru&gt;</code>"
 
 
 async def test_bad_args_reply_is_in_the_user_language(db):
@@ -123,8 +123,8 @@ async def test_bad_args_reply_is_in_the_user_language(db):
     await _send(ctx, "/chat remove", ROOT, 3)
     await _send(ctx, "/admin create abc", ADMIN, 4)  # no right: silence
     assert _texts(transport)[1:] == [
-        "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: /admin create &lt;user_id&gt;",
-        "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: /chat remove &lt;chat_id&gt;",
+        "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: <code>/admin create &lt;user_id&gt;</code>",
+        "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: <code>/chat remove &lt;chat_id&gt;</code>",
     ]
 
 

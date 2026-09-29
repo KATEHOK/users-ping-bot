@@ -161,7 +161,7 @@ async def test_register_replies_welcome_and_owner_gets_already_registered(db):
     await _send(ctx, "/upb chat register", REGISTRAR, 1)
     await _send(ctx, "/upb chat register", REGISTRAR, 2)
     assert await _texts(transport) == [
-        "Chat registered. Subscribe: /upb notify on. Ping: /upb all. Help: /upb help.",
+        "Chat registered. Subscribe: <code>/upb notify on</code>. Ping: <code>/upb all</code>. Help: <code>/upb help</code>.",
         "Chat is already registered.",
     ]
     async with db.reader() as c:
@@ -471,8 +471,8 @@ async def test_lang_bad_argument_gets_a_syntax_hint_only_for_owners(db):
     await _send(ctx, "/upb lang de", SUB, 2)
     await _send(ctx, "/upb lang ru extra", REGISTRAR, 3)
     assert await _texts(transport) == [
-        "Invalid arguments. Usage: /upb lang &lt;en|ru&gt;",
-        "Invalid arguments. Usage: /upb lang &lt;en|ru&gt;",
+        "Invalid arguments. Usage: <code>/upb lang &lt;en|ru&gt;</code>",
+        "Invalid arguments. Usage: <code>/upb lang &lt;en|ru&gt;</code>",
     ]
     async with db.reader() as c:
         assert (await services.get_chat(c, CHAT)).lang == "en"

@@ -66,6 +66,7 @@ set-root: _need-version ## Assign root: make set-root ID=<telegram_user_id>
 # file that looks like a finished backup. No existing service container is needed.
 # Only the file NAME of BACKUP_FILE is honoured: the copy always lands in ./backups.
 # An existing ./backups/<name> is never overwritten unless FORCE=1.
+# A leftover staging copy of the same name is overwritten (--force): the host check is the guard.
 # Default name has seconds: upb-<date>_<hhmmss>.sqlite3.
 BACKUP_NAME := $(if $(BACKUP_FILE),$(notdir $(BACKUP_FILE)),upb-$(shell date +%F_%H%M%S).sqlite3)
 backup: _need-version ## Snapshot, verify, stream to ./backups (BACKUP_FILE=<name> names it; refuses to overwrite unless FORCE=1)
@@ -74,7 +75,7 @@ backup: _need-version ## Snapshot, verify, stream to ./backups (BACKUP_FILE=<nam
 	@mkdir -p $(BACKUP_DIR)
 	@# chmod kept on purpose: it also normalises a 0777 directory left by an older Makefile.
 	@chmod 0750 $(BACKUP_DIR)
-	$(CLI) $(SERVICE) -m app.cli backup $(VOLUME_DIR)/$(BACKUP_NAME)
+	$(CLI) $(SERVICE) -m app.cli backup --force $(VOLUME_DIR)/$(BACKUP_NAME)
 	$(CLI) $(SERVICE) -m app.cli verify $(VOLUME_DIR)/$(BACKUP_NAME)
 	$(SHT) $(SERVICE) -c 'cat $(VOLUME_DIR)/$(BACKUP_NAME)' > $(BACKUP_DIR)/$(BACKUP_NAME).part
 	mv $(BACKUP_DIR)/$(BACKUP_NAME).part $(BACKUP_DIR)/$(BACKUP_NAME)

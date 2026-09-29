@@ -37,6 +37,7 @@ FATAL_PAUSE = 60.0  # keeps restart: unless-stopped from hammering Telegram and 
 EXIT_FATAL = 1
 EXIT_UNAUTHORIZED = 3
 PRUNE_KEEP = timedelta(days=2)
+OUTBOX_KEEP = timedelta(days=30)
 PRUNE_INTERVAL = 3600.0
 
 _QUIET_LOGGERS = ("aiohttp", "aiogram", "aiosqlite", "urllib3", "requests")
@@ -77,6 +78,7 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
     async with ctx.db.reader() as c:
         chats = await ctx.services.list_chats(c)
 
+    started_at = iso(ctx.clock.now())
     removed: list[int] = []
     for chat in chats:
         if ctx.delivery.stop.is_set():
@@ -95,12 +97,19 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
     if removed and ctx.delivery.stop.is_set():
         # no report follows a signalled check, and the next start would say "0 removed":
         # hand the removed ids to the outbox so root still hears of them
-        await _queue_interrupted_notice(ctx, removed)
+        try:
+            await _queue_interrupted_notice(ctx, removed, started_at)
+        except Exception as exc:
+            # a signal ends with exit code 0 whatever happens here
+            logger.error("interrupted_notice_error exc=%s", type(exc).__name__)
     return removed
 
 
-async def _queue_interrupted_notice(ctx: Context, removed: list[int]) -> None:
-    """Root is told about chats removed by an interrupted check, via the outbox."""
+async def _queue_interrupted_notice(ctx: Context, removed: list[int], started_at: str) -> None:
+    """Root is told about chats removed by an interrupted check, via the outbox.
+
+    One event per message-sized group of ids; the run start keeps a later run's notice distinct.
+    """
     if not removed:
         return
     async with ctx.db.transaction() as c:
@@ -108,15 +117,15 @@ async def _queue_interrupted_notice(ctx: Context, removed: list[int]) -> None:
         if root_id is None or not await ctx.services.has_private_contact(c, root_id):
             return
         lang = await ctx.services.get_user_lang(c, root_id)
-        ids = ",".join(str(i) for i in sorted(removed))
-        await ctx.services.queue_event(
-            c,
-            event_key=f"reconcile_removed:{root_id}:{ids}",
-            event_type="reconcile_removed",
-            target_kind="user",
-            target_id=root_id,
-            payload={"lang": lang, "chat_ids": list(removed)},
-        )
+        for part, group in enumerate(rendering.split_ids(removed)):
+            await ctx.services.queue_event(
+                c,
+                event_key=f"reconcile_removed:{root_id}:{started_at}:{part}",
+                event_type="reconcile_removed",
+                target_kind="user",
+                target_id=root_id,
+                payload={"lang": lang, "chat_ids": group},
+            )
 
 
 async def send_startup_report(ctx: Context, removed: list[int]) -> None:
@@ -132,9 +141,11 @@ async def send_startup_report(ctx: Context, removed: list[int]) -> None:
 
 
 async def prune_once(ctx: Context) -> int:
-    older_than = iso(ctx.clock.now() - PRUNE_KEEP)
+    now = ctx.clock.now()
     async with ctx.db.transaction() as c:
-        return await ctx.services.prune_processed_updates(c, older_than=older_than)
+        pruned = await ctx.services.prune_processed_updates(c, older_than=iso(now - PRUNE_KEEP))
+        await ctx.services.prune_outbox(c, older_than=iso(now - OUTBOX_KEEP))
+        return pruned
 
 
 async def prune_loop(ctx: Context, stop: asyncio.Event) -> None:

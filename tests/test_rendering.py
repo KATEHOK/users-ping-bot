@@ -80,7 +80,7 @@ def test_decision_keys_present():
 
 def test_t_escapes_keyword_values_and_resolves_language():
     assert t("bad_args", "en", syntax="/admin create <user_id>") == (
-        "Invalid arguments. Usage: /admin create &lt;user_id&gt;"
+        "Invalid arguments. Usage: <code>/admin create &lt;user_id&gt;</code>"
     )
     assert "&lt;" in t("bad_args", "ru", syntax="<x>")
     assert t("lang_set", "en") == "Language: English."
@@ -190,7 +190,12 @@ def test_pong_constant():
 
 
 def _syntax_lines(text: str) -> set[str]:
-    return {line.split(" - ")[0] for line in text.split("\n") if " - " in line}
+    # "<code>SYNTAX</code> - description" -> "SYNTAX" (still escaped)
+    return {
+        line.split(" - ")[0].removeprefix("<code>").removesuffix("</code>")
+        for line in text.split("\n")
+        if line.startswith("<code>")
+    }
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -221,24 +226,24 @@ def test_group_help_shows_short_forms_next_to_full_ones():
     for lang in LANGS:
         text = help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang=lang)
         for line in ("/upb all (/all)", "/upb notify on (/on)", "/upb notify off (/off)", "/upb help (/help)"):
-            assert line + " - " in text
-        assert "/upb list - " in text  # no alias, shown as before
+            assert f"<code>{line}</code> - " in text
+        assert "<code>/upb list</code> - " in text  # no alias, shown as before
     private = help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="en")
-    assert "/help - " in private and "(/" not in private
+    assert "<code>/help</code> - " in private and "(/" not in private
 
 
 def test_usage_shows_alias_and_prefix_matching_ignores_it():
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
     assert _syntax_lines(text) == {"/upb notify on (/on)", "/upb notify off (/off)"}
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("all",), lang="en")
-    assert "/upb all (/all)" in text  # unknown prefix: everything allowed
+    assert "<code>/upb all (/all)</code>" in text  # unknown prefix: everything allowed
 
 
 def test_help_escapes_command_syntax():
     text = help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="en")
-    assert "/admin create &lt;user_id&gt;" in text
+    assert "<code>/admin create &lt;user_id&gt;</code>" in text
     assert "<user_id>" not in text
-    assert "&lt;en|ru&gt;" in text
+    assert "<code>/lang &lt;en|ru&gt;</code>" in text
 
 
 def test_private_help_carries_group_registration_hint_in_both_languages():
