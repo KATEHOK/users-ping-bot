@@ -65,9 +65,12 @@ set-root: _need-version ## Assign root: make set-root ID=<telegram_user_id>
 # breaks database writes). A failed copy-out keeps the staging file and never leaves a
 # file that looks like a finished backup. No existing service container is needed.
 # Only the file NAME of BACKUP_FILE is honoured: the copy always lands in ./backups.
+# An existing ./backups/<name> is never overwritten unless FORCE=1.
 # Default name has seconds: upb-<date>_<hhmmss>.sqlite3.
 BACKUP_NAME := $(if $(BACKUP_FILE),$(notdir $(BACKUP_FILE)),upb-$(shell date +%F_%H%M%S).sqlite3)
-backup: _need-version ## Snapshot into the volume, verify it there, stream to ./backups (BACKUP_FILE=<name> sets the name only)
+backup: _need-version ## Snapshot, verify, stream to ./backups (BACKUP_FILE=<name> names it; refuses to overwrite unless FORCE=1)
+	@if [ -e '$(BACKUP_DIR)/$(BACKUP_NAME)' ] && [ "$(FORCE)" != 1 ]; then \
+	  echo "$(BACKUP_DIR)/$(BACKUP_NAME) already exists: pick another BACKUP_FILE or pass FORCE=1 to overwrite" >&2; exit 2; fi
 	@mkdir -p $(BACKUP_DIR)
 	@# chmod kept on purpose: it also normalises a 0777 directory left by an older Makefile.
 	@chmod 0750 $(BACKUP_DIR)
@@ -84,7 +87,12 @@ verify: _need-version ## Check a backup file: make verify FILE=backups/<file> (s
 	$(SH) $(SERVICE) -c 'mkdir -p $(VOLUME_DIR)'
 	rc=0; { $(SHT) $(SERVICE) -c 'cat > $(VOLUME_DIR)/$(notdir $(FILE))' < '$(FILE)' \
 	  && $(CLI) $(SERVICE) -m app.cli verify $(VOLUME_DIR)/$(notdir $(FILE)); } || rc=$$?; \
-	$(SH) $(SERVICE) -c 'rm -f $(VOLUME_DIR)/$(notdir $(FILE))'; exit $$rc
+	if $(SH) $(SERVICE) -c 'rm -f $(VOLUME_DIR)/$(notdir $(FILE))'; then \
+	  test $$rc -eq 0 || echo "verify failed (exit $$rc); staging copy removed from the volume" >&2; \
+	else \
+	  echo "could not remove staging copy $(VOLUME_DIR)/$(notdir $(FILE)) from the volume" >&2; \
+	  test $$rc -ne 0 || rc=1; \
+	fi; exit $$rc
 
 .PHONY: _need-version
 _need-version:

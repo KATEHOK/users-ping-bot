@@ -215,9 +215,8 @@ async def test_concurrent_cli_set_root_and_telegram_admin_create_do_not_corrupt_
 
 @pytest.mark.asyncio
 async def test_concurrent_admin_remove_and_register_leaves_consistent_state(tmp_path):
-    # punch-list P1, bullet 3: an /admin-remove-style cascade racing a chat
-    # register must leave no chat row referencing the revoked admin and no
-    # orphaned subscription, in either possible commit order.
+    # An /admin-remove-style cascade racing a chat register must leave no
+    # chat row referencing the revoked admin and no orphaned subscription, in either possible commit order.
     path = str(tmp_path / "race_admin_remove_register.sqlite3")
     A = 7
     SUB = 55
@@ -280,7 +279,7 @@ async def test_concurrent_admin_remove_and_register_leaves_consistent_state(tmp_
 
 @pytest.mark.asyncio
 async def test_concurrent_set_root_race_never_leaves_two_roots_or_partial_cascade(tmp_path):
-    # punch-list P1, bullet 1: a real root with real chats races two challengers
+    # A real root with real chats races two challengers
     # for root at once. "Never leaves a partial cascade" means the loser's view
     # of the old root's chats is never half-dropped: both chats disappear
     # together, exactly once, and the root_revoked notice is queued exactly once.
@@ -343,7 +342,7 @@ async def test_concurrent_set_root_race_never_leaves_two_roots_or_partial_cascad
 
 @pytest.mark.asyncio
 async def test_permission_check_after_other_connections_commit_observes_new_rights(tmp_path):
-    # punch-list P1, bullet 2: a permission check that BEGINS after another
+    # A permission check that BEGINS after another
     # connection's commit must see the new rights -- the bot side keeps no
     # per-connection cache of a role, so nothing here needs invalidating.
     path = str(tmp_path / "rights_visibility.sqlite3")

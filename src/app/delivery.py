@@ -218,6 +218,10 @@ class Delivery:
         if event.event_type == "root_revoked":
             # created_at is the moment of the revocation, not of a late delivery
             return rendering.root_revoked_text(event.created_at, lang)
+        if event.event_type == "reconcile_removed":
+            raw = event.payload.get("chat_ids")
+            ids = [i for i in raw if isinstance(i, int)] if isinstance(raw, list) else []
+            return rendering.reconcile_interrupted_text(ids, lang)
         return None
 
     async def _finish(
@@ -240,7 +244,8 @@ class Delivery:
             if new_chat_id is not None:
                 retry_at = None  # retry on the new id in the next cycle
         async with self._db.transaction() as c:
-            if new_chat_id is not None:
+            if new_chat_id is not None and new_chat_id != event.target_id:
+                # equal ids: the migration is already in place (the row was retargeted)
                 await self._services.migrate_chat(c, event.target_id, new_chat_id)
             await self._services.mark_event(c, event.event_id, status, error=error, retry_at=retry_at)
         if give_up:

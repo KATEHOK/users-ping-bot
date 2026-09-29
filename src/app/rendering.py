@@ -41,6 +41,10 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "\u0410\u043a\u0442\u0438\u0432\u043d\u043e\u0439 \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u0438 \u043d\u0435\u0442: {chat_id}.",
     ),
     "root_revoked": ("Root role revoked at {time}.", "\u0420\u043e\u043b\u044c root \u0441\u043d\u044f\u0442\u0430: {time}."),
+    "reconcile_interrupted": (
+        "Startup check was interrupted. Chats removed before that: {ids}.",
+        "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043f\u0440\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043f\u0440\u0435\u0440\u0432\u0430\u043d\u0430. \u0421\u043d\u044f\u0442\u043e \u0434\u043e \u044d\u0442\u043e\u0433\u043e: {ids}.",
+    ),
     "startup": (
         "Bot started. Chats removed on check: {n}.",
         "\u0411\u043e\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {n}.",
@@ -206,6 +210,10 @@ def farewell_text(lang: Lang = DEFAULT_LANG) -> str:
 
 def root_revoked_text(when: str, lang: Lang = DEFAULT_LANG) -> str:
     return t("root_revoked", lang, time=when)
+
+
+def reconcile_interrupted_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
+    return t("reconcile_interrupted", lang, ids=", ".join(str(i) for i in chat_ids))
 
 
 def _safe(text: str) -> str:

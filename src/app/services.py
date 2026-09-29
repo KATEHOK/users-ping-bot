@@ -635,6 +635,8 @@ class Services:
         *,
         title: str | None = None,
     ) -> MigrationResult:
+        if old_chat_id == new_chat_id:
+            return MigrationResult(action="noop")  # never alias a chat to itself
         cursor = await c.execute(
             "SELECT new_chat_id FROM chat_aliases WHERE old_chat_id = ?", (old_chat_id,)
         )

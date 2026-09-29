@@ -941,3 +941,71 @@ async def test_signal_during_reconcile_stops_probing_report_and_prune(db):
     assert len(transport.probes) == 1
     assert transport.calls == []  # no root report
     assert 3600.0 not in clock.sleeps  # no loops were started
+
+
+async def _interrupted_reconcile(db, ctx, services, transport):
+    """Chat -1 is gone; the signal arrives right after it was unregistered."""
+    class GoneThenSignal(type(transport)):
+        async def probe_chat(self, chat_id: int) -> None:
+            await super().probe_chat(chat_id)
+            ctx.delivery.stop.set()
+            raise PermanentSend()
+
+    transport.__class__ = GoneThenSignal
+    return await entry.reconcile_chats(ctx, transport)
+
+
+async def _notices(db):
+    async with db.reader() as c:
+        cur = await c.execute(
+            "SELECT event_key, target_id, payload FROM outbox WHERE event_type = 'reconcile_removed'"
+        )
+        return await cur.fetchall()
+
+
+async def test_interrupted_reconcile_queues_a_root_notice_delivered_by_the_outbox(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _reg_world(db, services)
+    async with db.transaction() as c:
+        await services.set_user_lang(c, 10, "ru")
+    removed = await _interrupted_reconcile(db, ctx, services, transport)
+    assert len(removed) == 1
+    gone = removed[0]
+    rows = await _notices(db)
+    assert len(rows) == 1 and rows[0][0] == f"reconcile_removed:10:{gone}" and rows[0][1] == 10
+    await entry.reconcile_chats(ctx, transport)  # same removal again: deduplicated
+    assert len(await _notices(db)) == 1
+    ctx.delivery.stop.clear()
+    transport.calls.clear()
+    assert await ctx.delivery.run_outbox_once() == 1
+    assert transport.calls[0]["chat_id"] == 10
+    assert str(gone) in transport.calls[0]["text"] and "прервана" in transport.calls[0]["text"]
+
+
+async def test_interrupted_reconcile_english_text_and_no_notice_without_root_contact(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _reg_world(db, services)
+    removed = await _interrupted_reconcile(db, ctx, services, transport)
+    ctx.delivery.stop.clear()
+    transport.calls.clear()
+    await ctx.delivery.run_outbox_once()
+    assert transport.calls[0]["text"] == f"Startup check was interrupted. Chats removed before that: {removed[0]}."
+
+    ctx2, services2, transport2, _c2 = mk_ctx(db)
+    async with db.transaction() as c:
+        await c.execute("DELETE FROM outbox")
+        await c.execute("UPDATE users SET private_contact_at = NULL WHERE user_id = 10")
+        await c.execute(
+            "INSERT INTO chats(chat_id, title, registered_by, registered_at, "
+            "registration_generation, lang) VALUES (-11, 'X', 1, 't', 1, 'en')"
+        )
+    await _interrupted_reconcile(db, ctx2, services2, transport2)
+    assert await _notices(db) == []
+
+
+async def test_uninterrupted_reconcile_queues_no_notice(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _reg_world(db, services)
+    transport.set_probe(-1, PermanentSend())
+    assert await entry.reconcile_chats(ctx, transport) == [-1]
+    assert await _notices(db) == []

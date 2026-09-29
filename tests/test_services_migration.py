@@ -201,3 +201,20 @@ async def test_failure_inside_migrate_chat_leaves_no_alias(db: Database):
     async with db.reader() as c:
         assert await services.resolve_chat_id(c, -100) == -100
         assert await services.get_chat(c, -100) is not None
+
+
+async def _alias_count(db):
+    async with db.reader() as c:
+        cur = await c.execute("SELECT COUNT(*) FROM chat_aliases")
+        return (await cur.fetchone())[0]
+
+
+async def test_migrating_a_chat_to_itself_is_a_noop(db: Database):
+    services = Services()
+    await _register(services, db, 1, -100, "Group")
+    async with db.transaction() as c:
+        result = await services.migrate_chat(c, -100, -100)
+    assert result.action == "noop"
+    assert await _alias_count(db) == 0
+    async with db.reader() as c:
+        assert await services.get_chat(c, -100) is not None

@@ -295,3 +295,29 @@ async def test_failed_status_write_after_any_outcome_never_resends(db, caplog, e
     event = await _event(db, services, eid)
     assert (event.status, event.attempts) == (status, attempts)
     assert not delivery._unwritten
+
+
+async def test_replayed_chat_migrated_outcome_never_aliases_a_chat_to_itself(db):
+    delivery, services, transport, _c = _mk(db)
+    eid = await _queue(db, services)
+    transport.fail_chat(CHAT, ChatMigrated(-1000))
+    # the write fails once, so the outcome is replayed later
+    original = services.mark_event
+    calls = {"n": 0}
+
+    async def flaky(c, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("locked")
+        return await original(c, *a, **kw)
+
+    services.mark_event = flaky
+    await delivery.run_outbox_once()
+    # meanwhile the migration lands elsewhere and retargets the pending row
+    async with db.transaction() as c:
+        await services.migrate_chat(c, CHAT, -1000)
+    await delivery.run_outbox_once()  # replays the recorded outcome
+    async with db.reader() as c:
+        cur = await c.execute("SELECT old_chat_id, new_chat_id FROM chat_aliases")
+        assert await cur.fetchall() == [(CHAT, -1000)]
+    assert (await _event(db, services, eid)).target_id == -1000

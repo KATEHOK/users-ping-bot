@@ -92,7 +92,31 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
                 await ctx.services.migrate_chat(c, chat.chat_id, exc.new_chat_id)
         except (AmbiguousSend, RateLimited):
             logger.info("reconcile_skipped chat_id=%s", chat.chat_id)  # network trouble: keep it
+    if removed and ctx.delivery.stop.is_set():
+        # no report follows a signalled check, and the next start would say "0 removed":
+        # hand the removed ids to the outbox so root still hears of them
+        await _queue_interrupted_notice(ctx, removed)
     return removed
+
+
+async def _queue_interrupted_notice(ctx: Context, removed: list[int]) -> None:
+    """Root is told about chats removed by an interrupted check, via the outbox."""
+    if not removed:
+        return
+    async with ctx.db.transaction() as c:
+        root_id = await ctx.services.get_root(c)
+        if root_id is None or not await ctx.services.has_private_contact(c, root_id):
+            return
+        lang = await ctx.services.get_user_lang(c, root_id)
+        ids = ",".join(str(i) for i in sorted(removed))
+        await ctx.services.queue_event(
+            c,
+            event_key=f"reconcile_removed:{root_id}:{ids}",
+            event_type="reconcile_removed",
+            target_kind="user",
+            target_id=root_id,
+            payload={"lang": lang, "chat_ids": list(removed)},
+        )
 
 
 async def send_startup_report(ctx: Context, removed: list[int]) -> None:

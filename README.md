@@ -116,42 +116,45 @@ docker compose run --rm --entrypoint python users-ping-bot -m app.cli set-root <
 - передаёт проверенную копию потоком в `backups/<имя>.part` на хосте и переименовывает в `<имя>` только после успеха (оборванная передача не выглядит готовым бэкапом);
 - только после этого удаляет копию внутри тома (полный том ломает запись в БД). Если копирование не удалось, копия в томе остаётся.
 
-Имя файла — `upb-<дата>_<ччммсс>.sqlite3`. `BACKUP_FILE=<имя>` задаёт только имя файла (каталог из значения отбрасывается: копия всегда в `backups/`). Вручную:
+Имя файла — `upb-<дата>_<ччммсс>.sqlite3`. `BACKUP_FILE=<имя>` задаёт только имя файла (каталог из значения отбрасывается: копия всегда в `backups/`). Если `backups/<имя>` уже есть, `make backup` отказывает с кодом 2 и ничего не трогает; перезаписать можно только явно: `FORCE=1 make backup BACKUP_FILE=<имя>`. Вручную (проверку существования файла на хосте делайте сами):
 
 ```sh
 mkdir -p backups && chmod 0750 backups
 f=upb-$(date +%F_%H%M%S).sqlite3
-docker compose run --rm --entrypoint python users-ping-bot -m app.cli backup /data/backups/$f
-docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/$f
-docker compose run --rm -T --entrypoint sh users-ping-bot -c "cat /data/backups/$f" > backups/$f.part &&
+test ! -e backups/$f &&
+  docker compose run --rm --entrypoint python users-ping-bot -m app.cli backup /data/backups/$f &&
+  docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/$f &&
+  docker compose run --rm -T --entrypoint sh users-ping-bot -c "cat /data/backups/$f" > backups/$f.part &&
   mv backups/$f.part backups/$f &&
   docker compose run --rm --entrypoint sh users-ping-bot -c "rm -f /data/backups/$f"
 ```
 
 Существующий контейнер сервиса не нужен.
 
-`make verify FILE=backups/<файл>` сначала передаёт файл с хоста в том (`/data/backups/`) потоком, затем проверяет его там и в любом случае удаляет копию из тома (данные остаются на хосте). Вручную:
+`make verify FILE=backups/<файл>` сначала передаёт файл с хоста в том (`/data/backups/`) потоком, затем проверяет его там и в любом случае пытается удалить копию из тома (данные остаются на хосте). После неудачной проверки он сообщает, что копия удалена, а если удалить её не удалось, завершается с ненулевым кодом даже при успешной проверке. Вручную (шаги связаны через `&&`; удаление копии выполните и после сбоя проверки):
 
 ```sh
-docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups'
-docker compose run --rm -T --entrypoint sh users-ping-bot -c 'cat > /data/backups/<файл>' < backups/<файл>
-docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/<файл>
+docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups' &&
+  docker compose run --rm -T --entrypoint sh users-ping-bot -c 'cat > /data/backups/<файл>' < backups/<файл> &&
+  docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/<файл>
 docker compose run --rm --entrypoint sh users-ping-bot -c 'rm -f /data/backups/<файл>'
 ```
 
 Копия — один самодостаточный файл. На существующий файл бэкап пишет только с `--force`, а на рабочую базу и её `-wal`/`-shm`/`-journal` не пишет никогда.
 
-**Восстановление** — при остановленном боте, после `make verify` нужной копии. Копия сначала передаётся потоком в том, затем одной командой копируется во временный файл рядом с БД; только если это удалось, убираются старые `-wal`/`-shm` (иначе SQLite применит их к восстановленному файлу), временный файл переименовывается поверх БД и удаляется копия в `/data/backups/`. Сбой любого шага оставляет текущую БД нетронутой.
+**Восстановление** — при остановленном боте, после `make verify` нужной копии. Шаги цепочкой `&&`: после первого сбоя следующие не выполняются. Копия передаётся потоком в том и проверяется там (`app.cli verify`); пока это не удалось, рабочая БД не затрагивается. Затем копия копируется во временный файл рядом с БД, убираются старые `-wal`/`-shm` (иначе SQLite применит их к восстановленному файлу), временный файл переименовывается поверх БД и удаляется копия в `/data/backups/`. Гарантия: сбой передачи, проверки или копирования оставляет рабочую БД нетронутой. Сбой после удаления `-wal`/`-shm` (на практике только `mv`) уже не откатывается: остаётся прежний файл БД без своих `-wal`/`-shm`, а временный файл — рядом; повторите восстановление. Неполный `/data/upb.sqlite3.restore` после сбоя `cp` бот не читает, следующее восстановление его перезапишет. Копия в `/data/backups/` при любом сбое остаётся в томе: удалите её вручную. При сбое бот остаётся остановленным — запустите его (`docker compose start`), когда разберётесь с причиной.
 
 ```sh
 docker compose stop
-docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups'
-docker compose run --rm -T --entrypoint sh users-ping-bot -c 'cat > /data/backups/<файл>' < backups/<файл>
-docker compose run --rm --entrypoint sh users-ping-bot -c \
-  'cp /data/backups/<файл> /data/upb.sqlite3.restore || { rm -f /data/upb.sqlite3.restore; exit 1; }
-   rm -f /data/upb.sqlite3-wal /data/upb.sqlite3-shm && mv /data/upb.sqlite3.restore /data/upb.sqlite3 &&
-   rm -f /data/backups/<файл>'
-docker compose start
+docker compose run --rm --entrypoint sh users-ping-bot -c 'mkdir -p /data/backups' &&
+  docker compose run --rm -T --entrypoint sh users-ping-bot -c 'cat > /data/backups/<файл>' < backups/<файл> &&
+  docker compose run --rm --entrypoint python users-ping-bot -m app.cli verify /data/backups/<файл> &&
+  docker compose run --rm --entrypoint sh users-ping-bot -c \
+    'cp /data/backups/<файл> /data/upb.sqlite3.restore &&
+     rm -f /data/upb.sqlite3-wal /data/upb.sqlite3-shm &&
+     mv /data/upb.sqlite3.restore /data/upb.sqlite3 &&
+     rm -f /data/backups/<файл>' &&
+  docker compose start
 ```
 
 **Вывод CLI.** Вывод `set-root` и `backup` начинается со строки `db=<путь>`; у `verify` в ней путь проверяемого файла. Ошибки разбора аргументов `db=` не печатают. Если файла БД нет, `set-root` предупреждает, что создаёт новый, — так видна опечатка в `UPB_DB_PATH`; `backup` без БД завершается ошибкой.
