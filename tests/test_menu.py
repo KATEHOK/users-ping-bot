@@ -93,7 +93,7 @@ async def test_root_registering_is_not_given_the_menu_twice(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await _say(ctx, "/register", 1, ROOT)
-    assert [(c["op"], c["user_id"]) for c in transport.menu_calls] == [("set", None), ("set", ROOT)]
+    assert [(c["op"], c["user_id"]) for c in transport.menu_calls] == [("set", None), ("set", ROOT), ("delete", ADMIN)]
 
 
 async def test_a_member_who_is_not_in_the_chat_is_logged_not_raised(db, caplog):
@@ -355,7 +355,8 @@ async def test_startup_sync_picks_chats_from_the_outbox(db):
     async with db.transaction() as c:
         await services.unregister_chat(c, -1)  # queues a farewell, no registration left
     await entry.sync_menus(ctx, [])
-    assert [(m["chat_id"], m["op"]) for m in transport.menu_calls] == [(-1, "delete")]
+    ops = [(m["chat_id"], m["user_id"], m["op"]) for m in transport.menu_calls]
+    assert ops == [(-1, None, "delete"), (-1, ROOT, "set"), (-1, ADMIN, "set")]  # staff get /register
 
 
 async def test_429_then_success(db):
@@ -529,6 +530,52 @@ async def test_cli_root_change_drops_the_menu_once_the_farewell_is_done(db, fail
     }
 
 
+@pytest.mark.parametrize("fail", [None, PermanentSend()])
+async def test_cli_root_change_syncs_active_chats_once_the_notice_is_final(db, fail):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await make_admin(db, services, ADMIN)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    async with db.transaction() as c:  # what the CLI does: no transport
+        await services.touch_user(c, 11)
+        await services.set_root(c, 11)
+    assert transport.menu_calls == []
+    if fail is not None:
+        transport.fail_chat(ROOT, fail)
+    await ctx.delivery.run_outbox_once()
+    members = _member_ops(transport)
+    assert _chat_ops(transport) == [("set", CHAT_ID)]
+    assert members[(CHAT_ID, ROOT)] is None  # the old root loses the owner menu
+    assert members[(CHAT_ID, 11)] == rendering.owner_menu_commands("en")
+    assert members[(CHAT_ID, ADMIN)] == rendering.owner_menu_commands("en")
+
+
+async def test_retryable_root_notice_failure_does_not_sync_menus_yet(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await make_admin(db, services, ADMIN)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    async with db.transaction() as c:
+        await services.touch_user(c, 11)
+        await services.set_root(c, 11)
+    transport.fail_chat(ROOT, AmbiguousSend())
+    await ctx.delivery.run_outbox_once()
+    assert transport.menu_calls == []
+
+
+async def test_root_notice_menu_sync_waits_on_429_only_up_to_the_cap(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await make_admin(db, services, ADMIN)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    async with db.transaction() as c:
+        await services.touch_user(c, 11)
+        await services.set_root(c, 11)
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await ctx.delivery.run_outbox_once()  # gives up on the chat scope, never raises
+    assert len(transport.menu_calls) == 1
+
+
 async def test_retryable_farewell_failure_does_not_touch_the_menu_yet(db):
     ctx, services, transport, _c = mk_ctx(db)
     await make_root(db, services, ROOT, contact=True)
@@ -554,7 +601,7 @@ async def test_bot_added_to_an_unregistered_group_deletes_a_stale_menu(db):
     assert _chat_ops(transport) == [("delete", CHAT_ID)]
     assert transport.calls == []
     await handle_event(ctx, _my_member(1, added=True))  # a replayed update does nothing
-    assert len(transport.menu_calls) == 2
+    assert len(transport.menu_calls) == 3  # chat scope, root, admin
 
 
 @pytest.mark.parametrize("adder", [ROOT, ADMIN])
@@ -564,7 +611,13 @@ async def test_staff_adding_the_bot_gets_the_register_menu_in_that_group(db, add
     async with db.transaction() as c:
         await services.set_user_lang(c, adder, "ru")
     await handle_event(ctx, _my_member(1, added=True, user=adder))
-    assert _member_ops(transport) == {(CHAT_ID, adder): rendering.register_menu_commands("ru")}
+    register = rendering.register_menu_commands
+    other = ADMIN if adder == ROOT else ROOT
+    # every staff member is a candidate, each in their own language
+    assert _member_ops(transport) == {
+        (CHAT_ID, adder): register("ru"),
+        (CHAT_ID, other): register("en"),
+    }
     assert [n for n, _ in _member_ops(transport)[(CHAT_ID, adder)]] == REGISTER_COMMANDS
     assert _chat_ops(transport) == [("delete", CHAT_ID)]
 
@@ -573,7 +626,11 @@ async def test_a_non_staff_adder_gets_no_member_menu(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await handle_event(ctx, _my_member(1, added=True, user=77))
-    assert _member_ops(transport) == {(CHAT_ID, 77): None}
+    assert _member_ops(transport) == {
+        (CHAT_ID, ROOT): rendering.register_menu_commands("en"),
+        (CHAT_ID, ADMIN): rendering.register_menu_commands("en"),
+        (CHAT_ID, 77): None,
+    }
 
 
 async def test_a_former_admin_adding_the_bot_has_the_member_menu_deleted(db):
@@ -582,7 +639,10 @@ async def test_a_former_admin_adding_the_bot_has_the_member_menu_deleted(db):
     async with db.transaction() as c:
         await services.revoke_admin(c, ADMIN)
     await handle_event(ctx, _my_member(1, added=True, user=ADMIN))
-    assert _member_ops(transport) == {(CHAT_ID, ADMIN): None}
+    assert _member_ops(transport) == {
+        (CHAT_ID, ROOT): rendering.register_menu_commands("en"),
+        (CHAT_ID, ADMIN): None,  # no longer staff
+    }
 
 
 async def test_adding_the_bot_to_a_registered_chat_syncs_the_owner_menus(db):
@@ -595,7 +655,39 @@ async def test_adding_the_bot_to_a_registered_chat_syncs_the_owner_menus(db):
     assert _member_ops(transport)[(CHAT_ID, ADMIN)] == rendering.owner_menu_commands("en")
 
 
-async def test_adder_menu_is_replaced_when_someone_else_registers(db):
+async def test_a_kicked_and_re_added_bot_resets_the_stale_owner_menus(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await make_admin(db, services, 2)
+    await _say(ctx, "/register", 1, ADMIN)  # root and ADMIN hold owner menus
+    await handle_event(
+        ctx,
+        make_event(
+            kind="my_chat_member", update_id=2, chat_id=CHAT_ID, chat_type="supergroup",
+            user_id=ADMIN, bot_removed=True, text=None,
+        ),
+    )  # kicked: no farewell
+    transport.menu_calls.clear()
+    await handle_event(ctx, _my_member(3, added=True, user=2))
+    members = _member_ops(transport)
+    register = rendering.register_menu_commands("en")
+    assert members == {(CHAT_ID, ROOT): register, (CHAT_ID, ADMIN): register, (CHAT_ID, 2): register}
+
+
+async def test_staff_register_menu_is_replaced_when_someone_else_registers(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await make_admin(db, services, 2)
+    await handle_event(ctx, _my_member(1, added=True, user=2))  # 2 got the register menu
+    assert _member_ops(transport)[(CHAT_ID, 2)] == rendering.register_menu_commands("en")
+    await _say(ctx, "/register", 2, ROOT)
+    members = _member_ops(transport)
+    assert members[(CHAT_ID, ROOT)] == rendering.owner_menu_commands("en")
+    assert members[(CHAT_ID, ADMIN)] is None  # a member scope would hide the chat menu
+    assert members[(CHAT_ID, 2)] is None
+
+
+async def test_adder_menu_is_replaced_when_the_bot_is_re_added_to_a_registered_chat(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await make_admin(db, services, 2)
@@ -637,7 +729,7 @@ async def test_member_scope_sync_makes_one_attempt_per_call_on_command_paths(db)
 
     transport.set_chat_commands = set_commands
     await handle_event(ctx, _my_member(2, added=True, user=ROOT))
-    assert [c["user_id"] for c in transport.menu_calls] == [None, ROOT]  # one attempt each
+    assert [c["user_id"] for c in transport.menu_calls] == [None, ROOT, ADMIN]  # one attempt each
     assert slept == []
 
     transport.menu_calls.clear()
@@ -711,7 +803,11 @@ async def test_startup_sync_sets_active_and_deletes_known_inactive(db):
     await entry.sync_menus(ctx, [-9])  # removed by reconciliation
     got = {c["chat_id"]: c["op"] for c in transport.menu_calls if c["user_id"] is None}
     assert got == {-1: "set", -200: "set", -9: "delete"}  # the migrated-away id is skipped
-    assert set(_member_ops(transport)) == {(-1, ROOT), (-1, ADMIN), (-200, ROOT), (-200, ADMIN)}
+    members = _member_ops(transport)
+    assert {k: v for k, v in members.items() if k[0] in (-1, -200)} == {
+        (chat, u): rendering.owner_menu_commands("en") for chat in (-1, -200) for u in (ROOT, ADMIN)
+    }
+    assert members[(-9, ROOT)] == rendering.register_menu_commands("en")  # inactive: staff get /register
 
 
 async def test_startup_sync_takes_a_former_root_from_the_outbox(db):

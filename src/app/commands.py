@@ -56,9 +56,9 @@ def parse_group_command(
     name, rest = leading
     if name == "lang":
         words = rest.split()
-        return ParsedCommand(Cmd.LANG, tuple(words)) if words else ParsedCommand(Cmd.USAGE, ("lang",))
+        return ParsedCommand(Cmd.LANG, tuple(words), True) if words else ParsedCommand(Cmd.USAGE, ("lang",))
     if name in _GROUP_ALIASES:
-        return ParsedCommand(_GROUP_ALIASES[name], tuple(rest.split()))
+        return ParsedCommand(_GROUP_ALIASES[name], tuple(rest.split()), True)
     if name != "upb":
         return None
 

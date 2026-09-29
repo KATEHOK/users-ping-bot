@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
 
@@ -63,6 +63,7 @@ class Actor:
 class ParsedCommand:
     cmd: Cmd
     args: tuple[str, ...]
+    via_alias: bool = field(default=False, compare=False)  # typed as a short group form
 
 
 @dataclass(frozen=True, slots=True)

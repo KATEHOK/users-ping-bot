@@ -422,6 +422,11 @@ class Services:
         row = await cursor.fetchone()
         return row[0] if row is not None else None
 
+    async def staff_ids(self, c: aiosqlite.Connection) -> list[int]:
+        """Root first, then every admin: all users who may hold a menu of ours."""
+        cursor = await c.execute("SELECT user_id FROM roles ORDER BY role = 'root' DESC, user_id")
+        return [r[0] for r in await cursor.fetchall()]
+
     async def former_root_ids(self, c: aiosqlite.Connection) -> list[int]:
         """Users who were told their root role was revoked: they may still hold an owner menu."""
         cursor = await c.execute(

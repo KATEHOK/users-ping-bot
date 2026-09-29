@@ -5,7 +5,7 @@ import pytest
 from app import rendering
 from app.delivery import AmbiguousSend, PermanentSend, RateLimited
 from app.handlers import handle_event
-from app.models import Cmd
+from app.models import Actor, Cmd, Role, Scope
 from app.rendering import t
 
 from conftest import (
@@ -65,6 +65,7 @@ ACTIVE_ALLOWED = {
 STAFF = {"root", "owner", "foreign_admin"}
 INACTIVE_ALLOWED = {cmd: set() for cmd in TEXTS}
 INACTIVE_ALLOWED[Cmd.CHAT_REGISTER] = STAFF
+INACTIVE_ALLOWED[Cmd.HELP] = STAFF
 
 
 async def _world(db, services, *, active: bool):
@@ -96,7 +97,7 @@ async def _count(db, sql, *params):
 
 def _assert_matrix_reply(cmd: Cmd, who: str, active: bool, texts: list[str]) -> None:
     """The exact reply an allowed sender gets as the first command in the _world chat."""
-    if not active:
+    if not active and cmd is not Cmd.HELP:
         assert cmd is Cmd.CHAT_REGISTER
         assert texts == [rendering.welcome_text("en")]
         return
@@ -118,9 +119,13 @@ def _assert_matrix_reply(cmd: Cmd, who: str, active: bool, texts: list[str]) -> 
         assert set(text.split("\n")) == {sub_line, "U21 - 21"}
     elif cmd is Cmd.HELP:
         assert text.startswith(t("help_title", "en") + "\n")
-        assert "/register" not in text  # active chat: not advertised
-        assert ("/unregister" in text) == (who in OWNERS)
-        assert ("/lang" in text) == (who in OWNERS)
+        if active:
+            assert "/register" not in text  # active chat: not advertised
+            assert ("/unregister" in text) == (who in OWNERS)
+            assert ("/lang" in text) == (who in OWNERS)
+        else:  # staff in a free chat: what they can run there
+            assert "/register" in text and "/help" in text
+            assert "/unregister" not in text and "/all" not in text
     elif cmd is Cmd.LANG:
         assert text == t("lang_set", "ru")
     else:
@@ -580,3 +585,39 @@ async def test_error_log_carries_the_class_only(db, monkeypatch, caplog):
     await _send(ctx, "/upb notify on", NOBODY, 1)
     assert "RuntimeError" in caplog.text
     assert "FAKE-TOKEN-MARKER" not in caplog.text
+
+
+@pytest.mark.parametrize("text", ["/help", "/usage", "/upb help", "/upb usage", "/help@upb_bot"])
+async def test_staff_help_in_a_free_chat_lists_register_and_help(db, text):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=False)
+    await _send(ctx, text, FOREIGN_ADMIN, 1)
+    (reply,) = await _texts(transport)
+    assert reply == rendering.help_text(
+        Actor(user_id=FOREIGN_ADMIN, role=Role.ADMIN),
+        scope=Scope.GROUP, chat_active=False, lang="en",
+    )
+    assert "/register" in reply and "/help" in reply
+
+
+async def test_non_staff_help_in_a_free_chat_makes_no_calls(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=False)
+    await _send(ctx, "/help", SUB, 1)
+    assert transport.calls == [] and transport.menu_calls == []
+
+
+@pytest.mark.parametrize(
+    "text,syntax",
+    [
+        ("/lang de", "/lang <en|ru>"),
+        ("/LANG de", "/lang <en|ru>"),
+        ("/upb lang de", "/upb lang <en|ru>"),
+    ],
+)
+async def test_bad_lang_args_show_the_syntax_that_was_used(db, text, syntax):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, text, ROOT, 1)
+    assert await _texts(transport) == [t("bad_args", "en", syntax=syntax)]
+    assert "&lt;en|ru&gt;" in (await _texts(transport))[0]  # still escaped

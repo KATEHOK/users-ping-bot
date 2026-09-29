@@ -35,7 +35,7 @@ def expected(cmd: Cmd, who: str, *, scope: Scope, chat_active: bool) -> bool:
         return False
     if scope is Scope.GROUP:
         if not chat_active:
-            return cmd in (Cmd.CHAT_REGISTER, Cmd.USAGE) and who in STAFF
+            return cmd in (Cmd.CHAT_REGISTER, Cmd.USAGE, Cmd.HELP) and who in STAFF
         if cmd in OWNER_ONLY:
             return who in OWNERS
         if cmd in EVERYONE_ACTIVE:
@@ -87,10 +87,10 @@ def test_foreign_admin_is_an_ordinary_user_in_an_active_group():
     assert not can_run(Cmd.CHAT_UNREGISTER, subscribed, scope=Scope.GROUP, chat_active=True)
 
 
-def test_inactive_group_offers_staff_only_register_and_usage():
+def test_inactive_group_offers_staff_only_register_help_and_usage():
     for actor in (ROOT, REGISTRAR, FOREIGN_ADMIN):
         cmds = [s.cmd for s in allowed_commands(actor, scope=Scope.GROUP, chat_active=False)]
-        assert cmds == [Cmd.CHAT_REGISTER, Cmd.USAGE]
+        assert cmds == [Cmd.CHAT_REGISTER, Cmd.HELP, Cmd.USAGE]
     for actor in (SUBSCRIBER, NOBODY):
         assert allowed_commands(actor, scope=Scope.GROUP, chat_active=False) == ()
 

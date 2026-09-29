@@ -372,8 +372,8 @@ def test_usage_examples_per_actor_and_scope():
     # bare or unknown: everything allowed
     assert lines(plain, Scope.GROUP, True, ()) == {"/on"}
     assert lines(plain, Scope.GROUP, True, ("qwe",)) == {"/on"}
-    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ()) == {"/register"}
-    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ("qwe",)) == {"/register"}
+    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ()) == {"/register", "/help"}
+    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ("qwe",)) == {"/register", "/help"}
     # known prefix with nothing allowed under it: silence, no fallback
     assert usage_text(plain, scope=Scope.GROUP, chat_active=True, prefix=("chat",), lang="en") == ""
     assert usage_text(plain, scope=Scope.GROUP, chat_active=True, prefix=("lang",), lang="en") == ""

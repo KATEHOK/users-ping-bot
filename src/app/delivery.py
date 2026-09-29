@@ -473,6 +473,19 @@ class Delivery:
                 owners = event.payload.get("owners")
                 users = [u for u in owners if isinstance(u, int)] if isinstance(owners, list) else []
                 await self.sync_chat_menu(event.target_id, users=users)
+            elif event.event_type == "root_revoked" and final:
+                await self._sync_after_root_change(event.target_id)
+
+    async def _sync_after_root_change(self, old_root_id: int) -> None:
+        """Root changed while the bot runs (via the CLI): owner menus of active chats may be stale."""
+        try:
+            async with self._db.reader() as c:
+                chat_ids = [r.chat_id for r in await self._services.list_chats(c)]
+                staff = await self._services.staff_ids(c)
+        except Exception as exc:
+            logger.error("menu_state_error exc=%s", type(exc).__name__)
+            return
+        await self.sync_chat_menus(chat_ids, users=[old_root_id, *staff])
 
     async def run_outbox_once(self) -> int:
         now_iso = iso(self._clock.now())

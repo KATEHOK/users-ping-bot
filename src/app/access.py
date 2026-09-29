@@ -55,8 +55,8 @@ def can_run(cmd: Cmd, actor: Actor, *, scope: Scope, chat_active: bool) -> bool:
 
     if scope is Scope.GROUP:
         if not chat_active:
-            # Free chat: any admin or root may register it; nothing else is available.
-            return cmd in (Cmd.CHAT_REGISTER, Cmd.USAGE) and actor.is_staff
+            # Free chat: any admin or root may register it; help lists just that.
+            return cmd in (Cmd.CHAT_REGISTER, Cmd.USAGE, Cmd.HELP) and actor.is_staff
         if cmd in (Cmd.CHAT_REGISTER, Cmd.CHAT_UNREGISTER, Cmd.LANG):
             return actor.is_chat_owner
         if cmd in (Cmd.NOTIFY_ON, Cmd.USAGE):
