@@ -22,6 +22,7 @@ from .services import OutboxEvent, Services
 logger = logging.getLogger(__name__)
 
 MAX_PING_RETRIES = 3  # explicit 429s only, per message chunk
+MAX_MENU_ATTEMPTS = 3  # setMyCommands / deleteMyCommands, 429s included
 OUTBOX_MAX_ATTEMPTS = 3
 OUTBOX_POLL_INTERVAL = 5.0
 OUTBOX_BASE_BACKOFF = 30.0
@@ -80,6 +81,14 @@ class Transport(Protocol):
         AmbiguousSend otherwise."""
         ...
 
+    async def set_chat_commands(self, chat_id: int, commands: Sequence[tuple[str, str]]) -> None:
+        """setMyCommands for this chat's scope only: (command, description) pairs."""
+        ...
+
+    async def delete_chat_commands(self, chat_id: int) -> None:
+        """deleteMyCommands for this chat's scope only."""
+        ...
+
 
 async def wait_or_stop(clock: Clock, stop: asyncio.Event, seconds: float) -> bool:
     """Sleep on the clock but wake at once on stop. True if stop is set."""
@@ -116,6 +125,9 @@ class _Outcome:
     new_chat_id: int | None = None
 
 
+_MENU_MOVED = ("moved", "kept_destination")  # migrate_chat actions that change registrations
+
+
 class Delivery:
     def __init__(
         self,
@@ -140,7 +152,9 @@ class Delivery:
 
     async def _apply_migration(self, old_chat_id: int, new_chat_id: int) -> None:
         async with self._db.transaction() as c:
-            await self._services.migrate_chat(c, old_chat_id, new_chat_id)
+            result = await self._services.migrate_chat(c, old_chat_id, new_chat_id)
+        if result.action in _MENU_MOVED:
+            await self.sync_chat_menus([old_chat_id, new_chat_id])
 
     async def _send(
         self,
@@ -209,6 +223,65 @@ class Delivery:
             ):
                 return  # the remainder is cancelled
 
+    # --- command menu ---
+
+    async def sync_chat_menu(self, chat_id: int) -> bool:
+        """Make the chat's command menu match the DB: set if registered, else delete.
+
+        Idempotent and never raises (except Unauthorized): failures are logged by code.
+        True if the menu now matches the state.
+        """
+        return await self._sync_menu(chat_id, migrated=False)
+
+    async def sync_chat_menus(self, chat_ids: Sequence[int]) -> None:
+        for chat_id in dict.fromkeys(chat_ids):
+            if self.stop.is_set():
+                return
+            await self.sync_chat_menu(chat_id)
+
+    async def _sync_menu(self, chat_id: int, *, migrated: bool) -> bool:
+        try:
+            async with self._db.reader() as c:
+                chat = await self._services.get_chat(c, chat_id)
+        except Exception as exc:
+            logger.error("menu_state_error exc=%s", type(exc).__name__)
+            return False
+        code = "menu_set" if chat is not None else "menu_delete"
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                if chat is not None:
+                    await self._transport.set_chat_commands(chat_id, rendering.menu_commands(chat.lang))
+                else:
+                    await self._transport.delete_chat_commands(chat_id)
+                return True
+            except RateLimited as exc:
+                if attempts >= MAX_MENU_ATTEMPTS:
+                    _log_code(f"{code}_retries_exhausted", chat_id=chat_id)
+                    return False
+                if await wait_or_stop(self._clock, self.stop, exc.retry_after):
+                    _log_code(f"{code}_stopped", chat_id=chat_id)
+                    return False
+            except ChatMigrated as exc:
+                _log_code(f"{code}_chat_migrated", chat_id=chat_id)
+                if migrated:
+                    return False
+                try:
+                    await self._apply_migration(chat_id, exc.new_chat_id)
+                except Exception as err:
+                    logger.error("migration_failed exc=%s", type(err).__name__)
+                    return False
+                await self._sync_menu(chat_id, migrated=True)
+                return await self._sync_menu(exc.new_chat_id, migrated=True)
+            except AmbiguousSend:
+                _log_code(f"{code}_ambiguous", chat_id=chat_id)
+                return False
+            except PermanentSend:
+                # a gone chat or a forbidden bot is expected for a delete
+                _log_code(f"{code}_permanent", chat_id=chat_id)
+                return False
+
     # --- outbox ---
 
     def _render_outbox_text(self, event: OutboxEvent) -> str | None:
@@ -243,11 +316,15 @@ class Delivery:
             status, retry_at = "pending", iso(self._clock.now() + timedelta(seconds=delay))
             if new_chat_id is not None:
                 retry_at = None  # retry on the new id in the next cycle
+        moved = False
         async with self._db.transaction() as c:
             if new_chat_id is not None and new_chat_id != event.target_id:
                 # equal ids: the migration is already in place (the row was retargeted)
-                await self._services.migrate_chat(c, event.target_id, new_chat_id)
+                result = await self._services.migrate_chat(c, event.target_id, new_chat_id)
+                moved = result.action in _MENU_MOVED
             await self._services.mark_event(c, event.event_id, status, error=error, retry_at=retry_at)
+        if moved:
+            await self.sync_chat_menus([event.target_id, new_chat_id])
         if give_up:
             logger.error(
                 "outbox_failed event_id=%s type=%s code=%s attempts=%s",

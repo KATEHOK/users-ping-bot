@@ -49,6 +49,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
     replies: list[str] = []
     ping: list[SubscriberRef] | None = None
     ping_key: tuple[int, int] | None = None
+    menu: list[int] = []  # chats whose command menu may have changed
 
     async with ctx.db.transaction() as c:
         if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
@@ -87,8 +88,10 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
         if cmd is Cmd.CHAT_REGISTER:
             result = await ctx.services.register_chat(c, chat_id, event.chat_title, event.user_id)
             replies.append(rendering.welcome_text(lang) if result.created else t("already_registered", lang))
+            menu.append(chat_id)
         elif cmd is Cmd.CHAT_UNREGISTER:
             await ctx.services.unregister_chat(c, chat_id)  # farewell goes through the outbox
+            menu.append(chat_id)
         elif cmd is Cmd.NOTIFY_ON:
             sub = await ctx.services.subscribe(c, chat_id, event.user_id)
             replies.append(t("subscribed" if sub.created else "already_subscribed", lang))
@@ -106,6 +109,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
         elif cmd is Cmd.LANG:
             await ctx.services.set_chat_lang(c, chat_id, new_lang)
             replies.append(t("lang_set", new_lang))
+            menu.append(chat_id)
         elif cmd is Cmd.USAGE:
             if not replies:  # empty text means nothing to show: silence
                 text = rendering.usage_text(
@@ -129,3 +133,4 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
         ):
             break
+    await send.sync_chat_menus(menu)

@@ -29,6 +29,8 @@ async def handle_migration(ctx: Context, event: IncomingEvent) -> None:
         if result.action in ("noop", "contradictory"):
             await mark_ignored(c, ctx, event.update_id)
     # never announced into the chats: nothing to send
+    if result.action in ("moved", "kept_destination"):
+        await ctx.delivery.sync_chat_menus([old_chat_id, new_chat_id])
 
 
 async def handle_member_left(ctx: Context, event: IncomingEvent) -> None:
@@ -47,6 +49,7 @@ async def handle_membership(ctx: Context, event: IncomingEvent) -> None:
 async def _left(ctx: Context, event: IncomingEvent, *, is_bot: bool) -> None:
     from . import mark_ignored
 
+    gone = False
     async with ctx.db.transaction() as c:
         if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
             return
@@ -55,9 +58,12 @@ async def _left(ctx: Context, event: IncomingEvent, *, is_bot: bool) -> None:
             return
         if is_bot:
             # unreachable chat: no farewell; subscriptions go with the registration
-            await ctx.services.unregister_chat(c, event.chat_id, farewell=False)
+            result = await ctx.services.unregister_chat(c, event.chat_id, farewell=False)
+            gone = result.generation != 0
         elif event.left_user_id is not None:
             # only this chat's subscription; a mere restriction change carries no left_user_id
             await ctx.services.unsubscribe(c, event.chat_id, event.left_user_id)
         else:
             await mark_ignored(c, ctx, event.update_id)
+    if gone:
+        await ctx.delivery.sync_chat_menu(event.chat_id)

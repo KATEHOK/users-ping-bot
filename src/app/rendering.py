@@ -62,6 +62,12 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "chats_empty": ("No registered chats.", "\u0417\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0445 \u0447\u0430\u0442\u043e\u0432 \u043d\u0435\u0442."),
     "admins_empty": ("No admins.", "\u0410\u0434\u043c\u0438\u043d\u043e\u0432 \u043d\u0435\u0442."),
     "startup_removed": ("Removed: {ids}.", "\u0421\u043d\u044f\u0442\u043e: {ids}."),
+    # bot menu entries in a registered group (short: shown in the "/" suggestions)
+    "menu_all": ("Ping all subscribers", "\u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445 \u043f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u043e\u0432"),
+    "menu_on": ("Subscribe", "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f"),
+    "menu_off": ("Unsubscribe", "\u041e\u0442\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f"),
+    "menu_help": ("Help", "\u0421\u043f\u0440\u0430\u0432\u043a\u0430"),
+    "menu_usage": ("Command syntax", "\u0421\u0438\u043d\u0442\u0430\u043a\u0441\u0438\u0441 \u043a\u043e\u043c\u0430\u043d\u0434"),
     # command summaries, one per listed command
     "cmd_chat_register": ("Register this chat.", "\u0417\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0447\u0430\u0442."),
     "cmd_chat_unregister": ("Unregister this chat.", "\u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e \u0447\u0430\u0442\u0430."),
@@ -90,6 +96,14 @@ def t(key: str, lang: Lang, **kw: object) -> str:
     pair = _CATALOG[key]
     template = pair[1] if lang == "ru" else pair[0]
     return template.format(**{k: esc(str(v)) for k, v in kw.items()})
+
+
+MENU_COMMANDS = ("all", "on", "off", "help", "usage")
+
+
+def menu_commands(lang: Lang) -> list[tuple[str, str]]:
+    """(command, description) pairs for the group command menu."""
+    return [(name, t(f"menu_{name}", lang)) for name in MENU_COMMANDS]
 
 
 def mention(user_id: int, display_name: str | None) -> str:

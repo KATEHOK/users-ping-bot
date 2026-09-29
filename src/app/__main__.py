@@ -105,6 +105,13 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
     return removed
 
 
+async def sync_menus(ctx: Context, extra: list[int]) -> None:
+    """Command menu of every known chat: registered -> set, otherwise delete."""
+    async with ctx.db.reader() as c:
+        known = await ctx.services.known_chat_ids(c)
+    await ctx.delivery.sync_chat_menus([*known, *extra])
+
+
 async def _queue_interrupted_notice(ctx: Context, removed: list[int], started_at: str) -> None:
     """Root is told about chats removed by an interrupted check, via the outbox.
 
@@ -204,6 +211,9 @@ async def serve(
         removed = await reconcile_chats(ctx, transport)
         if stop.is_set():
             return 0  # signalled during reconciliation: no report, pruning or loops
+        await sync_menus(ctx, removed)
+        if stop.is_set():
+            return 0  # signalled during the menu sync
         await send_startup_report(ctx, removed)
         await prune_once(ctx)
 

@@ -6,6 +6,7 @@ place aiogram types are touched, so the rest of the app stays testable without a
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Literal
 
 from aiogram import Bot, exceptions, types
@@ -81,6 +82,21 @@ class AiogramTransport:
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=thread_id,
             )
+        except Exception as exc:
+            raise map_error(exc) from None
+
+    async def set_chat_commands(self, chat_id: int, commands: Sequence[tuple[str, str]]) -> None:
+        try:
+            await self._bot.set_my_commands(
+                [types.BotCommand(command=c, description=d) for c, d in commands],
+                scope=types.BotCommandScopeChat(chat_id=chat_id),
+            )
+        except Exception as exc:
+            raise map_error(exc) from None
+
+    async def delete_chat_commands(self, chat_id: int) -> None:
+        try:
+            await self._bot.delete_my_commands(scope=types.BotCommandScopeChat(chat_id=chat_id))
         except Exception as exc:
             raise map_error(exc) from None
 

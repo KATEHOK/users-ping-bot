@@ -405,6 +405,14 @@ class Services:
         row = await cursor.fetchone()
         return row[0] if row is not None else None
 
+    async def known_chat_ids(self, c: aiosqlite.Connection) -> list[int]:
+        """Every chat id the DB has seen: registered, migrated away from, or an outbox target."""
+        cursor = await c.execute(
+            "SELECT chat_id FROM chats UNION SELECT old_chat_id FROM chat_aliases "
+            "UNION SELECT target_id FROM outbox WHERE target_kind = 'chat' ORDER BY 1"
+        )
+        return [r[0] for r in await cursor.fetchall()]
+
     async def remove_chat(self, c: aiosqlite.Connection, chat_id: int) -> RemoveChatResult:
         # only this chat; the registrar keeps their role and other chats
         canonical = await self.resolve_chat_id(c, chat_id)
