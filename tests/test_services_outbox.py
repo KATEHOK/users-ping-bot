@@ -256,7 +256,10 @@ async def test_farewell_payload_carries_chat_language(db: Database):
         await services.unregister_chat(c, -200)
     async with db.reader() as c:
         events = await services.due_events(c, "9999-01-01T00:00:00+00:00")
-    assert {e.target_id: e.payload for e in events} == {-100: {"lang": "ru"}, -200: {"lang": "en"}}
+    assert {e.target_id: e.payload for e in events} == {
+        -100: {"lang": "ru", "owners": [1]},
+        -200: {"lang": "en", "owners": [1]},
+    }
 
 
 async def test_unregister_without_farewell_queues_nothing(db: Database):

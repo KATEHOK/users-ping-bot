@@ -31,13 +31,16 @@ def _leading_command(
     return name.lower(), text[length:]
 
 
-# Short group forms: /all, /on, /off, /help, /usage. Words after them are the args.
+# Short group forms; words after them are the args.
 _GROUP_ALIASES: dict[str, Cmd] = {
     "all": Cmd.PING,
     "on": Cmd.NOTIFY_ON,
     "off": Cmd.NOTIFY_OFF,
     "help": Cmd.HELP,
     "usage": Cmd.HELP,
+    "list": Cmd.LIST,
+    "register": Cmd.CHAT_REGISTER,
+    "unregister": Cmd.CHAT_UNREGISTER,
 }
 
 
@@ -51,6 +54,9 @@ def parse_group_command(
     if leading is None:
         return None
     name, rest = leading
+    if name == "lang":
+        words = rest.split()
+        return ParsedCommand(Cmd.LANG, tuple(words)) if words else ParsedCommand(Cmd.USAGE, ("lang",))
     if name in _GROUP_ALIASES:
         return ParsedCommand(_GROUP_ALIASES[name], tuple(rest.split()))
     if name != "upb":
@@ -70,7 +76,13 @@ def parse_group_command(
         if len(w) >= 2 and w[1] == "unregister":
             return ParsedCommand(Cmd.CHAT_UNREGISTER, tuple(words[2:]))
         return usage()
+    if w[0] == "register":
+        return ParsedCommand(Cmd.CHAT_REGISTER, tuple(words[1:]))
+    if w[0] == "unregister":
+        return ParsedCommand(Cmd.CHAT_UNREGISTER, tuple(words[1:]))
     if w[0] == "notify":
+        if len(w) >= 2 and w[1] == "list":
+            return ParsedCommand(Cmd.LIST, tuple(words[2:]))
         if len(w) >= 2 and w[1] == "on":
             return ParsedCommand(Cmd.NOTIFY_ON, tuple(words[2:]))
         if len(w) >= 2 and w[1] == "off":

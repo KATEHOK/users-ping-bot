@@ -85,18 +85,26 @@ class AiogramTransport:
         except Exception as exc:
             raise map_error(exc) from None
 
-    async def set_chat_commands(self, chat_id: int, commands: Sequence[tuple[str, str]]) -> None:
+    @staticmethod
+    def _scope(chat_id: int, user_id: int | None) -> types.BotCommandScopeUnion:
+        if user_id is None:
+            return types.BotCommandScopeChat(chat_id=chat_id)
+        return types.BotCommandScopeChatMember(chat_id=chat_id, user_id=user_id)
+
+    async def set_chat_commands(
+        self, chat_id: int, commands: Sequence[tuple[str, str]], *, user_id: int | None = None
+    ) -> None:
         try:
             await self._bot.set_my_commands(
                 [types.BotCommand(command=c, description=d) for c, d in commands],
-                scope=types.BotCommandScopeChat(chat_id=chat_id),
+                scope=self._scope(chat_id, user_id),
             )
         except Exception as exc:
             raise map_error(exc) from None
 
-    async def delete_chat_commands(self, chat_id: int) -> None:
+    async def delete_chat_commands(self, chat_id: int, *, user_id: int | None = None) -> None:
         try:
-            await self._bot.delete_my_commands(scope=types.BotCommandScopeChat(chat_id=chat_id))
+            await self._bot.delete_my_commands(scope=self._scope(chat_id, user_id))
         except Exception as exc:
             raise map_error(exc) from None
 

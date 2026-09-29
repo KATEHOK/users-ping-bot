@@ -152,7 +152,7 @@ class RecordingTransport:
         self._fail_chats: dict[int, Exception] = {}
         self._probe_results: dict[int, Exception] = {}
         self.probes: list[int] = []
-        # menu calls: {"op": "set"|"delete", "chat_id", "commands"}
+        # menu calls: {"op": "set"|"delete", "chat_id", "user_id" (None: chat scope), "commands"}
         self.menu_calls: list[dict[str, Any]] = []
         self._menu_raise_queue: list[Exception] = []
         self._menu_fail_all: Exception | None = None
@@ -181,12 +181,16 @@ class RecordingTransport:
         if self._menu_fail_all is not None:
             raise self._menu_fail_all
 
-    async def set_chat_commands(self, chat_id: int, commands) -> None:
-        self.menu_calls.append({"op": "set", "chat_id": chat_id, "commands": list(commands)})
+    async def set_chat_commands(self, chat_id: int, commands, *, user_id: int | None = None) -> None:
+        self.menu_calls.append(
+            {"op": "set", "chat_id": chat_id, "user_id": user_id, "commands": list(commands)}
+        )
         self._menu_maybe_raise()
 
-    async def delete_chat_commands(self, chat_id: int) -> None:
-        self.menu_calls.append({"op": "delete", "chat_id": chat_id, "commands": None})
+    async def delete_chat_commands(self, chat_id: int, *, user_id: int | None = None) -> None:
+        self.menu_calls.append(
+            {"op": "delete", "chat_id": chat_id, "user_id": user_id, "commands": None}
+        )
         self._menu_maybe_raise()
 
     def raise_next(self, exc: Exception) -> None:

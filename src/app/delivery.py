@@ -82,12 +82,14 @@ class Transport(Protocol):
         AmbiguousSend otherwise."""
         ...
 
-    async def set_chat_commands(self, chat_id: int, commands: Sequence[tuple[str, str]]) -> None:
-        """setMyCommands for this chat's scope only: (command, description) pairs."""
+    async def set_chat_commands(
+        self, chat_id: int, commands: Sequence[tuple[str, str]], *, user_id: int | None = None
+    ) -> None:
+        """setMyCommands for this chat's scope (or one member's in it): (command, description) pairs."""
         ...
 
-    async def delete_chat_commands(self, chat_id: int) -> None:
-        """deleteMyCommands for this chat's scope only."""
+    async def delete_chat_commands(self, chat_id: int, *, user_id: int | None = None) -> None:
+        """deleteMyCommands for this chat's scope (or one member's in it)."""
         ...
 
 
@@ -228,48 +230,105 @@ class Delivery:
 
     # --- command menu ---
 
-    async def sync_chat_menu(self, chat_id: int, *, single_attempt: bool = False) -> bool:
-        """Make the chat's command menu match the DB: set if registered, else delete.
+    async def sync_chat_menu(
+        self, chat_id: int, *, single_attempt: bool = False, users: Sequence[int] = ()
+    ) -> bool:
+        """Make the chat's command menus match the DB.
 
+        Active chat: the common menu for everyone, the owner menu for root and the registrar.
+        Inactive: the chat menu is deleted; each of `users` (candidates whose member menu may
+        be stale) gets the register menu if still staff, else none. In an active chat a
+        candidate who is not an owner loses the member menu.
         Idempotent and never raises (except Unauthorized): failures are logged by code.
         `single_attempt`: no 429 wait or retry, for callers that must not block.
-        True if the menu now matches the state.
+        True if every menu now matches the state.
         """
-        return await self._sync_menu(chat_id, MAX_MENU_ATTEMPTS if not single_attempt else 1)
+        return await self._sync_menu(
+            chat_id, MAX_MENU_ATTEMPTS if not single_attempt else 1, tuple(users)
+        )
 
-    async def sync_chat_menus(self, chat_ids: Sequence[int], *, single_attempt: bool = False) -> None:
+    async def sync_chat_menus(
+        self, chat_ids: Sequence[int], *, single_attempt: bool = False, users: Sequence[int] = ()
+    ) -> None:
         for chat_id in dict.fromkeys(chat_ids):
             if self.stop.is_set():
                 return
-            await self.sync_chat_menu(chat_id, single_attempt=single_attempt)
+            await self.sync_chat_menu(chat_id, single_attempt=single_attempt, users=users)
 
-    async def _sync_menu(self, chat_id: int, max_attempts: int) -> bool:
+    async def _menu_plan(
+        self, chat_id: int, users: tuple[int, ...]
+    ) -> tuple[bool, list[tuple[int | None, list[tuple[str, str]] | None]]]:
+        """(chat active, [(user_id or None for the chat scope, commands or None = delete)])."""
+        async with self._db.reader() as c:
+            chat = await self._services.get_chat(c, chat_id)
+            svc = self._services
+            if chat is not None:
+                plan = [(None, rendering.menu_commands(chat.lang))]
+                owners: list[int] = []
+                root_id = await svc.get_root(c)
+                if root_id is not None:
+                    owners.append(root_id)
+                if await svc.get_role(c, chat.registered_by) is not None:
+                    owners.append(chat.registered_by)
+                owners = list(dict.fromkeys(owners))
+                plan += [(u, rendering.owner_menu_commands(chat.lang)) for u in owners]
+                plan += [(u, None) for u in dict.fromkeys(users) if u not in owners]
+                return True, plan
+            plan = [(None, None)]
+            for u in dict.fromkeys(users):
+                if await svc.get_role(c, u) is None:
+                    plan.append((u, None))
+                else:
+                    lang = await svc.get_user_lang(c, u)
+                    plan.append((u, rendering.register_menu_commands(lang)))
+            return False, plan
+
+    async def _sync_menu(self, chat_id: int, max_attempts: int, users: tuple[int, ...]) -> bool:
         try:
-            async with self._db.reader() as c:
-                chat = await self._services.get_chat(c, chat_id)
+            active, plan = await self._menu_plan(chat_id, users)
         except Exception as exc:
             logger.error("menu_state_error exc=%s", type(exc).__name__)
             return False
-        code = "menu_set" if chat is not None else "menu_delete"
+        ok = True
+        for user_id, commands in plan:
+            done = await self._menu_call(chat_id, user_id, commands, active, max_attempts)
+            if done is None:
+                return True  # the chat moved: the migration synced both ids
+            if not done:
+                ok = False
+                if user_id is None:
+                    break  # the chat itself is out of reach: member menus would fail too
+        return ok
+
+    async def _menu_call(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        commands: list[tuple[str, str]] | None,
+        active: bool,
+        max_attempts: int,
+    ) -> bool | None:
+        """One set/delete with the 429 policy. None: the chat migrated and was handled."""
+        code = "menu_set" if commands is not None else "menu_delete"
         attempts = 0
         while True:
             attempts += 1
             try:
-                if chat is not None:
-                    await self._transport.set_chat_commands(chat_id, rendering.menu_commands(chat.lang))
+                if commands is not None:
+                    await self._transport.set_chat_commands(chat_id, commands, user_id=user_id)
                 else:
-                    await self._transport.delete_chat_commands(chat_id)
+                    await self._transport.delete_chat_commands(chat_id, user_id=user_id)
                 return True
             except RateLimited as exc:
                 if attempts >= max_attempts or exc.retry_after > MENU_MAX_WAIT:
-                    _log_code(f"{code}_retries_exhausted", chat_id=chat_id)
+                    _log_code(f"{code}_retries_exhausted", chat_id=chat_id, user_id=user_id)
                     return False
                 if await wait_or_stop(self._clock, self.stop, exc.retry_after):
-                    _log_code(f"{code}_stopped", chat_id=chat_id)
+                    _log_code(f"{code}_stopped", chat_id=chat_id, user_id=user_id)
                     return False
             except ChatMigrated as exc:
-                _log_code(f"{code}_chat_migrated", chat_id=chat_id)
-                if chat is None:
+                _log_code(f"{code}_chat_migrated", chat_id=chat_id, user_id=user_id)
+                if not active:
                     return True  # an upgraded group has no menu to show
                 try:
                     # syncs both ids when the registration moved
@@ -279,13 +338,13 @@ class Delivery:
                 except Exception as err:
                     logger.error("migration_failed exc=%s", type(err).__name__)
                     return False
-                return True
+                return None
             except AmbiguousSend:
-                _log_code(f"{code}_ambiguous", chat_id=chat_id)
+                _log_code(f"{code}_ambiguous", chat_id=chat_id, user_id=user_id)
                 return False
             except PermanentSend:
-                # a gone chat or a forbidden bot is expected for a delete
-                _log_code(f"{code}_permanent", chat_id=chat_id)
+                # a gone chat, a forbidden bot or a user who is not in the chat
+                _log_code(f"{code}_permanent", chat_id=chat_id, user_id=user_id)
                 return False
 
     # --- outbox ---
@@ -411,7 +470,9 @@ class Delivery:
             final = outcome.sent or not outcome.retryable or event.attempts + 1 >= OUTBOX_MAX_ATTEMPTS
             if event.event_type == "chat_farewell" and final:
                 # the chat was dropped (maybe by the CLI, which has no transport): drop its menu
-                await self.sync_chat_menu(event.target_id)
+                owners = event.payload.get("owners")
+                users = [u for u in owners if isinstance(u, int)] if isinstance(owners, list) else []
+                await self.sync_chat_menu(event.target_id, users=users)
 
     async def run_outbox_once(self) -> int:
         now_iso = iso(self._clock.now())

@@ -107,10 +107,14 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
 
 
 async def sync_menus(ctx: Context, extra: list[int]) -> None:
-    """Command menu of every known chat: registered -> set, otherwise delete."""
+    """Menus of every known chat: registered -> set, otherwise delete.
+
+    Former roots are checked too: a demoted root may still hold an owner menu.
+    """
     async with ctx.db.reader() as c:
         known = await ctx.services.known_chat_ids(c)
-    await ctx.delivery.sync_chat_menus([*known, *extra])
+        former = await ctx.services.former_root_ids(c)
+    await ctx.delivery.sync_chat_menus([*known, *extra], users=former)
 
 
 async def _queue_interrupted_notice(

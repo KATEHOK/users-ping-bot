@@ -28,6 +28,12 @@ def ent(text: str) -> tuple[tuple[str, int, int], ...]:
         ("/upb list", Cmd.LIST, ()),
         ("/upb help", Cmd.HELP, ()),
         ("/upb usage", Cmd.HELP, ()),
+        ("/upb notify list", Cmd.LIST, ()),
+        ("/upb notify list x", Cmd.LIST, ("x",)),
+        ("/upb register", Cmd.CHAT_REGISTER, ()),
+        ("/upb register extra args", Cmd.CHAT_REGISTER, ("extra", "args")),
+        ("/upb unregister", Cmd.CHAT_UNREGISTER, ()),
+        ("/upb lang ru", Cmd.LANG, ("ru",)),
     ],
 )
 def test_group_command_addressed_forms(text, expected_cmd, expected_args):
@@ -47,7 +53,16 @@ def test_group_command_addressed_forms(text, expected_cmd, expected_args):
         ("/off extra", Cmd.NOTIFY_OFF, ("extra",)),
         ("/help", Cmd.HELP, ()),
         ("/usage", Cmd.HELP, ()),
+        ("/list", Cmd.LIST, ()),
+        ("/list x", Cmd.LIST, ("x",)),
+        ("/register", Cmd.CHAT_REGISTER, ()),
+        ("/register x", Cmd.CHAT_REGISTER, ("x",)),
+        ("/unregister", Cmd.CHAT_UNREGISTER, ()),
+        ("/lang ru", Cmd.LANG, ("ru",)),
+        ("/lang ru extra", Cmd.LANG, ("ru", "extra")),
+        ("/lang", Cmd.USAGE, ("lang",)),
         ("/ALL", Cmd.PING, ()),
+        (f"/register@{BOT}", Cmd.CHAT_REGISTER, ()),
         (f"/all@{BOT}", Cmd.PING, ()),
         (f"/on@{BOT.upper()} x", Cmd.NOTIFY_ON, ("x",)),
     ],
@@ -58,7 +73,15 @@ def test_group_aliases(text, expected_cmd, expected_args):
     assert (parsed.cmd, parsed.args) == (expected_cmd, expected_args)
 
 
-@pytest.mark.parametrize("text", ["/all@other_bot", "/on@other_bot", "/help@other_bot x"])
+@pytest.mark.parametrize("text", [
+        "/all@other_bot",
+        "/on@other_bot",
+        "/help@other_bot x",
+        "/list@other_bot",
+        "/register@other_bot",
+        "/unregister@other_bot",
+        "/lang@other_bot ru",
+    ],)
 def test_group_alias_addressed_to_different_bot_is_none(text):
     assert parse_group_command(text, ent(text), bot_username=BOT) is None
 
@@ -102,7 +125,7 @@ def test_entity_not_at_offset_zero_is_ignored():
 
 
 def test_other_command_name_in_group_is_none():
-    text = "/list"
+    text = "/admin"
     assert parse_group_command(text, ent(text), bot_username=BOT) is None
 
 
@@ -342,3 +365,13 @@ def test_permission_is_separate_from_syntax():
     text = "/admin create 1_000"
     parsed = parse_private_command(text, ent(text), bot_username=BOT)
     assert parsed.cmd is Cmd.ADMIN_CREATE and parsed.args == ("1_000",)
+
+
+@pytest.mark.parametrize("text", ["/list", "/register", "/unregister", "/all", "/on", "/off"])
+def test_group_aliases_are_not_private_commands(text):
+    assert parse_private_command(text, ent(text), bot_username=BOT) is None
+
+
+def test_private_lang_is_unchanged_by_the_group_alias():
+    text = "/lang ru"
+    assert parse_private_command(text, ent(text), bot_username=BOT).cmd is Cmd.P_LANG

@@ -31,11 +31,27 @@ from test_transport_aiogram import CHAT, TOKEN, ScriptedSession
 ROOT = 10
 ADMIN = 1
 CHAT_ID = 500
-COMMANDS = ["all", "on", "off", "help", "usage"]
+COMMANDS = ["all", "on", "off", "list", "help", "usage"]
+OWNER_COMMANDS = [*COMMANDS, "unregister", "lang"]
+REGISTER_COMMANDS = ["register", "help"]
 
 
 def _names(call):
     return [name for name, _desc in call["commands"]]
+
+
+def _chat_ops(transport):
+    """(op, chat_id) of the chat-scope calls only."""
+    return [(c["op"], c["chat_id"]) for c in transport.menu_calls if c["user_id"] is None]
+
+
+def _member_ops(transport):
+    """{(chat_id, user_id): commands or None} of the member-scope calls (the last one wins)."""
+    return {
+        (c["chat_id"], c["user_id"]): c["commands"]
+        for c in transport.menu_calls
+        if c["user_id"] is not None
+    }
 
 
 async def _world(db, services):
@@ -50,16 +66,52 @@ async def _say(ctx, text, uid, user, chat_id=CHAT_ID):
 # --- handlers ---
 
 
-async def test_register_sets_five_commands_in_the_chat_language(db):
+async def test_register_sets_the_chat_menu_in_the_chat_language(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await _say(ctx, "/upb chat register", 1, ADMIN)
-    assert len(transport.menu_calls) == 1
     call = transport.menu_calls[0]
-    assert call["op"] == "set" and call["chat_id"] == CHAT_ID
+    assert call["op"] == "set" and call["chat_id"] == CHAT_ID and call["user_id"] is None
     assert _names(call) == COMMANDS
     assert call["commands"] == rendering.menu_commands("en")
     assert len(transport.calls) == 1  # the welcome reply is still sent
+
+
+async def test_register_gives_root_and_the_registrar_the_owner_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await _say(ctx, "/register", 1, ADMIN)
+    owners = _member_ops(transport)
+    assert set(owners) == {(CHAT_ID, ROOT), (CHAT_ID, ADMIN)}
+    for commands in owners.values():
+        assert [n for n, _ in commands] == OWNER_COMMANDS
+        assert commands == rendering.owner_menu_commands("en")
+    assert len(transport.menu_calls) == 3  # chat scope + two owners
+
+
+async def test_root_registering_is_not_given_the_menu_twice(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await _say(ctx, "/register", 1, ROOT)
+    assert [(c["op"], c["user_id"]) for c in transport.menu_calls] == [("set", None), ("set", ROOT)]
+
+
+async def test_a_member_who_is_not_in_the_chat_is_logged_not_raised(db, caplog):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    real = transport.set_chat_commands
+
+    async def set_commands(chat_id, commands, *, user_id=None):
+        await real(chat_id, commands, user_id=user_id)
+        if user_id == ROOT:
+            raise PermanentSend()  # user not found in the chat
+
+    transport.set_chat_commands = set_commands
+    with caplog.at_level(logging.DEBUG):
+        await _say(ctx, "/register", 1, ADMIN)
+    assert (CHAT_ID, ADMIN) in _member_ops(transport)  # the others are still served
+    assert any(r.getMessage().startswith("menu_set_permanent ") for r in caplog.records)
+    assert len(transport.calls) == 1
 
 
 async def test_lang_change_sets_the_menu_again_in_the_new_language(db):
@@ -67,15 +119,30 @@ async def test_lang_change_sets_the_menu_again_in_the_new_language(db):
     await _world(db, services)
     await _say(ctx, "/upb chat register", 1, ADMIN)
     await _say(ctx, "/upb lang ru", 2, ADMIN)
-    assert [c["op"] for c in transport.menu_calls] == ["set", "set"]
-    assert transport.menu_calls[1]["commands"] == rendering.menu_commands("ru")
-    assert transport.menu_calls[1]["commands"] != transport.menu_calls[0]["commands"]
+    first = len(transport.menu_calls)
+    await _say(ctx, "/lang ru", 3, ADMIN)  # the short form syncs too
+    new = transport.menu_calls[first:]
+    assert {(c["user_id"]) for c in new} == {None, ROOT, ADMIN}
+    for c in new:
+        want = rendering.menu_commands("ru") if c["user_id"] is None else rendering.owner_menu_commands("ru")
+        assert c["commands"] == want
+    assert rendering.menu_commands("ru") != rendering.menu_commands("en")
 
 
 async def test_menu_descriptions_fit_the_telegram_limits():
     for lang in ("en", "ru"):
-        for name, desc in rendering.menu_commands(lang):
-            assert 1 <= len(name) <= 32 and 3 <= len(desc) <= 256
+        for build in (
+            rendering.menu_commands, rendering.owner_menu_commands, rendering.register_menu_commands
+        ):
+            for name, desc in build(lang):
+                assert 1 <= len(name) <= 32 and 3 <= len(desc) <= 256 and name == name.lower()
+
+
+async def test_menu_sets_by_rights():
+    for lang in ("en", "ru"):
+        assert [n for n, _ in rendering.menu_commands(lang)] == COMMANDS
+        assert [n for n, _ in rendering.owner_menu_commands(lang)] == OWNER_COMMANDS
+        assert [n for n, _ in rendering.register_menu_commands(lang)] == REGISTER_COMMANDS
 
 
 async def test_group_unregister_deletes_the_menu(db):
@@ -83,9 +150,15 @@ async def test_group_unregister_deletes_the_menu(db):
     await _world(db, services)
     await register_chat(db, services, CHAT_ID, ADMIN)
     await _say(ctx, "/upb chat unregister", 1, ADMIN)
-    assert transport.menu_calls == [
-        {"op": "delete", "chat_id": CHAT_ID, "commands": None}
-    ]
+    assert transport.menu_calls[0] == {
+        "op": "delete", "chat_id": CHAT_ID, "user_id": None, "commands": None
+    }
+    # both owners are still staff: they get the register menu, the chat is free again
+    assert _member_ops(transport) == {
+        (CHAT_ID, ROOT): rendering.register_menu_commands("en"),
+        (CHAT_ID, ADMIN): rendering.register_menu_commands("en"),
+    }
+    assert len(transport.menu_calls) == 3
 
 
 async def test_private_chat_remove_deletes_the_menu(db):
@@ -95,7 +168,7 @@ async def test_private_chat_remove_deletes_the_menu(db):
     await handle_event(
         ctx, private_event(f"/chat remove {CHAT_ID}", update_id=1, user_id=ROOT)
     )
-    assert [(c["op"], c["chat_id"]) for c in transport.menu_calls] == [("delete", CHAT_ID)]
+    assert _chat_ops(transport) == [("delete", CHAT_ID)]
 
 
 async def test_admin_revoke_cascade_deletes_every_dropped_chat(db):
@@ -106,10 +179,13 @@ async def test_admin_revoke_cascade_deletes_every_dropped_chat(db):
     await handle_event(
         ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT)
     )
-    assert sorted((c["op"], c["chat_id"]) for c in transport.menu_calls) == [
-        ("delete", 501),
-        ("delete", 502),
-    ]
+    assert sorted(_chat_ops(transport)) == [("delete", 501), ("delete", 502)]
+    # the revoked admin loses the member menu, root (still staff) may register again
+    assert _member_ops(transport) == {
+        (501, ADMIN): None, (502, ADMIN): None,
+        (501, ROOT): rendering.register_menu_commands("en"),
+        (502, ROOT): rendering.register_menu_commands("en"),
+    }
 
 
 async def test_bot_kicked_deletes_the_menu(db):
@@ -124,6 +200,7 @@ async def test_bot_kicked_deletes_the_menu(db):
         ),
     )
     assert [(c["op"], c["chat_id"]) for c in transport.menu_calls] == [("delete", CHAT_ID)]
+    assert _member_ops(transport) == {}  # the bot is gone: nothing more to reach
 
 
 async def test_bot_left_message_deletes_the_menu_and_a_second_one_is_silent(db):
@@ -172,8 +249,9 @@ async def test_migration_deletes_the_old_id_and_sets_the_new(db, side):
             migrate_from_chat_id=CHAT_ID,
         )
     await handle_event(ctx, event)
-    got = sorted((c["op"], c["chat_id"]) for c in transport.menu_calls)
+    got = sorted(_chat_ops(transport))
     assert got == sorted([("delete", CHAT_ID), ("set", new)])
+    assert set(_member_ops(transport)) == {(new, ROOT), (new, ADMIN)}
 
 
 async def test_migration_found_by_a_failed_reply_syncs_both_ids(db):
@@ -182,7 +260,7 @@ async def test_migration_found_by_a_failed_reply_syncs_both_ids(db):
     await register_chat(db, services, CHAT_ID, ADMIN)
     transport.raise_next(ChatMigrated(-1001))
     await _say(ctx, "/upb list", 1, ADMIN)
-    got = sorted((c["op"], c["chat_id"]) for c in transport.menu_calls)
+    got = sorted(_chat_ops(transport))
     assert got == sorted([("delete", CHAT_ID), ("set", -1001)])
 
 
@@ -352,7 +430,7 @@ async def test_live_migration_found_by_a_menu_call_costs_three_calls(db):
     # set(old) and the best-effort delete(old) both answer with a migrate error
     transport.queue_menu_raises([ChatMigrated(-1001), ChatMigrated(-1001)])
     await ctx.delivery.sync_chat_menu(CHAT_ID)
-    got = [(c["op"], c["chat_id"]) for c in transport.menu_calls]
+    got = _chat_ops(transport)
     assert got == [("set", CHAT_ID), ("delete", CHAT_ID), ("set", -1001)]
 
 
@@ -366,7 +444,7 @@ async def test_live_migration_event_costs_one_delete_and_one_set(db):
         migrate_to_chat_id=-1001,
     )
     await handle_event(ctx, event)
-    got = [(c["op"], c["chat_id"]) for c in transport.menu_calls]
+    got = _chat_ops(transport)
     assert got == [("delete", CHAT_ID), ("set", -1001)]
 
 
@@ -413,6 +491,21 @@ async def test_unauthorized_from_the_startup_menu_sync_exits_with_code_3(db):
     assert code == entry.EXIT_UNAUTHORIZED
 
 
+async def test_unauthorized_from_a_member_scope_call_propagates(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    real = transport.set_chat_commands
+
+    async def set_commands(chat_id, commands, *, user_id=None):
+        if user_id is not None:
+            raise Unauthorized()
+        await real(chat_id, commands, user_id=user_id)
+
+    transport.set_chat_commands = set_commands
+    with pytest.raises(Unauthorized):
+        await handle_event(ctx, group_event("/register", update_id=1, user_id=ADMIN, chat_id=CHAT_ID))
+
+
 # --- root change and joining ---
 
 
@@ -428,8 +521,12 @@ async def test_cli_root_change_drops_the_menu_once_the_farewell_is_done(db, fail
     if fail is not None:
         transport.fail_chat(CHAT_ID, fail)
     await ctx.delivery.run_outbox_once()
-    got = [(c["op"], c["chat_id"]) for c in transport.menu_calls]
-    assert got == [("delete", CHAT_ID)]
+    assert _chat_ops(transport) == [("delete", CHAT_ID)]
+    # the old root is no longer staff, the new one may register the free chat
+    assert _member_ops(transport) == {
+        (CHAT_ID, ROOT): None,
+        (CHAT_ID, 11): rendering.register_menu_commands("en"),
+    }
 
 
 async def test_retryable_farewell_failure_does_not_touch_the_menu_yet(db):
@@ -443,10 +540,10 @@ async def test_retryable_farewell_failure_does_not_touch_the_menu_yet(db):
     assert transport.menu_calls == []
 
 
-def _my_member(uid, *, added):
+def _my_member(uid, *, added, user=ADMIN):
     return make_event(
         kind="my_chat_member", update_id=uid, chat_id=CHAT_ID, chat_type="supergroup",
-        user_id=ADMIN, bot_added=added, text=None,
+        user_id=user, bot_added=added, text=None,
     )
 
 
@@ -454,10 +551,101 @@ async def test_bot_added_to_an_unregistered_group_deletes_a_stale_menu(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await handle_event(ctx, _my_member(1, added=True))
-    assert [(c["op"], c["chat_id"]) for c in transport.menu_calls] == [("delete", CHAT_ID)]
+    assert _chat_ops(transport) == [("delete", CHAT_ID)]
     assert transport.calls == []
     await handle_event(ctx, _my_member(1, added=True))  # a replayed update does nothing
-    assert len(transport.menu_calls) == 1
+    assert len(transport.menu_calls) == 2
+
+
+@pytest.mark.parametrize("adder", [ROOT, ADMIN])
+async def test_staff_adding_the_bot_gets_the_register_menu_in_that_group(db, adder):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    async with db.transaction() as c:
+        await services.set_user_lang(c, adder, "ru")
+    await handle_event(ctx, _my_member(1, added=True, user=adder))
+    assert _member_ops(transport) == {(CHAT_ID, adder): rendering.register_menu_commands("ru")}
+    assert [n for n, _ in _member_ops(transport)[(CHAT_ID, adder)]] == REGISTER_COMMANDS
+    assert _chat_ops(transport) == [("delete", CHAT_ID)]
+
+
+async def test_a_non_staff_adder_gets_no_member_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await handle_event(ctx, _my_member(1, added=True, user=77))
+    assert _member_ops(transport) == {(CHAT_ID, 77): None}
+
+
+async def test_a_former_admin_adding_the_bot_has_the_member_menu_deleted(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    async with db.transaction() as c:
+        await services.revoke_admin(c, ADMIN)
+    await handle_event(ctx, _my_member(1, added=True, user=ADMIN))
+    assert _member_ops(transport) == {(CHAT_ID, ADMIN): None}
+
+
+async def test_adding_the_bot_to_a_registered_chat_syncs_the_owner_menus(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    await handle_event(ctx, _my_member(1, added=True, user=ADMIN))
+    assert _chat_ops(transport) == [("set", CHAT_ID)]
+    assert set(_member_ops(transport)) == {(CHAT_ID, ROOT), (CHAT_ID, ADMIN)}
+    assert _member_ops(transport)[(CHAT_ID, ADMIN)] == rendering.owner_menu_commands("en")
+
+
+async def test_adder_menu_is_replaced_when_someone_else_registers(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await make_admin(db, services, 2)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    await handle_event(ctx, _my_member(1, added=True, user=2))  # 2 is staff, not an owner here
+    assert _member_ops(transport)[(CHAT_ID, 2)] is None
+
+
+async def test_admin_revoke_of_a_registrar_reaches_the_member_scopes_once(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await _say(ctx, "/register", 1, ADMIN)
+    transport.menu_calls.clear()
+    await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=2, user_id=ROOT))
+    ops = [(c["op"], c["chat_id"], c["user_id"]) for c in transport.menu_calls]
+    assert sorted(ops, key=str) == sorted(
+        [("delete", CHAT_ID, None), ("delete", CHAT_ID, ADMIN), ("set", CHAT_ID, ROOT)], key=str
+    )
+
+
+async def test_member_scope_sync_makes_one_attempt_per_call_on_command_paths(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    await handle_event(ctx, _my_member(1, added=True))
+    transport.menu_calls.clear()
+    real = transport.set_chat_commands
+
+    async def set_commands(chat_id, commands, *, user_id=None):
+        await real(chat_id, commands, user_id=user_id)
+        if user_id is not None:
+            raise RateLimited(1.0)
+
+    transport.set_chat_commands = set_commands
+    await handle_event(ctx, _my_member(2, added=True, user=ROOT))
+    assert [c["user_id"] for c in transport.menu_calls] == [None, ROOT]  # one attempt each
+    assert slept == []
+
+    transport.menu_calls.clear()
+    transport.set_chat_commands = real
+    transport.fail_menu(RateLimited(1.0))
+    await handle_event(ctx, _my_member(3, added=True, user=ROOT))
+    assert len(transport.menu_calls) == 1  # the chat scope is out of reach: members are skipped
+    assert slept == []
 
 
 async def test_join_triggered_delete_makes_one_attempt_and_never_waits_on_429(db):
@@ -472,7 +660,7 @@ async def test_join_triggered_delete_makes_one_attempt_and_never_waits_on_429(db
     await _world(db, services)
     transport.fail_menu(RateLimited(7.0))
     await handle_event(ctx, _my_member(1, added=True))
-    assert len(transport.menu_calls) == 1
+    assert len(transport.menu_calls) == 1  # one attempt, no wait
     assert slept == []
 
 
@@ -521,8 +709,49 @@ async def test_startup_sync_sets_active_and_deletes_known_inactive(db):
     async with db.transaction() as c:
         await services.migrate_chat(c, -2, -200)  # -2 is now a known inactive id
     await entry.sync_menus(ctx, [-9])  # removed by reconciliation
-    got = {(c["chat_id"]): c["op"] for c in transport.menu_calls}
+    got = {c["chat_id"]: c["op"] for c in transport.menu_calls if c["user_id"] is None}
     assert got == {-1: "set", -200: "set", -9: "delete"}  # the migrated-away id is skipped
+    assert set(_member_ops(transport)) == {(-1, ROOT), (-1, ADMIN), (-200, ROOT), (-200, ADMIN)}
+
+
+async def test_startup_sync_takes_a_former_root_from_the_outbox(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await make_admin(db, services, ADMIN)
+    await register_chat(db, services, -1, ADMIN)
+    async with db.transaction() as c:  # the CLI: no transport, no menu calls
+        await services.touch_user(c, 11)
+        await services.set_root(c, 11)
+    await entry.sync_menus(ctx, [])
+    members = _member_ops(transport)
+    assert members[(-1, ROOT)] is None  # demoted: the owner menu goes
+    assert members[(-1, 11)] == rendering.owner_menu_commands("en")  # the new root gets it
+    assert members[(-1, ADMIN)] == rendering.owner_menu_commands("en")
+
+
+async def test_startup_sync_does_not_duplicate_a_registrar_who_was_root(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await register_chat(db, services, -1, ROOT)
+    async with db.transaction() as c:
+        await services.touch_user(c, 11)
+        await services.set_root(c, 11)  # drops the chat registered by the old root
+    async with db.transaction() as c:
+        await services.set_root(c, ROOT)  # and back
+    await register_chat(db, services, -2, ROOT)
+    await entry.sync_menus(ctx, [])
+    ops = [(c["chat_id"], c["user_id"], c["op"]) for c in transport.menu_calls if c["chat_id"] == -2]
+    assert ops.count((-2, ROOT, "set")) == 1
+
+
+async def test_startup_sync_gives_owners_their_menu_in_the_chat_language(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, -1, ADMIN)
+    async with db.transaction() as c:
+        await services.set_chat_lang(c, -1, "ru")
+    await entry.sync_menus(ctx, [])
+    assert _member_ops(transport)[(-1, ADMIN)] == rendering.owner_menu_commands("ru")
 
 
 async def test_startup_sync_stops_early_on_the_stop_signal(db):
@@ -548,7 +777,7 @@ async def test_serve_syncs_menus_after_reconciliation(db):
         5,
     )
     assert code == 0
-    got = {c["chat_id"]: c["op"] for c in transport.menu_calls}
+    got = {c["chat_id"]: c["op"] for c in transport.menu_calls if c["user_id"] is None}
     assert got == {-1: "set", -2: "delete"}
 
 
@@ -561,9 +790,9 @@ async def test_signal_during_the_startup_menu_sync_still_sends_the_report(db):
     stop = asyncio.Event()
     real_set = transport.set_chat_commands
 
-    async def set_and_signal(chat_id, commands):
+    async def set_and_signal(chat_id, commands, *, user_id=None):
         stop.set()  # a stop arrives while the menus are being synced
-        await real_set(chat_id, commands)
+        await real_set(chat_id, commands, user_id=user_id)
 
     transport.set_chat_commands = set_and_signal
     code = await asyncio.wait_for(
@@ -600,6 +829,16 @@ async def test_real_transport_uses_the_chat_scope_only(bot_and_session):
         {"command": "on", "description": "Subscribe"},
     ]
     assert p2["scope"] == {"type": "chat", "chat_id": CHAT}
+
+
+async def test_real_transport_member_scope(bot_and_session):
+    transport, session = bot_and_session
+    session.replies += [(200, {"ok": True, "result": True})] * 2
+    await transport.set_chat_commands(CHAT, [("register", "Register")], user_id=77)
+    await transport.delete_chat_commands(CHAT, user_id=77)
+    (_n1, p1), (_n2, p2) = session.requests
+    assert p1["scope"] == {"type": "chat_member", "chat_id": CHAT, "user_id": 77}
+    assert p2["scope"] == {"type": "chat_member", "chat_id": CHAT, "user_id": 77}
 
 
 async def test_real_transport_maps_errors(bot_and_session):

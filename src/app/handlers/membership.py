@@ -49,7 +49,7 @@ async def handle_membership(ctx: Context, event: IncomingEvent) -> None:
 
 
 async def _joined(ctx: Context, event: IncomingEvent) -> None:
-    """The bot joined a group: drop a stale menu left from an earlier registration."""
+    """The bot joined a group: drop a stale menu, give the adder (if staff) the register menu."""
     from . import mark_ignored
 
     async with ctx.db.transaction() as c:
@@ -59,7 +59,8 @@ async def _joined(ctx: Context, event: IncomingEvent) -> None:
         await mark_ignored(c, ctx, event.update_id)
     if canonical == event.chat_id and event.chat_type in ("group", "supergroup"):
         # best effort: an outsider's join must not hold up update processing on a 429
-        await ctx.delivery.sync_chat_menu(event.chat_id, single_attempt=True)
+        users = [event.user_id] if event.user_id is not None else []
+        await ctx.delivery.sync_chat_menu(event.chat_id, single_attempt=True, users=users)
 
 
 async def _left(ctx: Context, event: IncomingEvent, *, is_bot: bool) -> None:

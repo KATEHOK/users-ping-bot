@@ -19,6 +19,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
     parsed = commands.parse_private_command(event.text, event.entities, bot_username=ctx.bot_username)
     replies: list[str] = []
     menu: list[int] = []  # chats unregistered by this command
+    menu_users: list[int] = []  # their owners: member menus to refresh
 
     async with ctx.db.transaction() as c:
         if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
@@ -49,7 +50,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
         except ValueError:
             replies.append(t("bad_args", lang, syntax=access.spec(cmd).syntax))
         else:
-            replies = await _execute(ctx, c, cmd, arg, parsed.args, actor, lang, menu)
+            replies = await _execute(ctx, c, cmd, arg, parsed.args, actor, lang, menu, menu_users)
 
         if not replies:
             await mark_ignored(c, ctx, event.update_id)
@@ -59,10 +60,12 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
         ):
             break
-    await ctx.delivery.sync_chat_menus(menu, single_attempt=True)
+    await ctx.delivery.sync_chat_menus(menu, single_attempt=True, users=menu_users)
 
 
-async def _execute(ctx, c, cmd: Cmd, arg, args, actor, lang, menu: list[int]) -> list[str]:
+async def _execute(
+    ctx, c, cmd: Cmd, arg, args, actor, lang, menu: list[int], menu_users: list[int]
+) -> list[str]:
     svc = ctx.services
 
     if cmd is Cmd.P_HELP:
@@ -85,6 +88,7 @@ async def _execute(ctx, c, cmd: Cmd, arg, args, actor, lang, menu: list[int]) ->
         if not result.revoked:
             return [t("admin_absent", lang, id=arg)]
         menu.extend(result.chat_ids)
+        menu_users.extend(result.owner_ids)
         return [t("admin_removed", lang, id=arg, n=len(result.chat_ids))]
 
     if cmd is Cmd.ADMIN_LIST:
@@ -103,6 +107,7 @@ async def _execute(ctx, c, cmd: Cmd, arg, args, actor, lang, menu: list[int]) ->
         result = await svc.remove_chat(c, arg)  # resolves an aliased (migrated) id itself
         if result.chat_ids:
             menu.extend(result.chat_ids)
+            menu_users.extend(result.owner_ids)
             return [t("chat_removed", lang, chat_id=result.chat_ids[0])]
         return [t("chat_absent", lang, chat_id=arg)]
 

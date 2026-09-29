@@ -50,6 +50,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
     ping: list[SubscriberRef] | None = None
     ping_key: tuple[int, int] | None = None
     menu: list[int] = []  # chats whose command menu may have changed
+    menu_users: list[int] = []  # owners whose member menu may be stale after an unregister
 
     async with ctx.db.transaction() as c:
         if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
@@ -90,8 +91,9 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             replies.append(rendering.welcome_text(lang) if result.created else t("already_registered", lang))
             menu.append(chat_id)
         elif cmd is Cmd.CHAT_UNREGISTER:
-            await ctx.services.unregister_chat(c, chat_id)  # farewell goes through the outbox
+            result = await ctx.services.unregister_chat(c, chat_id)  # farewell goes via the outbox
             menu.append(chat_id)
+            menu_users.extend(result.owner_ids)
         elif cmd is Cmd.NOTIFY_ON:
             sub = await ctx.services.subscribe(c, chat_id, event.user_id)
             replies.append(t("subscribed" if sub.created else "already_subscribed", lang))
@@ -133,4 +135,4 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
         ):
             break
-    await send.sync_chat_menus(menu, single_attempt=True)
+    await send.sync_chat_menus(menu, single_attempt=True, users=menu_users)

@@ -96,7 +96,7 @@ async def test_help_by_role_with_registration_hint(db):
     admin_text, root_text = _texts(transport)
     assert "/chat list" in admin_text and "/admin create" not in admin_text
     assert "/admin create" in root_text and "/chat remove" in root_text
-    assert "/upb chat register" in admin_text
+    assert "<code>/register</code>" in admin_text
 
 
 async def test_lang_persists_per_user_and_replies_in_it(db):
