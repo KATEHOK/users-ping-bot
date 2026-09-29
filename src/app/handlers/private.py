@@ -59,7 +59,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
         ):
             break
-    await ctx.delivery.sync_chat_menus(menu)
+    await ctx.delivery.sync_chat_menus(menu, single_attempt=True)
 
 
 async def _execute(ctx, c, cmd: Cmd, arg, args, actor, lang, menu: list[int]) -> list[str]:

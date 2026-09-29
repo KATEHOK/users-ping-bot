@@ -133,4 +133,4 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
         ):
             break
-    await send.sync_chat_menus(menu)
+    await send.sync_chat_menus(menu, single_attempt=True)

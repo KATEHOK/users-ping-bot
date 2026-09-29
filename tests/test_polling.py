@@ -1,6 +1,7 @@
 """aiogram adapter and polling loop, startup reconciliation, exit policy."""
 
 import asyncio
+import json
 import logging
 import signal
 from datetime import datetime, timedelta, timezone
@@ -1089,7 +1090,9 @@ async def _serve_with_gone_chat(db, send_fails, chats_gone=True):
 
 async def test_lost_startup_report_queues_the_removed_chats_notice(db):
     rows = await _serve_with_gone_chat(db, send_fails=True)
-    assert len(rows) == 1 and rows[0][1] == 10 and "-1" in rows[0][2]
+    assert len(rows) == 1 and rows[0][1] == 10
+    payload = json.loads(rows[0][2])
+    assert payload["chat_ids"] == [-1] and payload["report_lost"] is True
 
 
 async def test_delivered_startup_report_queues_no_notice(db):
@@ -1103,9 +1106,86 @@ async def test_lost_startup_report_without_removed_chats_queues_no_notice(db):
 async def test_startup_report_returns_whether_everything_was_delivered(db):
     ctx, services, transport, _c = mk_ctx(db)
     await make_root(db, services, 10, contact=True)
-    assert await entry.send_startup_report(ctx, []) is True
+    assert await entry.send_startup_report(ctx, []) == (True, True)
     transport.queue_raises([PermanentSend()])
-    assert await entry.send_startup_report(ctx, []) is False
+    assert await entry.send_startup_report(ctx, []) == (False, False)
+
+
+class _FailNthSend(RecordingTransport):
+    """Fails the n-th send (1-based) with exc; `on_fail` runs first."""
+
+    def __init__(self, n, exc, on_fail=None):
+        super().__init__()
+        self._n, self._exc, self._on_fail = n, exc, on_fail
+
+    async def send_message(self, chat_id, text, **kw):
+        await super().send_message(chat_id, text, **kw)
+        if len(self.calls) == self._n:
+            if self._on_fail:
+                self._on_fail()
+            raise self._exc
+
+
+async def _serve_with_long_report(db, transport_factory, stop=None, lang="en"):
+    """Many chats so the report has several parts; chat -1 is gone."""
+    clock, stop = RecordingClock(), stop or asyncio.Event()
+    ctx, services, _t, _c = mk_ctx(db, clock)
+    await make_root(db, services, 10, contact=True)
+    async with db.transaction() as c:
+        await c.execute("UPDATE users SET lang = ? WHERE user_id = 10", (lang,))
+    for n in range(1, 260):
+        await register_chat(db, services, -n, 10, f"Chat number {n} " + "x" * 20)
+    transport = transport_factory(stop)
+    transport.set_probe(-1, PermanentSend())
+    assert await _serve(db, FakeBot([[_bare(1)]], stop), clock, stop, transport) == 0
+    return transport, await _notices(db)
+
+
+async def test_report_lost_after_the_ids_part_queues_no_notice(db):
+    transport, rows = await _serve_with_long_report(
+        db, lambda stop: _FailNthSend(2, PermanentSend())
+    )
+    assert len(transport.calls) == 2 and "-1" in transport.calls[0]["text"]  # ids in part one
+    assert rows == []
+
+
+async def test_report_lost_before_the_ids_part_queues_the_report_lost_notice(db):
+    transport, rows = await _serve_with_long_report(
+        db, lambda stop: _FailNthSend(1, PermanentSend()), lang="ru"
+    )
+    (row,) = rows
+    assert json.loads(row[2])["report_lost"] is True
+    clock = FakeClock()
+    ctx, _s, transport2, _c = mk_ctx(db, clock)
+    await ctx.delivery.run_outbox_once()
+    assert transport2.calls[0]["text"] == (
+        "\u041e\u0442\u0447\u0451\u0442 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 "
+        "\u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d. "
+        "\u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 "
+        "\u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: -1."
+    )
+
+
+async def test_report_lost_text_in_english(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, 10, contact=True)
+    async with db.transaction() as c:
+        await c.execute("UPDATE users SET lang = 'en' WHERE user_id = 10")
+    await entry._queue_interrupted_notice(ctx, [-1, -2], "t", report_lost=True)
+    await ctx.delivery.run_outbox_once()
+    assert transport.calls[0]["text"] == (
+        "Startup report was not delivered. Chats removed on check: -1, -2."
+    )
+
+
+async def test_stop_during_the_report_429_wait_still_queues_the_notice(db):
+    stop = asyncio.Event()
+    transport, rows = await _serve_with_long_report(
+        db, lambda s: _FailNthSend(1, RateLimited(3600.0), on_fail=s.set), stop=stop
+    )
+    assert len(transport.calls) == 1  # no retry after the stop
+    (row,) = rows
+    assert json.loads(row[2])["chat_ids"] == [-1]
 
 
 async def test_prune_once_drops_old_finished_outbox_rows_but_never_pending(db):

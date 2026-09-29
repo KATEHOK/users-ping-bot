@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 MAX_PING_RETRIES = 3  # explicit 429s only, per message chunk
 MAX_MENU_ATTEMPTS = 3  # setMyCommands / deleteMyCommands, 429s included
+MENU_MAX_WAIT = 5.0  # a longer 429 wait is not worth it for a cosmetic menu: heals at the next start
 OUTBOX_MAX_ATTEMPTS = 3
 OUTBOX_POLL_INTERVAL = 5.0
 OUTBOX_BASE_BACKOFF = 30.0
@@ -154,7 +155,7 @@ class Delivery:
         async with self._db.transaction() as c:
             result = await self._services.migrate_chat(c, old_chat_id, new_chat_id)
         if result.action in _MENU_MOVED:
-            await self.sync_chat_menus([old_chat_id, new_chat_id])
+            await self.sync_chat_menus([old_chat_id, new_chat_id], single_attempt=True)
 
     async def _send(
         self,
@@ -236,11 +237,11 @@ class Delivery:
         """
         return await self._sync_menu(chat_id, MAX_MENU_ATTEMPTS if not single_attempt else 1)
 
-    async def sync_chat_menus(self, chat_ids: Sequence[int]) -> None:
+    async def sync_chat_menus(self, chat_ids: Sequence[int], *, single_attempt: bool = False) -> None:
         for chat_id in dict.fromkeys(chat_ids):
             if self.stop.is_set():
                 return
-            await self.sync_chat_menu(chat_id)
+            await self.sync_chat_menu(chat_id, single_attempt=single_attempt)
 
     async def _sync_menu(self, chat_id: int, max_attempts: int) -> bool:
         try:
@@ -260,7 +261,7 @@ class Delivery:
                     await self._transport.delete_chat_commands(chat_id)
                 return True
             except RateLimited as exc:
-                if attempts >= max_attempts:
+                if attempts >= max_attempts or exc.retry_after > MENU_MAX_WAIT:
                     _log_code(f"{code}_retries_exhausted", chat_id=chat_id)
                     return False
                 if await wait_or_stop(self._clock, self.stop, exc.retry_after):
@@ -299,6 +300,8 @@ class Delivery:
         if event.event_type == "reconcile_removed":
             raw = event.payload.get("chat_ids")
             ids = [i for i in raw if isinstance(i, int)] if isinstance(raw, list) else []
+            if event.payload.get("report_lost"):
+                return rendering.report_lost_text(ids, lang)
             return rendering.reconcile_interrupted_text(ids, lang)
         return None
 

@@ -45,6 +45,10 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "Startup check was interrupted. Chats removed before that: {ids}.",
         "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043f\u0440\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043f\u0440\u0435\u0440\u0432\u0430\u043d\u0430. \u0421\u043d\u044f\u0442\u043e \u0434\u043e \u044d\u0442\u043e\u0433\u043e: {ids}.",
     ),
+    "report_lost": (
+        "Startup report was not delivered. Chats removed on check: {ids}.",
+        "\u041e\u0442\u0447\u0451\u0442 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {ids}.",
+    ),
     "startup": (
         "Bot started. Chats removed on check: {n}.",
         "\u0411\u043e\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {n}.",
@@ -251,6 +255,10 @@ def reconcile_interrupted_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LAN
     return t("reconcile_interrupted", lang, ids=", ".join(str(i) for i in chat_ids))
 
 
+def report_lost_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
+    return t("report_lost", lang, ids=", ".join(str(i) for i in chat_ids))
+
+
 def _safe(text: str) -> str:
     # Telegram auto-links @name in plain text: swap in the fullwidth sign to keep lists inert.
     return esc(text.replace("@", "\uff20"))
@@ -312,8 +320,21 @@ def startup_report_text(
     rows: Sequence[ChatRowLike],
     lang: Lang = DEFAULT_LANG,
 ) -> list[str]:
+    return split_text("\n".join(_startup_lines(removed_chat_ids, rows, lang)))
+
+
+def _startup_lines(removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike], lang: Lang) -> list[str]:
     lines = [t("startup", lang, n=len(removed_chat_ids))]
     for group in split_ids(removed_chat_ids):
         lines.append(t("startup_removed", lang, ids=", ".join(str(i) for i in group)))
     lines += _chat_lines(rows, lang, True)
-    return split_text("\n".join(lines))
+    return lines
+
+
+def startup_report_ids_parts(
+    removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike], lang: Lang = DEFAULT_LANG
+) -> int:
+    """How many leading report messages carry the removed-chat ids."""
+    lines = _startup_lines(removed_chat_ids, rows, lang)
+    head = 1 + len(split_ids(removed_chat_ids))  # the header and the removed-ids lines
+    return len(split_text("\n".join(lines[:head])))

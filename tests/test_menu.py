@@ -9,7 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 
 import app.__main__ as entry
 from app import rendering
-from app.delivery import AmbiguousSend, ChatMigrated, PermanentSend, RateLimited, Unauthorized
+from app.delivery import MENU_MAX_WAIT, AmbiguousSend, ChatMigrated, PermanentSend, RateLimited, Unauthorized
 from app.handlers import handle_event
 from app.telegram import AiogramTransport
 
@@ -226,10 +226,58 @@ async def test_429_is_retried_at_most_three_attempts_and_waits_retry_after(db):
     ctx, services, transport, _c = mk_ctx(db, clock)
     await _world(db, services)
     await register_chat(db, services, CHAT_ID, ADMIN)
-    transport.fail_menu(RateLimited(7.0))
+    transport.fail_menu(RateLimited(4.0))
     assert await ctx.delivery.sync_chat_menu(CHAT_ID) is False
     assert len(transport.menu_calls) == 3
-    assert slept == [7.0, 7.0]
+    assert slept == [4.0, 4.0]
+
+
+async def test_429_longer_than_the_wait_cap_gives_up_without_waiting(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    assert await ctx.delivery.sync_chat_menu(CHAT_ID) is False
+    assert len(transport.menu_calls) == 1 and slept == []
+    transport.fail_menu(None)
+    transport.queue_menu_raises([RateLimited(MENU_MAX_WAIT)])  # exactly the cap is waited out
+    assert await ctx.delivery.sync_chat_menu(CHAT_ID) is True
+    assert slept == [MENU_MAX_WAIT]
+
+
+@pytest.mark.parametrize("text", ["/upb chat register", "/upb lang ru", "/upb chat unregister"])
+async def test_command_triggered_menu_sync_makes_one_attempt_and_never_waits(db, text):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    if text != "/upb chat register":
+        await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.fail_menu(RateLimited(1.0))
+    await _say(ctx, text, 1, ADMIN)
+    assert len(transport.menu_calls) == 1
+    assert slept == []
+
+
+async def test_startup_sync_picks_chats_from_the_outbox(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, -1, ADMIN)
+    async with db.transaction() as c:
+        await services.unregister_chat(c, -1)  # queues a farewell, no registration left
+    await entry.sync_menus(ctx, [])
+    assert [(m["chat_id"], m["op"]) for m in transport.menu_calls] == [(-1, "delete")]
 
 
 async def test_429_then_success(db):

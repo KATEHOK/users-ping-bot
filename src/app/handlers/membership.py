@@ -30,7 +30,7 @@ async def handle_migration(ctx: Context, event: IncomingEvent) -> None:
             await mark_ignored(c, ctx, event.update_id)
     # never announced into the chats: nothing to send
     if result.action in ("moved", "kept_destination"):
-        await ctx.delivery.sync_chat_menus([old_chat_id, new_chat_id])
+        await ctx.delivery.sync_chat_menus([old_chat_id, new_chat_id], single_attempt=True)
 
 
 async def handle_member_left(ctx: Context, event: IncomingEvent) -> None:
@@ -82,4 +82,4 @@ async def _left(ctx: Context, event: IncomingEvent, *, is_bot: bool) -> None:
         else:
             await mark_ignored(c, ctx, event.update_id)
     if gone:
-        await ctx.delivery.sync_chat_menu(event.chat_id)
+        await ctx.delivery.sync_chat_menu(event.chat_id, single_attempt=True)

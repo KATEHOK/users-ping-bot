@@ -8,6 +8,7 @@ import logging
 import signal
 import sys
 from datetime import timedelta
+from typing import NamedTuple
 
 from aiogram import Bot, exceptions as aiogram_exceptions
 from aiogram.client.default import DefaultBotProperties
@@ -112,7 +113,9 @@ async def sync_menus(ctx: Context, extra: list[int]) -> None:
     await ctx.delivery.sync_chat_menus([*known, *extra])
 
 
-async def _queue_interrupted_notice(ctx: Context, removed: list[int], started_at: str) -> None:
+async def _queue_interrupted_notice(
+    ctx: Context, removed: list[int], started_at: str, *, report_lost: bool = False
+) -> None:
     """Root is told about chats removed by an interrupted check, via the outbox.
 
     One event per message-sized group of ids; the run start keeps a later run's notice distinct.
@@ -131,22 +134,28 @@ async def _queue_interrupted_notice(ctx: Context, removed: list[int], started_at
                 event_type="reconcile_removed",
                 target_kind="user",
                 target_id=root_id,
-                payload={"lang": lang, "chat_ids": group},
+                payload={"lang": lang, "chat_ids": group, "report_lost": report_lost},
             )
 
 
-async def send_startup_report(ctx: Context, removed: list[int]) -> bool:
-    """Send the report to root. False if some part was not delivered."""
+class ReportResult(NamedTuple):
+    complete: bool  # every part was delivered (or nobody to tell)
+    ids_delivered: bool  # the parts that list the removed chats were delivered
+
+
+async def send_startup_report(ctx: Context, removed: list[int]) -> ReportResult:
+    """Send the report to root, stopping at the first part that is not delivered."""
     async with ctx.db.reader() as c:
         root_id = await ctx.services.get_root(c)
         if root_id is None or not await ctx.services.has_private_contact(c, root_id):
-            return True  # nobody to tell
+            return ReportResult(True, True)  # nobody to tell
         lang = await ctx.services.get_user_lang(c, root_id)
         rows = await ctx.services.list_chats(c)
-    for text in rendering.startup_report_text(removed, rows, lang):
+    ids_parts = rendering.startup_report_ids_parts(removed, rows, lang)
+    for sent, text in enumerate(rendering.startup_report_text(removed, rows, lang)):
         if not await ctx.delivery.send_reply(root_id, text, reply_to=None, thread_id=None):
-            return False
-    return True
+            return ReportResult(False, sent >= ids_parts)
+    return ReportResult(True, True)
 
 
 async def prune_once(ctx: Context) -> int:
@@ -214,10 +223,11 @@ async def serve(
         removed = await reconcile_chats(ctx, transport)
         if stop.is_set():
             return 0  # signalled during reconciliation: no report, pruning or loops
-        if not await send_startup_report(ctx, removed) and removed:
-            # the report may have been lost: the next start would say "0 removed"
+        report = await send_startup_report(ctx, removed)
+        if removed and not report.ids_delivered:
+            # the removed ids were lost: the next start would say "0 removed"
             try:
-                await _queue_interrupted_notice(ctx, removed, started_at)
+                await _queue_interrupted_notice(ctx, removed, started_at, report_lost=True)
             except Exception as exc:
                 logger.error("interrupted_notice_error exc=%s", type(exc).__name__)
         await prune_once(ctx)
