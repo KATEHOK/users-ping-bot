@@ -58,7 +58,8 @@ async def _joined(ctx: Context, event: IncomingEvent) -> None:
         canonical = await ctx.services.resolve_chat_id(c, event.chat_id)
         await mark_ignored(c, ctx, event.update_id)
     if canonical == event.chat_id and event.chat_type in ("group", "supergroup"):
-        await ctx.delivery.sync_chat_menu(event.chat_id)
+        # best effort: an outsider's join must not hold up update processing on a 429
+        await ctx.delivery.sync_chat_menu(event.chat_id, single_attempt=True)
 
 
 async def _left(ctx: Context, event: IncomingEvent, *, is_bot: bool) -> None:

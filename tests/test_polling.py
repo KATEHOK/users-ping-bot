@@ -1075,6 +1075,39 @@ async def test_failed_notice_write_during_signalled_shutdown_still_exits_zero(db
     assert "interrupted_notice_error exc=RuntimeError" in caplog.text
 
 
+async def _serve_with_gone_chat(db, send_fails, chats_gone=True):
+    clock, stop = RecordingClock(), asyncio.Event()
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _reg_world(db, services)
+    if chats_gone:
+        transport.set_probe(-1, PermanentSend())
+    if send_fails:
+        transport.queue_raises([PermanentSend()])
+    assert await _serve(db, FakeBot([[_bare(1)]], stop), clock, stop, transport) == 0
+    return await _notices(db)
+
+
+async def test_lost_startup_report_queues_the_removed_chats_notice(db):
+    rows = await _serve_with_gone_chat(db, send_fails=True)
+    assert len(rows) == 1 and rows[0][1] == 10 and "-1" in rows[0][2]
+
+
+async def test_delivered_startup_report_queues_no_notice(db):
+    assert await _serve_with_gone_chat(db, send_fails=False) == []
+
+
+async def test_lost_startup_report_without_removed_chats_queues_no_notice(db):
+    assert await _serve_with_gone_chat(db, send_fails=True, chats_gone=False) == []
+
+
+async def test_startup_report_returns_whether_everything_was_delivered(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, 10, contact=True)
+    assert await entry.send_startup_report(ctx, []) is True
+    transport.queue_raises([PermanentSend()])
+    assert await entry.send_startup_report(ctx, []) is False
+
+
 async def test_prune_once_drops_old_finished_outbox_rows_but_never_pending(db):
     clock = FakeClock()
     ctx, services, _t, _c = mk_ctx(db, clock)

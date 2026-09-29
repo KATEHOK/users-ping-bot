@@ -135,16 +135,18 @@ async def _queue_interrupted_notice(ctx: Context, removed: list[int], started_at
             )
 
 
-async def send_startup_report(ctx: Context, removed: list[int]) -> None:
+async def send_startup_report(ctx: Context, removed: list[int]) -> bool:
+    """Send the report to root. False if some part was not delivered."""
     async with ctx.db.reader() as c:
         root_id = await ctx.services.get_root(c)
         if root_id is None or not await ctx.services.has_private_contact(c, root_id):
-            return
+            return True  # nobody to tell
         lang = await ctx.services.get_user_lang(c, root_id)
         rows = await ctx.services.list_chats(c)
     for text in rendering.startup_report_text(removed, rows, lang):
         if not await ctx.delivery.send_reply(root_id, text, reply_to=None, thread_id=None):
-            break
+            return False
+    return True
 
 
 async def prune_once(ctx: Context) -> int:
@@ -208,10 +210,16 @@ async def serve(
     tasks: list[asyncio.Future] = []
     fatal: BaseException | None = None
     try:
+        started_at = iso(clock.now())
         removed = await reconcile_chats(ctx, transport)
         if stop.is_set():
             return 0  # signalled during reconciliation: no report, pruning or loops
-        await send_startup_report(ctx, removed)
+        if not await send_startup_report(ctx, removed) and removed:
+            # the report may have been lost: the next start would say "0 removed"
+            try:
+                await _queue_interrupted_notice(ctx, removed, started_at)
+            except Exception as exc:
+                logger.error("interrupted_notice_error exc=%s", type(exc).__name__)
         await prune_once(ctx)
         # menus are cosmetic: synced only after the report, which must not be lost
         await sync_menus(ctx, removed)

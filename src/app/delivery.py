@@ -227,13 +227,14 @@ class Delivery:
 
     # --- command menu ---
 
-    async def sync_chat_menu(self, chat_id: int) -> bool:
+    async def sync_chat_menu(self, chat_id: int, *, single_attempt: bool = False) -> bool:
         """Make the chat's command menu match the DB: set if registered, else delete.
 
         Idempotent and never raises (except Unauthorized): failures are logged by code.
+        `single_attempt`: no 429 wait or retry, for callers that must not block.
         True if the menu now matches the state.
         """
-        return await self._sync_menu(chat_id)
+        return await self._sync_menu(chat_id, MAX_MENU_ATTEMPTS if not single_attempt else 1)
 
     async def sync_chat_menus(self, chat_ids: Sequence[int]) -> None:
         for chat_id in dict.fromkeys(chat_ids):
@@ -241,7 +242,7 @@ class Delivery:
                 return
             await self.sync_chat_menu(chat_id)
 
-    async def _sync_menu(self, chat_id: int) -> bool:
+    async def _sync_menu(self, chat_id: int, max_attempts: int) -> bool:
         try:
             async with self._db.reader() as c:
                 chat = await self._services.get_chat(c, chat_id)
@@ -259,7 +260,7 @@ class Delivery:
                     await self._transport.delete_chat_commands(chat_id)
                 return True
             except RateLimited as exc:
-                if attempts >= MAX_MENU_ATTEMPTS:
+                if attempts >= max_attempts:
                     _log_code(f"{code}_retries_exhausted", chat_id=chat_id)
                     return False
                 if await wait_or_stop(self._clock, self.stop, exc.retry_after):

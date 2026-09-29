@@ -412,6 +412,22 @@ async def test_bot_added_to_an_unregistered_group_deletes_a_stale_menu(db):
     assert len(transport.menu_calls) == 1
 
 
+async def test_join_triggered_delete_makes_one_attempt_and_never_waits_on_429(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    transport.fail_menu(RateLimited(7.0))
+    await handle_event(ctx, _my_member(1, added=True))
+    assert len(transport.menu_calls) == 1
+    assert slept == []
+
+
 async def test_other_membership_updates_do_not_sync_the_menu(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
