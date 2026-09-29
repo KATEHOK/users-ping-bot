@@ -1,0 +1,36 @@
+# Example AppRole policy for users-ping-bot. This is a template, not applied
+# to any Vault instance by this repo — create the actual policy and role by
+# hand or through your own IaC, then plug the resulting role_id/secret_id
+# into .env.
+#
+# Replace <kv_mount> and <secret_path> with the real values (VAULT_KV_MOUNT
+# and VAULT_SECRET_PATH). KV v2 stores data one path segment deeper, under
+# "<mount>/data/<path>" -- that is the exact and only path this policy grants.
+#
+# Deliberately absent, and must stay absent:
+#   - list capability (would let the token enumerate sibling secrets)
+#   - create/update/delete/patch (this app only ever reads the token)
+#   - "<kv_mount>/metadata/<secret_path>" or any other path under the mount
+#   - any auth/approle/* path (no AppRole self-management from this token)
+path "<kv_mount>/data/<secret_path>" {
+  capabilities = ["read"]
+}
+
+# Notes for whoever wires this up:
+#
+# - Vault must be reached over HTTPS with a verified certificate (the app
+#   refuses a non-https VAULT_ADDR outright). "Read-only" above describes
+#   what the *issued* token can do; the AppRole login call itself is a plain
+#   POST to auth/<mount>/login and is not covered by this policy.
+#
+# - SecretID TTL and use-count (secret_id_num_uses) must tolerate ordinary
+#   restarts of the bot process (each start performs one login). A SecretID
+#   that expires or exhausts its uses between restarts turns into an outage,
+#   not a security improvement -- size it for your deploy/restart cadence,
+#   or document the .env update procedure if you keep it tight.
+#
+# - Check the *effective* policy set on the token, not just this file: Vault
+#   merges in the "default" policy and any other policies already attached
+#   to the AppRole or its mount. Run `vault token capabilities <token>
+#   <kv_mount>/data/<secret_path>` (and on neighbouring paths, to confirm
+#   they are denied) before trusting this in production.

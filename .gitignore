@@ -1,2 +1,9 @@
 .env
 .idea/
+local/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+# database copies made by `make backup`
+backups/

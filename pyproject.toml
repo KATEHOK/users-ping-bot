@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+# keep pytest temp dirs inside the repo, in an ignored path; pytest recreates it each run
+addopts = "--basetemp=local/tmp/pytest"

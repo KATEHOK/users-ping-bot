@@ -1,23 +1,30 @@
-# Виртуальное окружение
+# Секреты и локальные окружения
+.env
+.env.*
+!.env.example
 .venv/
 venv/
 env/
 
-# Секреты
-.env
-.env.*
-!.env.example
-
 # Git
 .git/
 .gitignore
+
+# Планы и рабочие материалы, не нужные в образе
+local/
+docs/
+
+# Тесты и dev-зависимости
+tests/
+requirements-dev.txt
+pytest.ini
+.pytest_cache/
 
 # Python-мусор
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.pytest_cache/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
@@ -27,7 +34,7 @@ __pycache__/
 .vscode/
 *.swp
 
-# Docker
+# Docker-файлы самого образа
 Dockerfile
 docker-compose.yml
 docker-compose.yaml
@@ -36,5 +43,12 @@ docker-compose.yaml
 # ОС-мусор
 .DS_Store
 
-# Логи и локальные артефакты
+# База данных, бэкапы, логи
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.bak
 *.log
+data/
+backups/
