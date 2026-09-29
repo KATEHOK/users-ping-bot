@@ -507,6 +507,129 @@ async def test_unauthorized_from_a_member_scope_call_propagates(db):
         await handle_event(ctx, group_event("/register", update_id=1, user_id=ADMIN, chat_id=CHAT_ID))
 
 
+# --- unregister reaches all staff; a revoked admin is purged from known chats ---
+
+OTHER = 2  # a second admin, not an owner of the chat
+
+
+async def _two_admins_chat(db, services):
+    await _world(db, services)
+    await make_admin(db, services, OTHER)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+
+
+def _register_menus(transport):
+    reg = rendering.register_menu_commands("en")
+    assert _member_ops(transport) == {(CHAT_ID, u): reg for u in (ROOT, ADMIN, OTHER)}
+    assert len(transport.menu_calls) == 4  # chat scope and three members
+
+
+async def test_group_unregister_gives_every_staff_member_the_register_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _two_admins_chat(db, services)
+    await _say(ctx, "/unregister", 1, ADMIN)
+    _register_menus(transport)
+
+
+async def test_private_chat_remove_gives_every_staff_member_the_register_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _two_admins_chat(db, services)
+    await handle_event(ctx, private_event(f"/chat remove {CHAT_ID}", update_id=1, user_id=ROOT))
+    _register_menus(transport)
+
+
+async def test_farewell_sync_gives_every_staff_member_the_register_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _two_admins_chat(db, services)
+    async with db.transaction() as c:  # leaves a farewell row; its sync runs from the outbox
+        await services.unregister_chat(c, CHAT_ID)
+    await ctx.delivery.run_outbox_once()
+    _register_menus(transport)
+
+
+async def test_unregister_deletes_the_member_menu_of_a_non_staff_owner(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _two_admins_chat(db, services)
+    async with db.transaction() as c:
+        await services.revoke_admin(c, OTHER)
+        await services.grant_admin(c, OTHER)
+    await register_chat(db, services, 501, 3)  # registrar 3 has no role
+    await _say(ctx, "/unregister", 1, ROOT, chat_id=501)
+    assert _member_ops(transport)[(501, 3)] is None
+    assert _member_ops(transport)[(501, OTHER)] == rendering.register_menu_commands("en")
+
+
+async def _known_chats(db, services):
+    """Active 501 (registered by root), inactive 502 (unregistered: a farewell row remains)."""
+    await _world(db, services)
+    await register_chat(db, services, 501, ROOT)
+    await register_chat(db, services, 502, ROOT)
+    async with db.transaction() as c:
+        await services.unregister_chat(c, 502)
+
+
+async def test_admin_revoke_deletes_the_member_menu_in_every_known_chat(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _known_chats(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.menu_calls.clear()
+    await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT))
+    purge = [(c["chat_id"], c["op"]) for c in transport.menu_calls if c["user_id"] == ADMIN]
+    assert sorted(purge) == [(CHAT_ID, "delete"), (501, "delete"), (502, "delete")]
+    # the cascade chat is handled once: no second delete for the same member
+    assert len(purge) == 3
+    assert len(transport.menu_calls) == 5  # 2 purges + the cascade's chat, admin and root calls
+
+
+async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _known_chats(db, services)
+    transport.menu_calls.clear()
+    real = transport.delete_chat_commands
+
+    async def delete(chat_id, *, user_id=None):
+        await real(chat_id, user_id=user_id)
+        if user_id == ADMIN:
+            raise PermanentSend() if chat_id == 501 else RateLimited(1.0)
+
+    transport.delete_chat_commands = delete
+    with caplog.at_level(logging.DEBUG):
+        await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT))
+    assert [(c["chat_id"], c["user_id"]) for c in transport.menu_calls] == [(501, ADMIN), (502, ADMIN)]
+    assert slept == []
+    assert any(r.getMessage().startswith("menu_delete_permanent ") for r in caplog.records)
+    assert any(r.getMessage().startswith("menu_delete_retries_exhausted ") for r in caplog.records)
+
+
+async def test_unauthorized_from_the_admin_revoke_purge_propagates(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _known_chats(db, services)
+    transport.fail_menu(Unauthorized())
+    with pytest.raises(Unauthorized):
+        await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT))
+
+
+async def test_cli_root_change_deletes_the_old_root_menu_in_inactive_known_chats(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT, contact=True)
+    await register_chat(db, services, CHAT_ID, ROOT)
+    async with db.transaction() as c:
+        await services.unregister_chat(c, CHAT_ID)
+        await services.touch_user(c, 11)
+        await services.set_root(c, 11)
+    await ctx.delivery.run_outbox_once()
+    members = _member_ops(transport)
+    assert members[(CHAT_ID, ROOT)] is None
+    assert members[(CHAT_ID, 11)] == rendering.register_menu_commands("en")
+
+
 # --- root change and joining ---
 
 
@@ -522,7 +645,8 @@ async def test_cli_root_change_drops_the_menu_once_the_farewell_is_done(db, fail
     if fail is not None:
         transport.fail_chat(CHAT_ID, fail)
     await ctx.delivery.run_outbox_once()
-    assert _chat_ops(transport) == [("delete", CHAT_ID)]
+    # the farewell sync, then the root_revoked sync over the known chats
+    assert _chat_ops(transport) == [("delete", CHAT_ID)] * 2
     # the old root is no longer staff, the new one may register the free chat
     assert _member_ops(transport) == {
         (CHAT_ID, ROOT): None,

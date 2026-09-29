@@ -99,7 +99,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
         elif cmd is Cmd.CHAT_UNREGISTER:
             result = await ctx.services.unregister_chat(c, chat_id)  # farewell goes via the outbox
             menu.append(chat_id)
-            menu_users.extend(result.owner_ids)
+            menu_users.extend([*await ctx.services.staff_ids(c), *result.owner_ids])
         elif cmd is Cmd.NOTIFY_ON:
             sub = await ctx.services.subscribe(c, chat_id, event.user_id)
             replies.append(t("subscribed" if sub.created else "already_subscribed", lang))

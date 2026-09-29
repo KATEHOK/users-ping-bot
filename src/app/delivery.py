@@ -255,6 +255,19 @@ class Delivery:
                 return
             await self.sync_chat_menu(chat_id, single_attempt=single_attempt, users=users)
 
+    async def delete_member_menus(
+        self, chat_ids: Sequence[int], user_id: int, *, single_attempt: bool = False
+    ) -> None:
+        """Delete one user's member-scope menu in each chat (a revoked admin's leftovers).
+
+        Failures (e.g. the user is not in the chat) are logged by code; Unauthorized propagates.
+        """
+        attempts = MAX_MENU_ATTEMPTS if not single_attempt else 1
+        for chat_id in dict.fromkeys(chat_ids):
+            if self.stop.is_set():
+                return
+            await self._menu_call(chat_id, user_id, None, False, attempts)
+
     async def _menu_plan(
         self, chat_id: int, users: tuple[int, ...]
     ) -> tuple[bool, list[tuple[int | None, list[tuple[str, str]] | None]]]:
@@ -472,15 +485,20 @@ class Delivery:
                 # the chat was dropped (maybe by the CLI, which has no transport): drop its menu
                 owners = event.payload.get("owners")
                 users = [u for u in owners if isinstance(u, int)] if isinstance(owners, list) else []
+                try:
+                    async with self._db.reader() as c:
+                        users += await self._services.staff_ids(c)
+                except Exception as exc:
+                    logger.error("menu_state_error exc=%s", type(exc).__name__)
                 await self.sync_chat_menu(event.target_id, users=users)
             elif event.event_type == "root_revoked" and final:
                 await self._sync_after_root_change(event.target_id)
 
     async def _sync_after_root_change(self, old_root_id: int) -> None:
-        """Root changed while the bot runs (via the CLI): owner menus of active chats may be stale."""
+        """Root changed while the bot runs (via the CLI): menus in known chats may be stale."""
         try:
             async with self._db.reader() as c:
-                chat_ids = [r.chat_id for r in await self._services.list_chats(c)]
+                chat_ids = await self._services.known_chat_ids(c)
                 staff = await self._services.staff_ids(c)
         except Exception as exc:
             logger.error("menu_state_error exc=%s", type(exc).__name__)
