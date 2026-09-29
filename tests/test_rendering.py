@@ -73,14 +73,14 @@ def test_decision_keys_present():
         "welcome already_registered subscribed already_subscribed unsubscribed not_subscribed "
         "list_empty farewell lang_set root_cli_only bad_args admin_created admin_exists "
         "admin_removed admin_absent chat_removed chat_absent root_revoked startup name_unknown "
-        "ping_note help_register_hint"
+        "help_register_hint"
     ).split():
         assert key in rendering._CATALOG
 
 
 def test_t_escapes_keyword_values_and_resolves_language():
     assert t("bad_args", "en", syntax="/admin create <user_id>") == (
-        "Invalid arguments. Usage: /admin create &lt;user_id&gt;"
+        "Invalid arguments. Usage: <code>/admin create &lt;user_id&gt;</code>"
     )
     assert "&lt;" in t("bad_args", "ru", syntax="<x>")
     assert t("lang_set", "en") == "Language: English."
@@ -179,7 +179,7 @@ def test_simple_texts(lang):
     assert welcome_text(lang) == t("welcome", lang)
     assert farewell_text(lang) == t("farewell", lang)
     assert "2026" in root_revoked_text("2026-09-26T12:00:00+00:00", lang)
-    assert "notify on" in welcome_text(lang)
+    assert "/on" in welcome_text(lang) and "<code>" not in welcome_text(lang)
 
 
 def test_pong_constant():
@@ -190,7 +190,18 @@ def test_pong_constant():
 
 
 def _syntax_lines(text: str) -> set[str]:
-    return {line.split(" - ")[0] for line in text.split("\n") if " - " in line}
+    # "/alias \u2014 description" -> "/alias"; a "<pre>SYNTAX</pre>" line -> "SYNTAX" (still escaped)
+    shown = set()
+    for line in text.split("\n"):
+        if line.startswith("<pre>"):
+            shown.add(line.removeprefix("<pre>").removesuffix("</pre>"))
+        elif line.startswith("/"):
+            shown.add(line.split(" \u2014 ")[0])
+    return shown
+
+
+def _shown(s: access.CommandSpec) -> str:
+    return esc(s.alias or s.syntax)
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -199,7 +210,7 @@ def _syntax_lines(text: str) -> set[str]:
 def test_help_lists_exactly_the_allowed_commands(actor, scope, chat_active, lang):
     allowed = access.allowed_commands(actor, scope=scope, chat_active=chat_active)
     listed = {
-        esc(s.syntax)
+        _shown(s)
         for s in allowed
         if s.cmd not in access.INTERNAL and not (chat_active and s.cmd is Cmd.CHAT_REGISTER)
     }
@@ -213,32 +224,119 @@ def test_help_lists_exactly_the_allowed_commands(actor, scope, chat_active, lang
 def test_help_never_lists_internal_entries(actor, scope, chat_active):
     text = help_text(actor, scope=scope, chat_active=chat_active, lang="en")
     for cmd in access.INTERNAL:
-        assert esc(access.spec(cmd).syntax) + " - " not in text
+        assert esc(access.spec(cmd).syntax) not in text
     assert "/admin, /chat" not in text
+
+
+def test_group_help_shows_only_the_alias_as_plain_text():
+    for lang in LANGS:
+        text = help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang=lang)
+        for alias in ("/all", "/on", "/off", "/help", "/list"):
+            assert any(line.startswith(f"{alias} \u2014 ") for line in text.split("\n"))
+        assert "/upb" not in text and "<code>" not in text and "<pre>" not in text
+    private = help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="en")
+    assert "\n/help \u2014 Help\n" in private
+
+
+def test_help_texts_en_and_ru_for_owner_member_and_private_root():
+    owner = Actor(user_id=2, role=Role.ADMIN, is_chat_owner=True)
+    en = {
+        "owner": help_text(owner, scope=Scope.GROUP, chat_active=True, lang="en"),
+        "member": help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang="en"),
+    }
+    assert en["owner"] == (
+        "Commands:\n/on \u2014 Subscribe\n/off \u2014 Unsubscribe\n/all \u2014 Ping all\n"
+        "/list \u2014 Subscribers\n/help \u2014 Help\n/unregister \u2014 Unregister\n"
+        "/lang &lt;en|ru&gt; \u2014 Language"
+    )
+    assert en["member"] == (
+        "Commands:\n/on \u2014 Subscribe\n/off \u2014 Unsubscribe\n/all \u2014 Ping all\n"
+        "/list \u2014 Subscribers\n/help \u2014 Help"
+    )
+    ru_owner = help_text(owner, scope=Scope.GROUP, chat_active=True, lang="ru")
+    assert ru_owner == (
+        "\u041a\u043e\u043c\u0430\u043d\u0434\u044b:\n/on \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f\n"
+        "/off \u2014 \u041e\u0442\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f\n/all \u2014 \u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445\n"
+        "/list \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438\n/help \u2014 \u0421\u043f\u0440\u0430\u0432\u043a\u0430\n"
+        "/unregister \u2014 \u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e\n/lang &lt;en|ru&gt; \u2014 \u042f\u0437\u044b\u043a"
+    )
+    ru_member = help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang="ru")
+    assert "/unregister" not in ru_member and "/lang" not in ru_member
+    assert ru_member.split("\n")[1:] == ru_owner.split("\n")[1:6]
+    assert help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="en") == (
+        "Commands:\n/help \u2014 Help\n"
+        "Language\n<pre>/lang &lt;en|ru&gt;</pre>\n"
+        "Grant admin\n<pre>/admin create &lt;user_id&gt;</pre>\n"
+        "Revoke admin\n<pre>/admin remove &lt;user_id&gt;</pre>\n"
+        "Admins\n<pre>/admin list</pre>\n"
+        "Chats\n<pre>/chat list</pre>\n"
+        "Remove chat\n<pre>/chat remove &lt;chat_id&gt;</pre>\n" + t("help_register_hint", "en")
+    )
+    ru_private = help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="ru")
+    assert "\n\u042f\u0437\u044b\u043a\n<pre>/lang &lt;en|ru&gt;</pre>\n" in ru_private
+    assert "\n\u0427\u0430\u0442\u044b\n<pre>/chat list</pre>\n" in ru_private
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_help_and_usage_have_no_ping_note_and_no_code_around_commands(lang):
+    assert "ping_note" not in rendering._CATALOG
+    for actor in ACTORS:
+        for scope, active in CONTEXTS:
+            texts = [help_text(actor, scope=scope, chat_active=active, lang=lang)]
+            texts.append(usage_text(actor, scope=scope, chat_active=active, prefix=(), lang=lang))
+            for text in texts:
+                assert "Delivery is not guaranteed" not in text
+                assert "\u0414\u043e\u0441\u0442\u0430\u0432\u043a\u0430 \u043d\u0435 \u0433\u0430\u0440\u0430\u043d\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f" not in text
+                assert "<code>" not in text.replace(t("help_register_hint", lang), "")
+
+
+def test_pre_block_only_for_multiword_command_or_description():
+    for lang in LANGS:
+        text = help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang=lang)
+        lines = text.split("\n")
+        for s in access.allowed_commands(ROOT, scope=Scope.PRIVATE, chat_active=True):
+            if s.cmd in access.INTERNAL:
+                continue
+            desc = t("cmd_" + s.cmd.value, lang)
+            multi = len(s.syntax.split()) >= 2 or len(desc.split()) >= 2
+            block = f"<pre>{esc(s.syntax)}</pre>"
+            if multi:
+                i = lines.index(block)
+                assert lines[i - 1] == desc
+            else:
+                assert block not in lines
+                assert f"{esc(s.syntax)} \u2014 {desc}" in lines
+
+
+def test_descriptions_are_short():
+    for key, (en, ru) in rendering._CATALOG.items():
+        if key.startswith("cmd_"):
+            assert len(en.split()) <= 2 and len(ru.split()) <= 2, key
+
+
+def test_usage_shows_alias_and_prefix_matching_ignores_it():
+    text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
+    assert _syntax_lines(text) == {"/on", "/off", "/list"}
+    text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("all",), lang="en")
+    assert "/all \u2014 Ping all" in text  # unknown prefix: everything allowed
 
 
 def test_help_escapes_command_syntax():
     text = help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="en")
-    assert "/admin create &lt;user_id&gt;" in text
+    assert "<pre>/admin create &lt;user_id&gt;</pre>" in text
     assert "<user_id>" not in text
-    assert "&lt;en|ru&gt;" in text
+    assert "<pre>/lang &lt;en|ru&gt;</pre>" in text
+    group = help_text(REGISTRAR, scope=Scope.GROUP, chat_active=True, lang="en")
+    assert "/lang &lt;en|ru&gt; \u2014 Language" in group and "<en|ru>" not in group
 
 
 def test_private_help_carries_group_registration_hint_in_both_languages():
     for lang in LANGS:
         text = help_text(REGISTRAR, scope=Scope.PRIVATE, chat_active=True, lang=lang)
         assert t("help_register_hint", lang) in text
-        assert "/upb chat register" in text
+        assert "<code>/register</code>" in text
     group = help_text(REGISTRAR, scope=Scope.GROUP, chat_active=True, lang="en")
     assert t("help_register_hint", "en") not in group
-
-
-def test_ping_note_only_where_ping_is_allowed():
-    for lang in LANGS:
-        note = t("ping_note", lang)
-        assert note in help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang=lang)
-        assert note not in help_text(NOBODY, scope=Scope.GROUP, chat_active=True, lang=lang)
-        assert note not in help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang=lang)
 
 
 def test_subscriber_help_has_no_administrative_commands():
@@ -249,9 +347,13 @@ def test_subscriber_help_has_no_administrative_commands():
 
 def test_usage_filters_by_prefix():
     text = usage_text(REGISTRAR, scope=Scope.GROUP, chat_active=True, prefix=("chat",), lang="en")
-    assert _syntax_lines(text) == {"/upb chat unregister"}  # register is not advertised when active
+    assert _syntax_lines(text) == {"/unregister"}  # register is not advertised when active
+    text = usage_text(FOREIGN_ADMIN, scope=Scope.GROUP, chat_active=False, prefix=("chat",), lang="en")
+    assert _syntax_lines(text) == {"/register"}
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
-    assert _syntax_lines(text) == {"/upb notify on", "/upb notify off"}
+    assert _syntax_lines(text) == {"/on", "/off", "/list"}
+    text = usage_text(REGISTRAR, scope=Scope.GROUP, chat_active=True, prefix=("lang",), lang="en")
+    assert _syntax_lines(text) == {"/lang &lt;en|ru&gt;"}
     text = usage_text(ROOT, scope=Scope.PRIVATE, chat_active=True, prefix=("admin",), lang="en")
     assert _syntax_lines(text) == {
         "/admin create &lt;user_id&gt;",
@@ -268,10 +370,10 @@ def test_usage_examples_per_actor_and_scope():
 
     plain = Actor(user_id=7)
     # bare or unknown: everything allowed
-    assert lines(plain, Scope.GROUP, True, ()) == {"/upb notify on"}
-    assert lines(plain, Scope.GROUP, True, ("qwe",)) == {"/upb notify on"}
-    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ()) == {"/upb chat register"}
-    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ("qwe",)) == {"/upb chat register"}
+    assert lines(plain, Scope.GROUP, True, ()) == {"/on"}
+    assert lines(plain, Scope.GROUP, True, ("qwe",)) == {"/on"}
+    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ()) == {"/register", "/help"}
+    assert lines(FOREIGN_ADMIN, Scope.GROUP, False, ("qwe",)) == {"/register", "/help"}
     # known prefix with nothing allowed under it: silence, no fallback
     assert usage_text(plain, scope=Scope.GROUP, chat_active=True, prefix=("chat",), lang="en") == ""
     assert usage_text(plain, scope=Scope.GROUP, chat_active=True, prefix=("lang",), lang="en") == ""
@@ -294,7 +396,7 @@ def test_usage_is_empty_only_when_nothing_matches(actor, scope, chat_active, pre
         assert (text == "") == (not allowed)
     if text:
         assert find_html_errors(text) == []
-        assert _syntax_lines(text) <= {esc(s.syntax) for s in allowed}
+        assert _syntax_lines(text) <= {_shown(s) for s in allowed}
 
 
 def test_usage_never_falls_back_for_known_prefix():

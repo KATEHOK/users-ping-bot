@@ -8,6 +8,7 @@ import logging
 import signal
 import sys
 from datetime import timedelta
+from typing import NamedTuple
 
 from aiogram import Bot, exceptions as aiogram_exceptions
 from aiogram.client.default import DefaultBotProperties
@@ -37,6 +38,7 @@ FATAL_PAUSE = 60.0  # keeps restart: unless-stopped from hammering Telegram and 
 EXIT_FATAL = 1
 EXIT_UNAUTHORIZED = 3
 PRUNE_KEEP = timedelta(days=2)
+OUTBOX_KEEP = timedelta(days=30)
 PRUNE_INTERVAL = 3600.0
 
 _QUIET_LOGGERS = ("aiohttp", "aiogram", "aiosqlite", "urllib3", "requests")
@@ -77,6 +79,7 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
     async with ctx.db.reader() as c:
         chats = await ctx.services.list_chats(c)
 
+    started_at = iso(ctx.clock.now())
     removed: list[int] = []
     for chat in chats:
         if ctx.delivery.stop.is_set():
@@ -95,12 +98,33 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
     if removed and ctx.delivery.stop.is_set():
         # no report follows a signalled check, and the next start would say "0 removed":
         # hand the removed ids to the outbox so root still hears of them
-        await _queue_interrupted_notice(ctx, removed)
+        try:
+            await _queue_interrupted_notice(ctx, removed, started_at)
+        except Exception as exc:
+            # a signal ends with exit code 0 whatever happens here
+            logger.error("interrupted_notice_error exc=%s", type(exc).__name__)
     return removed
 
 
-async def _queue_interrupted_notice(ctx: Context, removed: list[int]) -> None:
-    """Root is told about chats removed by an interrupted check, via the outbox."""
+async def sync_menus(ctx: Context, extra: list[int]) -> None:
+    """Menus of every known chat: registered -> set, otherwise delete.
+
+    Former roots and current staff are checked too: their member menus may be stale.
+    """
+    async with ctx.db.reader() as c:
+        known = await ctx.services.known_chat_ids(c)
+        former = await ctx.services.former_root_ids(c)
+        staff = await ctx.services.staff_ids(c)
+    await ctx.delivery.sync_chat_menus([*known, *extra], users=[*former, *staff])
+
+
+async def _queue_interrupted_notice(
+    ctx: Context, removed: list[int], started_at: str, *, report_lost: bool = False
+) -> None:
+    """Root is told about chats removed by an interrupted check, via the outbox.
+
+    One event per message-sized group of ids; the run start keeps a later run's notice distinct.
+    """
     if not removed:
         return
     async with ctx.db.transaction() as c:
@@ -108,33 +132,43 @@ async def _queue_interrupted_notice(ctx: Context, removed: list[int]) -> None:
         if root_id is None or not await ctx.services.has_private_contact(c, root_id):
             return
         lang = await ctx.services.get_user_lang(c, root_id)
-        ids = ",".join(str(i) for i in sorted(removed))
-        await ctx.services.queue_event(
-            c,
-            event_key=f"reconcile_removed:{root_id}:{ids}",
-            event_type="reconcile_removed",
-            target_kind="user",
-            target_id=root_id,
-            payload={"lang": lang, "chat_ids": list(removed)},
-        )
+        for part, group in enumerate(rendering.split_ids(removed)):
+            await ctx.services.queue_event(
+                c,
+                event_key=f"reconcile_removed:{root_id}:{started_at}:{part}",
+                event_type="reconcile_removed",
+                target_kind="user",
+                target_id=root_id,
+                payload={"lang": lang, "chat_ids": group, "report_lost": report_lost},
+            )
 
 
-async def send_startup_report(ctx: Context, removed: list[int]) -> None:
+class ReportResult(NamedTuple):
+    complete: bool  # every part was delivered (or nobody to tell)
+    ids_delivered: bool  # the parts that list the removed chats were delivered
+
+
+async def send_startup_report(ctx: Context, removed: list[int]) -> ReportResult:
+    """Send the report to root, stopping at the first part that is not delivered."""
     async with ctx.db.reader() as c:
         root_id = await ctx.services.get_root(c)
         if root_id is None or not await ctx.services.has_private_contact(c, root_id):
-            return
+            return ReportResult(True, True)  # nobody to tell
         lang = await ctx.services.get_user_lang(c, root_id)
         rows = await ctx.services.list_chats(c)
-    for text in rendering.startup_report_text(removed, rows, lang):
+    ids_parts = rendering.startup_report_ids_parts(removed, rows, lang)
+    for sent, text in enumerate(rendering.startup_report_text(removed, rows, lang)):
         if not await ctx.delivery.send_reply(root_id, text, reply_to=None, thread_id=None):
-            break
+            return ReportResult(False, sent >= ids_parts)
+    return ReportResult(True, True)
 
 
 async def prune_once(ctx: Context) -> int:
-    older_than = iso(ctx.clock.now() - PRUNE_KEEP)
+    now = ctx.clock.now()
     async with ctx.db.transaction() as c:
-        return await ctx.services.prune_processed_updates(c, older_than=older_than)
+        pruned = await ctx.services.prune_processed_updates(c, older_than=iso(now - PRUNE_KEEP))
+        await ctx.services.prune_outbox(c, older_than=iso(now - OUTBOX_KEEP))
+        return pruned
 
 
 async def prune_loop(ctx: Context, stop: asyncio.Event) -> None:
@@ -190,11 +224,22 @@ async def serve(
     tasks: list[asyncio.Future] = []
     fatal: BaseException | None = None
     try:
+        started_at = iso(clock.now())
         removed = await reconcile_chats(ctx, transport)
         if stop.is_set():
             return 0  # signalled during reconciliation: no report, pruning or loops
-        await send_startup_report(ctx, removed)
+        report = await send_startup_report(ctx, removed)
+        if removed and not report.ids_delivered:
+            # the removed ids were lost: the next start would say "0 removed"
+            try:
+                await _queue_interrupted_notice(ctx, removed, started_at, report_lost=True)
+            except Exception as exc:
+                logger.error("interrupted_notice_error exc=%s", type(exc).__name__)
         await prune_once(ctx)
+        # menus are cosmetic: synced only after the report, which must not be lost
+        await sync_menus(ctx, removed)
+        if stop.is_set():
+            return 0  # signalled during the menu sync
 
         tasks = [
             asyncio.ensure_future(delivery.outbox_loop(stop)),

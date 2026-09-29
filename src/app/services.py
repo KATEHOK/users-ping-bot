@@ -9,6 +9,7 @@ atomic unit via Database.transaction()/reader().
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -30,6 +31,7 @@ class RegisterResult:
 class UnregisterResult:
     chat_id: int
     generation: int
+    owner_ids: tuple[int, ...] = ()  # who held owner menus: root and the registrar
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,11 +48,13 @@ class GrantResult:
 class RevokeResult:
     revoked: bool  # False if the target was not an admin: no-op
     chat_ids: list[int] = field(default_factory=list)  # chats dropped by the cascade
+    owner_ids: tuple[int, ...] = ()  # menu candidates for those chats: root and the admin
 
 
 @dataclass(frozen=True, slots=True)
 class RemoveChatResult:
     chat_ids: list[int]  # [chat_id] if a registration was removed, else []
+    owner_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +241,14 @@ class Services:
         )
         return cursor.rowcount
 
+    async def prune_outbox(self, c: aiosqlite.Connection, *, older_than: str) -> int:
+        """Deletes finished events (sent, failed, cancelled) last touched before older_than."""
+        cursor = await c.execute(
+            "DELETE FROM outbox WHERE status IN ('sent', 'failed', 'cancelled') AND updated_at < ?",
+            (older_than,),
+        )
+        return cursor.rowcount
+
     # --- chats ---
 
     _CHAT_COLS = "chat_id, title, registered_by, registered_at, registration_generation, lang"
@@ -287,14 +299,26 @@ class Services:
         existing = await self.get_chat(c, chat_id)
         if existing is None:
             return UnregisterResult(chat_id=chat_id, generation=0)
+        owners = await self._owner_ids(c, existing.registered_by)
         # deleting the chat row cascades subscriptions via ON DELETE CASCADE
         await c.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
         if farewell:
-            await self._queue_farewell(c, chat_id, existing.registration_generation, existing.lang)
+            await self._queue_farewell(
+                c, chat_id, existing.registration_generation, existing.lang, owners
+            )
         return UnregisterResult(
             chat_id=chat_id,
             generation=existing.registration_generation,
+            owner_ids=owners,
         )
+
+    async def _owner_ids(
+        self, c: aiosqlite.Connection, registrar_id: int, *extra: int
+    ) -> tuple[int, ...]:
+        """Root, the registrar and extras, without repeats: whose menus a chat change touches."""
+        root_id = await self.get_root(c)
+        ids = [i for i in (root_id, registrar_id, *extra) if i is not None]
+        return tuple(dict.fromkeys(ids))
 
     async def list_chats(
         self, c: aiosqlite.Connection, *, registered_by: int | None = None
@@ -375,13 +399,14 @@ class Services:
         )
         rows = await cursor.fetchall()
         chat_ids = [r[0] for r in rows]
+        owners = await self._owner_ids(c, user_id)
         await c.execute("DELETE FROM roles WHERE user_id = ?", (user_id,))
         for chat_id, generation, lang in rows:
             # each delete cascades only that chat's own subscriptions:
             # U's subscriptions in chats registered by someone else are untouched
             await c.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
-            await self._queue_farewell(c, chat_id, generation, self._lang(lang))
-        return RevokeResult(revoked=True, chat_ids=chat_ids)
+            await self._queue_farewell(c, chat_id, generation, self._lang(lang), owners)
+        return RevokeResult(revoked=True, chat_ids=chat_ids, owner_ids=owners)
 
     async def list_admins(self, c: aiosqlite.Connection) -> list[UserRow]:
         cursor = await c.execute(
@@ -397,11 +422,34 @@ class Services:
         row = await cursor.fetchone()
         return row[0] if row is not None else None
 
+    async def staff_ids(self, c: aiosqlite.Connection) -> list[int]:
+        """Root first, then every admin: all users who may hold a menu of ours."""
+        cursor = await c.execute("SELECT user_id FROM roles ORDER BY role = 'root' DESC, user_id")
+        return [r[0] for r in await cursor.fetchall()]
+
+    async def former_root_ids(self, c: aiosqlite.Connection) -> list[int]:
+        """Users who were told their root role was revoked: they may still hold an owner menu."""
+        cursor = await c.execute(
+            "SELECT DISTINCT target_id FROM outbox "
+            "WHERE event_type = 'root_revoked' AND target_kind = 'user' ORDER BY 1"
+        )
+        return [r[0] for r in await cursor.fetchall()]
+
+    async def known_chat_ids(self, c: aiosqlite.Connection) -> list[int]:
+        """Chat ids to sync at startup: registered or an outbox target (old migrated ids have no menu)."""
+        cursor = await c.execute(
+            "SELECT chat_id FROM chats "
+            "UNION SELECT target_id FROM outbox WHERE target_kind = 'chat' ORDER BY 1"
+        )
+        return [r[0] for r in await cursor.fetchall()]
+
     async def remove_chat(self, c: aiosqlite.Connection, chat_id: int) -> RemoveChatResult:
         # only this chat; the registrar keeps their role and other chats
         canonical = await self.resolve_chat_id(c, chat_id)
         result = await self.unregister_chat(c, canonical)
-        return RemoveChatResult(chat_ids=[canonical] if result.generation else [])
+        return RemoveChatResult(
+            chat_ids=[canonical] if result.generation else [], owner_ids=result.owner_ids
+        )
 
     async def set_root(self, c: aiosqlite.Connection, new_root_id: int) -> SetRootResult:
         previous_root_id = await self.get_root(c)
@@ -427,7 +475,9 @@ class Services:
             dropped_chat_ids = [r[0] for r in rows]
             for chat_id, generation, lang in rows:
                 await c.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
-                await self._queue_farewell(c, chat_id, generation, self._lang(lang))
+                await self._queue_farewell(
+                    c, chat_id, generation, self._lang(lang), (previous_root_id, new_root_id)
+                )
             # delete the old root's role row before inserting the new one, so the
             # roles_single_root partial unique index is never transiently violated
             await c.execute("DELETE FROM roles WHERE user_id = ?", (previous_root_id,))
@@ -458,6 +508,9 @@ class Services:
             (self._now(), new_root_id),
         )
 
+        if previous_root_id is not None:
+            await self._retarget_reconcile_notices(c, previous_root_id, new_root_id)
+
         # set the new user's role to exactly root; if he was admin, this replaces
         # that row in place, so every chat he registered as admin is kept as-is
         await c.execute(
@@ -473,15 +526,48 @@ class Services:
             notified_previous=notified_previous,
         )
 
+    async def _retarget_reconcile_notices(
+        self, c: aiosqlite.Connection, old_root_id: int, new_root_id: int
+    ) -> None:
+        """Pending removed-chats notices go to the new root, or are cancelled if it cannot be reached."""
+        cursor = await c.execute(
+            "SELECT event_id, payload FROM outbox WHERE event_type = 'reconcile_removed' "
+            "AND target_kind = 'user' AND target_id = ? AND status = 'pending'",
+            (old_root_id,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+        reachable = await self.has_private_contact(c, new_root_id)
+        lang = await self.get_user_lang(c, new_root_id) if reachable else None
+        for event_id, raw in rows:
+            if reachable:
+                payload = json.loads(raw)
+                payload["lang"] = lang
+                await c.execute(
+                    "UPDATE outbox SET target_id = ?, payload = ?, updated_at = ? WHERE event_id = ?",
+                    (new_root_id, json.dumps(payload), self._now(), event_id),
+                )
+            else:
+                await c.execute(
+                    "UPDATE outbox SET status = 'cancelled', updated_at = ? WHERE event_id = ?",
+                    (self._now(), event_id),
+                )
+
     # --- outbox ---
 
     async def _queue_farewell(
-        self, c: aiosqlite.Connection, chat_id: int, generation: int, lang: Lang
+        self,
+        c: aiosqlite.Connection,
+        chat_id: int,
+        generation: int,
+        lang: Lang,
+        owners: Sequence[int] = (),
     ) -> None:
         # farewell:<chat_id>:<generation> is deterministic and collision-free: a chat
         # only ever gets one farewell per registration generation, and generation is
         # a monotonic counter shared by all chats. The chat row is gone by delivery
-        # time, so its language travels in the payload.
+        # time, so its language and the owners whose menus need a refresh travel in the payload.
         await self.queue_event(
             c,
             event_key=f"farewell:{chat_id}:{generation}",
@@ -489,7 +575,7 @@ class Services:
             target_kind="chat",
             target_id=chat_id,
             generation=generation,
-            payload={"lang": lang},
+            payload={"lang": lang, "owners": list(owners)},
         )
 
     async def queue_event(

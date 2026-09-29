@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
 
@@ -63,6 +63,7 @@ class Actor:
 class ParsedCommand:
     cmd: Cmd
     args: tuple[str, ...]
+    via_alias: bool = field(default=False, compare=False)  # typed as a short group form
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,7 @@ class IncomingEvent:
     # membership / migration
     left_user_id: int | None = None
     bot_removed: bool = False
+    bot_added: bool = False  # my_chat_member: the bot became a member/administrator
     migrate_to_chat_id: int | None = None
     migrate_from_chat_id: int | None = None
 

@@ -14,10 +14,7 @@ PONG = "pong"
 
 # key -> (en, ru). Placeholders are str.format fields; their values are HTML-escaped by t().
 _CATALOG: dict[str, tuple[str, str]] = {
-    "welcome": (
-        "Chat registered. Subscribe: /upb notify on. Ping: /upb all. Help: /upb help.",
-        "\u0427\u0430\u0442 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d. \u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430: /upb notify on. \u041f\u0438\u043d\u0433: /upb all. \u0421\u043f\u0440\u0430\u0432\u043a\u0430: /upb help.",
-    ),
+    "welcome": ("Chat registered. Subscribe: /on. Ping: /all. Help: /help.", "\u0427\u0430\u0442 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d. \u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430: /on. \u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445: /all. \u0421\u043f\u0440\u0430\u0432\u043a\u0430: /help."),
     "already_registered": ("Chat is already registered.", "\u0427\u0430\u0442 \u0443\u0436\u0435 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d."),
     "subscribed": ("Subscribed.", "\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043e\u0444\u043e\u0440\u043c\u043b\u0435\u043d\u0430."),
     "already_subscribed": ("Already subscribed.", "\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u0443\u0436\u0435 \u043e\u0444\u043e\u0440\u043c\u043b\u0435\u043d\u0430."),
@@ -27,7 +24,7 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "farewell": ("Chat unregistered. Bye!", "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u0430 \u0441\u043d\u044f\u0442\u0430. \u0414\u043e \u0432\u0441\u0442\u0440\u0435\u0447\u0438!"),
     "lang_set": ("Language: English.", "\u042f\u0437\u044b\u043a: \u0440\u0443\u0441\u0441\u043a\u0438\u0439."),
     "root_cli_only": ("Root is assigned via CLI only.", "Root \u043d\u0430\u0437\u043d\u0430\u0447\u0430\u0435\u0442\u0441\u044f \u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0435\u0440\u0435\u0437 CLI."),
-    "bad_args": ("Invalid arguments. Usage: {syntax}", "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: {syntax}"),
+    "bad_args": ("Invalid arguments. Usage: <code>{syntax}</code>", "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b. \u0424\u043e\u0440\u043c\u0430\u0442: <code>{syntax}</code>"),
     "admin_created": ("Admin granted: {id}.", "\u0420\u043e\u043b\u044c admin \u0432\u044b\u0434\u0430\u043d\u0430: {id}."),
     "admin_exists": ("Already admin: {id}.", "\u0420\u043e\u043b\u044c admin \u0443\u0436\u0435 \u0435\u0441\u0442\u044c: {id}."),
     "admin_removed": (
@@ -45,39 +42,38 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "Startup check was interrupted. Chats removed before that: {ids}.",
         "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043f\u0440\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043f\u0440\u0435\u0440\u0432\u0430\u043d\u0430. \u0421\u043d\u044f\u0442\u043e \u0434\u043e \u044d\u0442\u043e\u0433\u043e: {ids}.",
     ),
+    "report_lost": (
+        "Startup report was not delivered. Chats removed on check: {ids}.",
+        "\u041e\u0442\u0447\u0451\u0442 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {ids}.",
+    ),
     "startup": (
         "Bot started. Chats removed on check: {n}.",
         "\u0411\u043e\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {n}.",
     ),
     "name_unknown": ("name unknown", "\u0438\u043c\u044f \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"),
-    "ping_note": (
-        "Recipients are fixed at the command. Delivery is not guaranteed.",
-        "\u041f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u0438 \u0444\u0438\u043a\u0441\u0438\u0440\u0443\u044e\u0442\u0441\u044f \u0432 \u043c\u043e\u043c\u0435\u043d\u0442 \u043a\u043e\u043c\u0430\u043d\u0434\u044b. \u0414\u043e\u0441\u0442\u0430\u0432\u043a\u0430 \u043d\u0435 \u0433\u0430\u0440\u0430\u043d\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f.",
-    ),
     "help_title": ("Commands:", "\u041a\u043e\u043c\u0430\u043d\u0434\u044b:"),
-    "help_register_hint": (
-        "To register a group: add the bot there and send /upb chat register.",
-        "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0433\u0440\u0443\u043f\u043f\u044b: \u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u0431\u043e\u0442\u0430 \u0432 \u0433\u0440\u0443\u043f\u043f\u0443 \u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 /upb chat register.",
-    ),
+    "help_register_hint": ("To register a group: add the bot there and send <code>/register</code>.", "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0433\u0440\u0443\u043f\u043f\u044b: \u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u0431\u043e\u0442\u0430 \u0432 \u0433\u0440\u0443\u043f\u043f\u0443 \u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 <code>/register</code>."),
     "chats_empty": ("No registered chats.", "\u0417\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0445 \u0447\u0430\u0442\u043e\u0432 \u043d\u0435\u0442."),
     "admins_empty": ("No admins.", "\u0410\u0434\u043c\u0438\u043d\u043e\u0432 \u043d\u0435\u0442."),
     "startup_removed": ("Removed: {ids}.", "\u0421\u043d\u044f\u0442\u043e: {ids}."),
+    # menu entry without a help line (short: shown in the "/" suggestions)
+    "menu_usage": ("Syntax", "\u0421\u0438\u043d\u0442\u0430\u043a\u0441\u0438\u0441"),
     # command summaries, one per listed command
-    "cmd_chat_register": ("Register this chat.", "\u0417\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0447\u0430\u0442."),
-    "cmd_chat_unregister": ("Unregister this chat.", "\u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e \u0447\u0430\u0442\u0430."),
-    "cmd_notify_on": ("Subscribe yourself.", "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f."),
-    "cmd_notify_off": ("Unsubscribe yourself.", "\u041e\u0442\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f."),
-    "cmd_ping": ("Ping all subscribers.", "\u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445 \u043f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u043e\u0432."),
-    "cmd_list": ("List subscribers.", "\u0421\u043f\u0438\u0441\u043e\u043a \u043f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u043e\u0432."),
-    "cmd_help": ("Show this help.", "\u042d\u0442\u0430 \u0441\u043f\u0440\u0430\u0432\u043a\u0430."),
-    "cmd_lang": ("Set the chat language.", "\u042f\u0437\u044b\u043a \u0447\u0430\u0442\u0430."),
-    "cmd_p_help": ("Show this help.", "\u042d\u0442\u0430 \u0441\u043f\u0440\u0430\u0432\u043a\u0430."),
-    "cmd_p_lang": ("Set your language.", "\u042f\u0437\u044b\u043a \u0432 \u043b\u0438\u0447\u043a\u0435."),
-    "cmd_admin_create": ("Grant the admin role.", "\u0412\u044b\u0434\u0430\u0442\u044c \u0440\u043e\u043b\u044c admin."),
-    "cmd_admin_remove": ("Revoke the admin role.", "\u0421\u043d\u044f\u0442\u044c \u0440\u043e\u043b\u044c admin."),
-    "cmd_admin_list": ("List admins.", "\u0421\u043f\u0438\u0441\u043e\u043a \u0430\u0434\u043c\u0438\u043d\u043e\u0432."),
-    "cmd_chat_list": ("List registered chats.", "\u0421\u043f\u0438\u0441\u043e\u043a \u0447\u0430\u0442\u043e\u0432."),
-    "cmd_chat_remove": ("Unregister a chat.", "\u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e \u0447\u0430\u0442\u0430."),
+    "cmd_chat_register": ("Register", "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f"),
+    "cmd_chat_unregister": ("Unregister", "\u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e"),
+    "cmd_notify_on": ("Subscribe", "\u041f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f"),
+    "cmd_notify_off": ("Unsubscribe", "\u041e\u0442\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f"),
+    "cmd_ping": ("Ping all", "\u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445"),
+    "cmd_list": ("Subscribers", "\u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438"),
+    "cmd_help": ("Help", "\u0421\u043f\u0440\u0430\u0432\u043a\u0430"),
+    "cmd_lang": ("Language", "\u042f\u0437\u044b\u043a"),
+    "cmd_p_help": ("Help", "\u0421\u043f\u0440\u0430\u0432\u043a\u0430"),
+    "cmd_p_lang": ("Language", "\u042f\u0437\u044b\u043a"),
+    "cmd_admin_create": ("Grant admin", "\u0412\u044b\u0434\u0430\u0442\u044c admin"),
+    "cmd_admin_remove": ("Revoke admin", "\u0421\u043d\u044f\u0442\u044c admin"),
+    "cmd_admin_list": ("Admins", "\u0410\u0434\u043c\u0438\u043d\u044b"),
+    "cmd_chat_list": ("Chats", "\u0427\u0430\u0442\u044b"),
+    "cmd_chat_remove": ("Remove chat", "\u0423\u0431\u0440\u0430\u0442\u044c \u0447\u0430\u0442"),
 }
 
 
@@ -90,6 +86,38 @@ def t(key: str, lang: Lang, **kw: object) -> str:
     pair = _CATALOG[key]
     template = pair[1] if lang == "ru" else pair[0]
     return template.format(**{k: esc(str(v)) for k, v in kw.items()})
+
+
+# (command, catalogue key) pairs of the group command menus
+_MENU_COMMON = (
+    ("all", "cmd_ping"),
+    ("on", "cmd_notify_on"),
+    ("off", "cmd_notify_off"),
+    ("list", "cmd_list"),
+    ("help", "cmd_help"),
+    ("usage", "menu_usage"),
+)
+_MENU_OWNER = (("unregister", "cmd_chat_unregister"), ("lang", "cmd_lang"))
+_MENU_REGISTER = (("register", "cmd_chat_register"), ("help", "cmd_help"))
+
+
+def _menu(pairs: Sequence[tuple[str, str]], lang: Lang) -> list[tuple[str, str]]:
+    return [(name, t(key, lang)) for name, key in pairs]
+
+
+def menu_commands(lang: Lang) -> list[tuple[str, str]]:
+    """(command, description) pairs for all members of an active chat."""
+    return _menu(_MENU_COMMON, lang)
+
+
+def owner_menu_commands(lang: Lang) -> list[tuple[str, str]]:
+    """The common set plus the owner commands."""
+    return _menu((*_MENU_COMMON, *_MENU_OWNER), lang)
+
+
+def register_menu_commands(lang: Lang) -> list[tuple[str, str]]:
+    """For the user who added the bot to a group that is not registered yet."""
+    return _menu(_MENU_REGISTER, lang)
 
 
 def mention(user_id: int, display_name: str | None) -> str:
@@ -141,7 +169,16 @@ def split_text(text: str, *, limit: int = MAX_MESSAGE) -> list[str]:
 
 
 def _command_lines(specs: Sequence[access.CommandSpec], lang: Lang) -> list[str]:
-    return [f"{esc(s.syntax)} - {t('cmd_' + s.cmd.value, lang)}" for s in specs]
+    lines = []
+    for s in specs:
+        desc = t("cmd_" + s.cmd.value, lang)
+        if s.alias:
+            lines.append(f"{esc(s.alias)} \u2014 {desc}")  # plain text: Telegram makes it clickable
+        elif len(s.syntax.split()) >= 2 or len(desc.split()) >= 2:
+            lines.append(f"{desc}\n<pre>{esc(s.syntax)}</pre>")
+        else:
+            lines.append(f"{esc(s.syntax)} \u2014 {desc}")
+    return lines
 
 
 def _listed(specs: Sequence[access.CommandSpec], *, chat_active: bool) -> list[access.CommandSpec]:
@@ -160,8 +197,6 @@ def help_text(actor: Actor, *, scope: Scope, chat_active: bool, lang: Lang = DEF
     lines = [t("help_title", lang), *_command_lines(specs, lang)]
     if scope is Scope.PRIVATE:
         lines.append(t("help_register_hint", lang))
-    if any(s.cmd is Cmd.PING for s in specs):
-        lines.append(t("ping_note", lang))
     return "\n".join(lines)
 
 
@@ -212,8 +247,29 @@ def root_revoked_text(when: str, lang: Lang = DEFAULT_LANG) -> str:
     return t("root_revoked", lang, time=when)
 
 
+def split_ids(ids: Sequence[int], *, limit: int = MAX_MESSAGE - 200) -> list[list[int]]:
+    """Groups ids so each group, joined by ', ', fits in limit (room is left for the surrounding text)."""
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_len = 0
+    for i in ids:
+        extra = len(str(i)) + (2 if current else 0)
+        if current and current_len + extra > limit:
+            groups.append(current)
+            current, current_len, extra = [], 0, len(str(i))
+        current.append(i)
+        current_len += extra
+    if current:
+        groups.append(current)
+    return groups
+
+
 def reconcile_interrupted_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
     return t("reconcile_interrupted", lang, ids=", ".join(str(i) for i in chat_ids))
+
+
+def report_lost_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
+    return t("report_lost", lang, ids=", ".join(str(i) for i in chat_ids))
 
 
 def _safe(text: str) -> str:
@@ -277,8 +333,21 @@ def startup_report_text(
     rows: Sequence[ChatRowLike],
     lang: Lang = DEFAULT_LANG,
 ) -> list[str]:
+    return split_text("\n".join(_startup_lines(removed_chat_ids, rows, lang)))
+
+
+def _startup_lines(removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike], lang: Lang) -> list[str]:
     lines = [t("startup", lang, n=len(removed_chat_ids))]
-    if removed_chat_ids:
-        lines.append(t("startup_removed", lang, ids=", ".join(str(i) for i in removed_chat_ids)))
+    for group in split_ids(removed_chat_ids):
+        lines.append(t("startup_removed", lang, ids=", ".join(str(i) for i in group)))
     lines += _chat_lines(rows, lang, True)
-    return split_text("\n".join(lines))
+    return lines
+
+
+def startup_report_ids_parts(
+    removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike], lang: Lang = DEFAULT_LANG
+) -> int:
+    """How many leading report messages carry the removed-chat ids."""
+    lines = _startup_lines(removed_chat_ids, rows, lang)
+    head = 1 + len(split_ids(removed_chat_ids))  # the header and the removed-ids lines
+    return len(split_text("\n".join(lines[:head])))

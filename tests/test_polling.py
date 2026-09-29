@@ -1,6 +1,7 @@
 """aiogram adapter and polling loop, startup reconciliation, exit policy."""
 
 import asyncio
+import json
 import logging
 import signal
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from aiogram.types import (
 )
 
 import app.__main__ as entry
+from app import rendering
 from app.config import Config
 from app.db import open_database
 from app.delivery import (
@@ -972,8 +974,9 @@ async def test_interrupted_reconcile_queues_a_root_notice_delivered_by_the_outbo
     assert len(removed) == 1
     gone = removed[0]
     rows = await _notices(db)
-    assert len(rows) == 1 and rows[0][0] == f"reconcile_removed:10:{gone}" and rows[0][1] == 10
-    await entry.reconcile_chats(ctx, transport)  # same removal again: deduplicated
+    assert len(rows) == 1 and rows[0][1] == 10
+    assert rows[0][0].startswith("reconcile_removed:10:2026-01-01T00:00:00")
+    await entry.reconcile_chats(ctx, transport)  # nothing left to remove: no second notice
     assert len(await _notices(db)) == 1
     ctx.delivery.stop.clear()
     transport.calls.clear()
@@ -1009,3 +1012,200 @@ async def test_uninterrupted_reconcile_queues_no_notice(db):
     transport.set_probe(-1, PermanentSend())
     assert await entry.reconcile_chats(ctx, transport) == [-1]
     assert await _notices(db) == []
+
+
+async def test_same_chats_removed_in_a_later_interrupted_run_are_notified_again(db):
+    clock = FakeClock()
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _reg_world(db, services)
+    (gone,) = await _interrupted_reconcile(db, ctx, services, transport)
+    clock.advance(3600)
+    async with db.transaction() as c:
+        await c.execute(
+            "INSERT INTO chats(chat_id, title, registered_by, registered_at, "
+            "registration_generation, lang) VALUES (?, 'Again', 1, 't', 9, 'en')",
+            (gone,),
+        )
+    ctx.delivery.stop.clear()
+    assert await _interrupted_reconcile(db, ctx, services, transport) == [gone]
+    keys = [r[0] for r in await _notices(db)]
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+async def test_interrupted_notice_with_many_ids_is_split_into_fitting_messages(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, 10, contact=True)
+    ids = [-1000000000000 - i for i in range(400)]
+    await entry._queue_interrupted_notice(ctx, ids, "run-1")
+    rows = await _notices(db)
+    assert len(rows) > 1
+    assert await ctx.delivery.run_outbox_once() == len(rows)
+    texts = [c["text"] for c in transport.calls]
+    assert all(len(t) <= rendering.MAX_MESSAGE for t in texts)
+    assert sum(str(i) in "".join(texts) for i in ids) == len(ids)  # every id is reported once
+    assert "".join(texts).count("-1000000000399") == 1
+
+
+def test_startup_report_splits_a_long_removed_line():
+    ids = [-1000000000000 - i for i in range(400)]
+    parts = rendering.startup_report_text(ids, [], "en")
+    assert len(parts) > 1
+    assert all(len(p) <= rendering.MAX_MESSAGE for p in parts)
+    body = "\n".join(parts)
+    assert all(str(i) in body for i in ids)
+
+
+async def test_failed_notice_write_during_signalled_shutdown_still_exits_zero(db, monkeypatch, caplog):
+    clock, stop = RecordingClock(), asyncio.Event()
+    ctx, services, _t, _c = mk_ctx(db, clock)
+    await _reg_world(db, services)
+
+    async def broken(*a, **kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(entry, "_queue_interrupted_notice", broken)
+
+    class GoneThenSignal(RecordingTransport):
+        async def probe_chat(self, chat_id: int) -> None:
+            await super().probe_chat(chat_id)
+            stop.set()
+            raise PermanentSend()
+
+    with caplog.at_level(logging.ERROR):
+        assert await _serve(db, FakeBot([], stop), clock, stop, GoneThenSignal()) == 0
+    assert "interrupted_notice_error exc=RuntimeError" in caplog.text
+
+
+async def _serve_with_gone_chat(db, send_fails, chats_gone=True):
+    clock, stop = RecordingClock(), asyncio.Event()
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _reg_world(db, services)
+    if chats_gone:
+        transport.set_probe(-1, PermanentSend())
+    if send_fails:
+        transport.queue_raises([PermanentSend()])
+    assert await _serve(db, FakeBot([[_bare(1)]], stop), clock, stop, transport) == 0
+    return await _notices(db)
+
+
+async def test_lost_startup_report_queues_the_removed_chats_notice(db):
+    rows = await _serve_with_gone_chat(db, send_fails=True)
+    assert len(rows) == 1 and rows[0][1] == 10
+    payload = json.loads(rows[0][2])
+    assert payload["chat_ids"] == [-1] and payload["report_lost"] is True
+
+
+async def test_delivered_startup_report_queues_no_notice(db):
+    assert await _serve_with_gone_chat(db, send_fails=False) == []
+
+
+async def test_lost_startup_report_without_removed_chats_queues_no_notice(db):
+    assert await _serve_with_gone_chat(db, send_fails=True, chats_gone=False) == []
+
+
+async def test_startup_report_returns_whether_everything_was_delivered(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, 10, contact=True)
+    assert await entry.send_startup_report(ctx, []) == (True, True)
+    transport.queue_raises([PermanentSend()])
+    assert await entry.send_startup_report(ctx, []) == (False, False)
+
+
+class _FailNthSend(RecordingTransport):
+    """Fails the n-th send (1-based) with exc; `on_fail` runs first."""
+
+    def __init__(self, n, exc, on_fail=None):
+        super().__init__()
+        self._n, self._exc, self._on_fail = n, exc, on_fail
+
+    async def send_message(self, chat_id, text, **kw):
+        await super().send_message(chat_id, text, **kw)
+        if len(self.calls) == self._n:
+            if self._on_fail:
+                self._on_fail()
+            raise self._exc
+
+
+async def _serve_with_long_report(db, transport_factory, stop=None, lang="en"):
+    """Many chats so the report has several parts; chat -1 is gone."""
+    clock, stop = RecordingClock(), stop or asyncio.Event()
+    ctx, services, _t, _c = mk_ctx(db, clock)
+    await make_root(db, services, 10, contact=True)
+    async with db.transaction() as c:
+        await c.execute("UPDATE users SET lang = ? WHERE user_id = 10", (lang,))
+    for n in range(1, 260):
+        await register_chat(db, services, -n, 10, f"Chat number {n} " + "x" * 20)
+    transport = transport_factory(stop)
+    transport.set_probe(-1, PermanentSend())
+    assert await _serve(db, FakeBot([[_bare(1)]], stop), clock, stop, transport) == 0
+    return transport, await _notices(db)
+
+
+async def test_report_lost_after_the_ids_part_queues_no_notice(db):
+    transport, rows = await _serve_with_long_report(
+        db, lambda stop: _FailNthSend(2, PermanentSend())
+    )
+    assert len(transport.calls) == 2 and "-1" in transport.calls[0]["text"]  # ids in part one
+    assert rows == []
+
+
+async def test_report_lost_before_the_ids_part_queues_the_report_lost_notice(db):
+    transport, rows = await _serve_with_long_report(
+        db, lambda stop: _FailNthSend(1, PermanentSend()), lang="ru"
+    )
+    (row,) = rows
+    assert json.loads(row[2])["report_lost"] is True
+    clock = FakeClock()
+    ctx, _s, transport2, _c = mk_ctx(db, clock)
+    await ctx.delivery.run_outbox_once()
+    assert transport2.calls[0]["text"] == (
+        "\u041e\u0442\u0447\u0451\u0442 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 "
+        "\u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d. "
+        "\u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 "
+        "\u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: -1."
+    )
+
+
+async def test_report_lost_text_in_english(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, 10, contact=True)
+    async with db.transaction() as c:
+        await c.execute("UPDATE users SET lang = 'en' WHERE user_id = 10")
+    await entry._queue_interrupted_notice(ctx, [-1, -2], "t", report_lost=True)
+    await ctx.delivery.run_outbox_once()
+    assert transport.calls[0]["text"] == (
+        "Startup report was not delivered. Chats removed on check: -1, -2."
+    )
+
+
+async def test_stop_during_the_report_429_wait_still_queues_the_notice(db):
+    stop = asyncio.Event()
+    transport, rows = await _serve_with_long_report(
+        db, lambda s: _FailNthSend(1, RateLimited(3600.0), on_fail=s.set), stop=stop
+    )
+    assert len(transport.calls) == 1  # no retry after the stop
+    (row,) = rows
+    assert json.loads(row[2])["chat_ids"] == [-1]
+
+
+async def test_prune_once_drops_old_finished_outbox_rows_but_never_pending(db):
+    clock = FakeClock()
+    ctx, services, _t, _c = mk_ctx(db, clock)
+    async with db.transaction() as c:
+        for n, status in enumerate(("sent", "failed", "cancelled", "pending")):
+            await services.queue_event(
+                c, event_key=f"old{n}", event_type="chat_farewell", target_kind="chat",
+                target_id=-n - 1, generation=n, payload={"lang": "en"},
+            )
+            await c.execute("UPDATE outbox SET status = ? WHERE event_key = ?", (status, f"old{n}"))
+    clock.advance(31 * 86400)
+    async with db.transaction() as c:
+        await services.queue_event(
+            c, event_key="fresh", event_type="chat_farewell", target_kind="chat",
+            target_id=-9, generation=9, payload={"lang": "en"},
+        )
+        await c.execute("UPDATE outbox SET status = 'sent' WHERE event_key = 'fresh'")
+    await entry.prune_once(ctx)
+    async with db.reader() as c:
+        cur = await c.execute("SELECT event_key FROM outbox ORDER BY event_key")
+        assert [r[0] for r in await cur.fetchall()] == ["fresh", "old3"]

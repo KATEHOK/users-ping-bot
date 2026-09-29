@@ -5,7 +5,7 @@ import pytest
 from app import rendering
 from app.delivery import AmbiguousSend, PermanentSend, RateLimited
 from app.handlers import handle_event
-from app.models import Cmd
+from app.models import Actor, Cmd, Role, Scope
 from app.rendering import t
 
 from conftest import (
@@ -35,6 +35,18 @@ TEXTS = {
     Cmd.LANG: "/upb lang ru",
 }
 
+# every spelling of each command: the rights and replies must not depend on it
+FORMS = {
+    Cmd.CHAT_REGISTER: ["/upb chat register", "/upb register", "/register"],
+    Cmd.CHAT_UNREGISTER: ["/upb chat unregister", "/upb unregister", "/unregister"],
+    Cmd.NOTIFY_ON: ["/upb notify on", "/on"],
+    Cmd.NOTIFY_OFF: ["/upb notify off", "/off"],
+    Cmd.PING: ["/upb all", "/upb notify all", "/all"],
+    Cmd.LIST: ["/upb list", "/upb notify list", "/list"],
+    Cmd.HELP: ["/upb help", "/upb usage", "/help", "/usage"],
+    Cmd.LANG: ["/upb lang ru", "/lang ru"],
+}
+
 WHO = {"root": ROOT, "owner": REGISTRAR, "foreign_admin": FOREIGN_ADMIN, "subscriber": SUB, "nobody": NOBODY}
 OWNERS = {"root", "owner"}
 MEMBERS = OWNERS | {"subscriber"}
@@ -53,6 +65,7 @@ ACTIVE_ALLOWED = {
 STAFF = {"root", "owner", "foreign_admin"}
 INACTIVE_ALLOWED = {cmd: set() for cmd in TEXTS}
 INACTIVE_ALLOWED[Cmd.CHAT_REGISTER] = STAFF
+INACTIVE_ALLOWED[Cmd.HELP] = STAFF
 
 
 async def _world(db, services, *, active: bool):
@@ -84,7 +97,7 @@ async def _count(db, sql, *params):
 
 def _assert_matrix_reply(cmd: Cmd, who: str, active: bool, texts: list[str]) -> None:
     """The exact reply an allowed sender gets as the first command in the _world chat."""
-    if not active:
+    if not active and cmd is not Cmd.HELP:
         assert cmd is Cmd.CHAT_REGISTER
         assert texts == [rendering.welcome_text("en")]
         return
@@ -106,8 +119,13 @@ def _assert_matrix_reply(cmd: Cmd, who: str, active: bool, texts: list[str]) -> 
         assert set(text.split("\n")) == {sub_line, "U21 - 21"}
     elif cmd is Cmd.HELP:
         assert text.startswith(t("help_title", "en") + "\n")
-        assert "/upb chat register" not in text  # active chat: not advertised
-        assert ("/upb chat unregister" in text) == (who in OWNERS)
+        if active:
+            assert "/register" not in text  # active chat: not advertised
+            assert ("/unregister" in text) == (who in OWNERS)
+            assert ("/lang" in text) == (who in OWNERS)
+        else:  # staff in a free chat: what they can run there
+            assert "/register" in text and "/help" in text
+            assert "/unregister" not in text and "/all" not in text
     elif cmd is Cmd.LANG:
         assert text == t("lang_set", "ru")
     else:
@@ -116,13 +134,15 @@ def _assert_matrix_reply(cmd: Cmd, who: str, active: bool, texts: list[str]) -> 
 
 @pytest.mark.parametrize("active", [True, False])
 @pytest.mark.parametrize("who", list(WHO))
-@pytest.mark.parametrize("cmd", list(TEXTS))
-async def test_rights_matrix(db, cmd, who, active):
+@pytest.mark.parametrize(
+    "cmd,text", [(cmd, text) for cmd, texts in FORMS.items() for text in texts]
+)
+async def test_rights_matrix(db, cmd, text, who, active):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services, active=active)
     table = ACTIVE_ALLOWED if active else INACTIVE_ALLOWED
 
-    await _send(ctx, TEXTS[cmd], WHO[who], 1)
+    await _send(ctx, text, WHO[who], 1)
 
     if who in table[cmd]:
         # an unregister answers through the outbox, everything else with a reply
@@ -133,6 +153,7 @@ async def test_rights_matrix(db, cmd, who, active):
             _assert_matrix_reply(cmd, who, active, await _texts(transport))
     else:
         assert transport.calls == []
+        assert transport.menu_calls == []  # a denied command touches nothing at Telegram
         assert await _count(db, "SELECT COUNT(*) FROM outbox") == 0
         # still committed: the claim and the contact record
         assert await _count(db, "SELECT outcome FROM processed_updates WHERE update_id = 1") == "ignored"
@@ -161,7 +182,7 @@ async def test_register_replies_welcome_and_owner_gets_already_registered(db):
     await _send(ctx, "/upb chat register", REGISTRAR, 1)
     await _send(ctx, "/upb chat register", REGISTRAR, 2)
     assert await _texts(transport) == [
-        "Chat registered. Subscribe: /upb notify on. Ping: /upb all. Help: /upb help.",
+        "Chat registered. Subscribe: /on. Ping: /all. Help: /help.",
         "Chat is already registered.",
     ]
     async with db.reader() as c:
@@ -188,7 +209,7 @@ async def test_unregister_drops_subscriptions_and_queues_farewell_in_chat_langua
         assert await services.get_chat(c, CHAT) is None
         assert not await services.is_subscribed(c, CHAT, SUB)
         ev = (await services.due_events(c, "9999"))[0]
-    assert ev.payload == {"lang": "ru"}
+    assert ev.payload == {"lang": "ru", "owners": [ROOT, REGISTRAR]}
     await ctx.delivery.run_outbox_once()
     assert await _texts(transport) == ["\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u0430 \u0441\u043d\u044f\u0442\u0430. \u0414\u043e \u0432\u0441\u0442\u0440\u0435\u0447\u0438!"]
     # the admin keeps the role
@@ -251,6 +272,33 @@ async def test_ping_excludes_the_initiator_even_when_subscribed(db):
     assert [_ids(t) for t in await _texts(transport)] == [[21]]
     assert transport.calls[0]["reply_to_message_id"] == 77
     assert transport.calls[0]["thread_id"] == 9
+
+
+async def test_all_alias_pings_like_the_full_form(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, "/upb all", REGISTRAR, 1)
+    await _send(ctx, "/all", ROOT, 2)
+    first, second = await _texts(transport)
+    assert _ids(first) == _ids(second) == [SUB, 21]
+
+
+async def test_all_alias_from_a_non_subscriber_is_silent(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, "/all", NOBODY, 1)
+    assert transport.calls == []
+
+
+async def test_short_on_off_help_aliases(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, "/on", NOBODY, 1)
+    await _send(ctx, "/help", NOBODY, 2)
+    await _send(ctx, "/off", NOBODY, 3)
+    texts = await _texts(transport)
+    assert texts[0] == t("subscribed", "en") and texts[2] == t("unsubscribed", "en")
+    assert texts[1].startswith(t("help_title", "en") + "\n")
 
 
 async def test_ping_of_only_the_initiator_answers_pong(db):
@@ -337,20 +385,21 @@ async def test_help_lists_only_what_the_author_may_run(db):
     await _send(ctx, "/upb help", SUB, 1)
     await _send(ctx, "/upb usage", REGISTRAR, 2)
     sub_text, owner_text = await _texts(transport)
-    assert "/upb all" in sub_text and "/upb chat unregister" not in sub_text
-    assert "/upb chat unregister" in owner_text and "/upb lang" in owner_text
-    assert "Recipients are fixed" in sub_text
+    assert "/all \u2014 Ping all" in sub_text and "/unregister" not in sub_text
+    assert "/unregister \u2014 Unregister" in owner_text and "/lang &lt;en|ru&gt; \u2014 Language" in owner_text
+    assert "/upb" not in sub_text + owner_text and "Recipients are fixed" not in sub_text
 
 
 @pytest.mark.parametrize(
     "who,text,expected",
     [
-        ("nobody", "/upb", ["/upb notify on"]),
-        ("nobody", "/upb qwe", ["/upb notify on"]),
-        ("nobody", "/upb notify", ["/upb notify on"]),
-        ("subscriber", "/upb notify", ["/upb notify on", "/upb notify off"]),
-        ("owner", "/upb chat", ["/upb chat unregister"]),
-        ("owner", "/upb lang", ["/upb lang"]),
+        ("nobody", "/upb", ["/on"]),
+        ("nobody", "/upb qwe", ["/on"]),
+        ("nobody", "/upb notify", ["/on"]),
+        ("subscriber", "/upb notify", ["/on", "/off", "/list"]),
+        ("owner", "/upb chat", ["/unregister"]),
+        ("owner", "/upb lang", ["/lang &lt;en|ru&gt;"]),
+        ("owner", "/lang", ["/lang &lt;en|ru&gt;"]),
     ],
 )
 async def test_partial_help_active_chat(db, who, text, expected):
@@ -359,10 +408,10 @@ async def test_partial_help_active_chat(db, who, text, expected):
     await _send(ctx, text, WHO[who], 1)
     out = transport.calls[0]["text"]
     for syntax in expected:
-        assert syntax.replace("<", "&lt;") in out or syntax in out
+        assert syntax in out
     if who == "nobody":
-        assert "/upb all" not in out and "/upb list" not in out
-    assert "/upb chat register" not in out  # already registered: not advertised
+        assert "/all" not in out and "/list" not in out
+    assert "/register" not in out  # already registered: not advertised
 
 
 @pytest.mark.parametrize("who", ["root", "owner", "subscriber", "nobody"])
@@ -371,7 +420,7 @@ async def test_register_is_not_advertised_in_an_active_chat_but_still_runs(db, w
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services, active=True)
     await _send(ctx, text, WHO[who], 1)
-    assert all("/upb chat register" not in c["text"] for c in transport.calls)
+    assert all("/register" not in c["text"] for c in transport.calls)
     await _send(ctx, "/upb chat register", ROOT, 2)
     assert (await _texts(transport))[-1] == t("already_registered", "en")
 
@@ -380,7 +429,7 @@ async def test_register_is_listed_in_an_inactive_chat_for_staff(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services, active=False)
     await _send(ctx, "/upb", FOREIGN_ADMIN, 1)
-    assert "/upb chat register" in transport.calls[0]["text"]
+    assert "/register \u2014 Register" in transport.calls[0]["text"]
 
 
 @pytest.mark.parametrize("who,text", [("subscriber", "/upb"), ("nobody", "/upb notify"), ("nobody", "/upb chat")])
@@ -396,7 +445,7 @@ async def test_partial_help_inactive_chat_shows_only_register_to_an_admin(db):
     await _world(db, services, active=False)
     await _send(ctx, "/upb", FOREIGN_ADMIN, 1)
     out = transport.calls[0]["text"]
-    assert "/upb chat register" in out and "/upb notify" not in out
+    assert "/register" in out and "/on" not in out
 
 
 async def test_usage_with_nothing_to_show_is_silent(db):
@@ -444,8 +493,8 @@ async def test_lang_bad_argument_gets_a_syntax_hint_only_for_owners(db):
     await _send(ctx, "/upb lang de", SUB, 2)
     await _send(ctx, "/upb lang ru extra", REGISTRAR, 3)
     assert await _texts(transport) == [
-        "Invalid arguments. Usage: /upb lang &lt;en|ru&gt;",
-        "Invalid arguments. Usage: /upb lang &lt;en|ru&gt;",
+        "Invalid arguments. Usage: <code>/upb lang &lt;en|ru&gt;</code>",
+        "Invalid arguments. Usage: <code>/upb lang &lt;en|ru&gt;</code>",
     ]
     async with db.reader() as c:
         assert (await services.get_chat(c, CHAT)).lang == "en"
@@ -536,3 +585,39 @@ async def test_error_log_carries_the_class_only(db, monkeypatch, caplog):
     await _send(ctx, "/upb notify on", NOBODY, 1)
     assert "RuntimeError" in caplog.text
     assert "FAKE-TOKEN-MARKER" not in caplog.text
+
+
+@pytest.mark.parametrize("text", ["/help", "/usage", "/upb help", "/upb usage", "/help@upb_bot"])
+async def test_staff_help_in_a_free_chat_lists_register_and_help(db, text):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=False)
+    await _send(ctx, text, FOREIGN_ADMIN, 1)
+    (reply,) = await _texts(transport)
+    assert reply == rendering.help_text(
+        Actor(user_id=FOREIGN_ADMIN, role=Role.ADMIN),
+        scope=Scope.GROUP, chat_active=False, lang="en",
+    )
+    assert "/register" in reply and "/help" in reply
+
+
+async def test_non_staff_help_in_a_free_chat_makes_no_calls(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=False)
+    await _send(ctx, "/help", SUB, 1)
+    assert transport.calls == [] and transport.menu_calls == []
+
+
+@pytest.mark.parametrize(
+    "text,syntax",
+    [
+        ("/lang de", "/lang <en|ru>"),
+        ("/LANG de", "/lang <en|ru>"),
+        ("/upb lang de", "/upb lang <en|ru>"),
+    ],
+)
+async def test_bad_lang_args_show_the_syntax_that_was_used(db, text, syntax):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services, active=True)
+    await _send(ctx, text, ROOT, 1)
+    assert await _texts(transport) == [t("bad_args", "en", syntax=syntax)]
+    assert "&lt;en|ru&gt;" in (await _texts(transport))[0]  # still escaped

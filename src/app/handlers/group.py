@@ -37,18 +37,25 @@ def _note_ping(ctx: Context, chat_id: int, user_id: int) -> None:
     ctx.ping_last[(chat_id, user_id)] = now
 
 
+def _syntax(cmd: Cmd, via_alias: bool) -> str:
+    s = access.spec(cmd)
+    return (s.alias or s.syntax) if via_alias else s.syntax
+
+
 async def handle(ctx: Context, event: IncomingEvent) -> None:
     from . import mark_ignored
 
     parsed = commands.parse_group_command(event.text, event.entities, bot_username=ctx.bot_username)
     if parsed is None:
-        return  # not a /upb command: never recorded
+        return  # not a /upb command or alias: never recorded
 
     cmd = parsed.cmd
     assert event.user_id is not None
     replies: list[str] = []
     ping: list[SubscriberRef] | None = None
     ping_key: tuple[int, int] | None = None
+    menu: list[int] = []  # chats whose command menu may have changed
+    menu_users: list[int] = []  # users whose member menu may be stale
 
     async with ctx.db.transaction() as c:
         if not await ctx.services.claim_update(c, ctx.bot_id, event.update_id):
@@ -78,7 +85,7 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             try:
                 new_lang = commands.validate_args(cmd, parsed.args)  # type: ignore[assignment]
             except ValueError:
-                replies.append(t("bad_args", lang, syntax=access.spec(cmd).syntax))
+                replies.append(t("bad_args", lang, syntax=_syntax(cmd, parsed.via_alias)))
                 cmd = Cmd.USAGE  # nothing more to do below
         elif cmd is Cmd.PING and _ping_limited(ctx, chat_id, event.user_id, actor.is_root):
             await mark_ignored(c, ctx, event.update_id)
@@ -87,8 +94,12 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
         if cmd is Cmd.CHAT_REGISTER:
             result = await ctx.services.register_chat(c, chat_id, event.chat_title, event.user_id)
             replies.append(rendering.welcome_text(lang) if result.created else t("already_registered", lang))
+            menu.append(chat_id)
+            menu_users.extend(await ctx.services.staff_ids(c))  # stale register menus
         elif cmd is Cmd.CHAT_UNREGISTER:
-            await ctx.services.unregister_chat(c, chat_id)  # farewell goes through the outbox
+            result = await ctx.services.unregister_chat(c, chat_id)  # farewell goes via the outbox
+            menu.append(chat_id)
+            menu_users.extend([*await ctx.services.staff_ids(c), *result.owner_ids])
         elif cmd is Cmd.NOTIFY_ON:
             sub = await ctx.services.subscribe(c, chat_id, event.user_id)
             replies.append(t("subscribed" if sub.created else "already_subscribed", lang))
@@ -102,10 +113,11 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             subs = await ctx.services.list_subscribers(c, chat_id)
             replies.extend(rendering.subscriber_list_text(subs, lang) or [t("list_empty", lang)])
         elif cmd is Cmd.HELP:
-            replies.append(rendering.help_text(actor, scope=Scope.GROUP, chat_active=True, lang=lang))
+            replies.append(rendering.help_text(actor, scope=Scope.GROUP, chat_active=active, lang=lang))
         elif cmd is Cmd.LANG:
             await ctx.services.set_chat_lang(c, chat_id, new_lang)
             replies.append(t("lang_set", new_lang))
+            menu.append(chat_id)
         elif cmd is Cmd.USAGE:
             if not replies:  # empty text means nothing to show: silence
                 text = rendering.usage_text(
@@ -129,3 +141,4 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
             event.chat_id, text, reply_to=event.message_id, thread_id=event.thread_id
         ):
             break
+    await send.sync_chat_menus(menu, single_attempt=True, users=menu_users)

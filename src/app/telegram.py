@@ -6,6 +6,7 @@ place aiogram types are touched, so the rest of the app stays testable without a
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Literal
 
 from aiogram import Bot, exceptions, types
@@ -84,6 +85,29 @@ class AiogramTransport:
         except Exception as exc:
             raise map_error(exc) from None
 
+    @staticmethod
+    def _scope(chat_id: int, user_id: int | None) -> types.BotCommandScopeUnion:
+        if user_id is None:
+            return types.BotCommandScopeChat(chat_id=chat_id)
+        return types.BotCommandScopeChatMember(chat_id=chat_id, user_id=user_id)
+
+    async def set_chat_commands(
+        self, chat_id: int, commands: Sequence[tuple[str, str]], *, user_id: int | None = None
+    ) -> None:
+        try:
+            await self._bot.set_my_commands(
+                [types.BotCommand(command=c, description=d) for c, d in commands],
+                scope=self._scope(chat_id, user_id),
+            )
+        except Exception as exc:
+            raise map_error(exc) from None
+
+    async def delete_chat_commands(self, chat_id: int, *, user_id: int | None = None) -> None:
+        try:
+            await self._bot.delete_my_commands(scope=self._scope(chat_id, user_id))
+        except Exception as exc:
+            raise map_error(exc) from None
+
     async def probe_chat(self, chat_id: int) -> None:
         try:
             member = await self._bot.get_chat_member(chat_id, self._bot.id)
@@ -99,6 +123,13 @@ def _bot_gone(member: object) -> bool:
     if status in ("left", "kicked"):
         return True
     return status == "restricted" and getattr(member, "is_member", True) is False
+
+
+def _bot_present(member: object) -> bool:
+    status = getattr(member, "status", None)
+    if status in ("member", "administrator", "creator"):
+        return True
+    return status == "restricted" and getattr(member, "is_member", False) is True
 
 
 def _display_name(user: types.User) -> str | None:
@@ -181,6 +212,11 @@ def _membership_event(
         user_id=cmu.from_user.id if cmu.from_user is not None else None,
         left_user_id=cmu.new_chat_member.user.id if left else None,
         bot_removed=left if kind == "my_chat_member" else False,
+        bot_added=(
+            kind == "my_chat_member"
+            and _bot_present(cmu.new_chat_member)
+            and not _bot_present(cmu.old_chat_member)
+        ),
     )
 
 
