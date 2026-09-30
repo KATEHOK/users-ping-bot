@@ -204,15 +204,44 @@ async def test_startup_deletes_recorded_menus_of_roleless_users_only(db):
     assert await _rows(db) == [(FREE, ROOT, "register")]
 
 
-async def test_startup_purge_keeps_the_row_on_failure_and_logs(db, caplog):
+async def test_startup_purge_drops_the_row_on_a_permanent_failure_and_logs(db, caplog):
     ctx, services, transport, _c = mk_ctx(db)
     async with db.transaction() as c:
         await services.record_member_menu(c, FREE, 77, "register")
     transport.fail_menu(PermanentSend())
     with caplog.at_level(logging.DEBUG):
         await entry.sync_menus(ctx, [])
-    assert await _rows(db) == [(FREE, 77, "register")]
+    assert await _rows(db) == []
     assert any(r.getMessage().startswith("menu_delete_permanent") for r in caplog.records)
+    transport.menu_calls.clear()
+    await entry.sync_menus(ctx, [])  # not retried at the next start
+    assert _deletes(transport) == []
+
+
+@pytest.mark.parametrize("exc", [AmbiguousSend(), RateLimited(MENU_MAX_WAIT + 1)])
+async def test_startup_purge_keeps_the_row_on_a_transient_failure(db, exc):
+    ctx, services, transport, _c = mk_ctx(db)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, FREE, 77, "register")
+    transport.fail_menu(exc)
+    await entry.sync_menus(ctx, [])
+    assert await _rows(db) == [(FREE, 77, "register")]
+    transport.fail_menu(None)
+    await entry.sync_menus(ctx, [])  # retried and dropped
+    assert await _rows(db) == []
+
+
+async def test_a_permanent_failure_drops_the_row_of_a_revoked_admins_menu(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, FREE, ADMIN, "register")
+        await services.record_member_menu(c, -800, ADMIN, "register")
+    transport.fail_menu(PermanentSend())
+    await ctx.delivery.delete_member_menus([FREE], ADMIN, single_attempt=True)
+    transport.fail_menu(AmbiguousSend())
+    await ctx.delivery.delete_member_menus([-800], ADMIN, single_attempt=True)
+    assert await _rows(db) == [(-800, ADMIN, "register")]
 
 
 async def test_startup_purge_lets_unauthorized_out(db):

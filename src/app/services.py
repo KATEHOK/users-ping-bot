@@ -358,9 +358,10 @@ class Services:
     async def list_subscribers(
         self, c: aiosqlite.Connection, chat_id: int, *, exclude_user_id: int | None = None
     ) -> list[SubscriberRef]:
-        # the chat's own name, when set, replaces the Telegram name
+        # the chat's own name, when set, replaces the Telegram name and the username
         sql = (
-            "SELECT s.user_id, COALESCE(n.name, u.display_name), u.username "
+            "SELECT s.user_id, COALESCE(n.name, u.display_name), "
+            "CASE WHEN n.name IS NULL THEN u.username END "
             "FROM subscriptions s JOIN users u ON u.user_id = s.user_id "
             "LEFT JOIN chat_names n ON n.chat_id = s.chat_id AND n.user_id = s.user_id "
             "WHERE s.chat_id = ?"

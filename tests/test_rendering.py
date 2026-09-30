@@ -164,6 +164,30 @@ def test_split_mentions_empty_and_custom_max_items():
     assert split_mentions(["a", "b", "c"], max_items=2) == ["a b", "c"]
 
 
+def _units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _visible_units(chunk: str) -> int:
+    return _units(re.sub(r"<[^>]+>", "", chunk))
+
+
+def test_split_mentions_counts_utf16_units_for_astral_names():
+    parts = [mention(i, "\U0001f600" * 64) for i in range(1, 121)]
+    chunks = split_mentions(parts)
+    assert len(chunks) > 3
+    assert all(_units(c) <= rendering.MAX_MESSAGE and _visible_units(c) <= 4096 for c in chunks)
+    found = [int(x) for c in chunks for x in re.findall(r"tg://user\?id=(\d+)", c)]
+    assert found == list(range(1, 121))
+
+
+def test_split_text_counts_utf16_units_for_astral_lines():
+    lines = ["\U0001f600" * 64 for _ in range(100)]
+    chunks = split_text("\n".join(lines))
+    assert len(chunks) > 3 and all(_units(c) <= rendering.MAX_MESSAGE for c in chunks)
+    assert "\n".join(chunks).split("\n") == lines
+
+
 def test_split_text_splits_on_newlines_under_limit():
     text = "\n".join(f"line{i}" for i in range(50))
     chunks = split_text(text, limit=30)
@@ -200,8 +224,8 @@ def _syntax_lines(text: str) -> set[str]:
     return shown
 
 
-def _shown(s: access.CommandSpec) -> str:
-    return esc(s.alias or s.syntax)
+def _shown(s: access.CommandSpec, lang: str = "en") -> str:
+    return esc(rendering.syntax_text(s.alias or s.syntax, lang))
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -210,7 +234,7 @@ def _shown(s: access.CommandSpec) -> str:
 def test_help_lists_exactly_the_allowed_commands(actor, scope, chat_active, lang):
     allowed = access.allowed_commands(actor, scope=scope, chat_active=chat_active)
     listed = {
-        _shown(s)
+        _shown(s, lang)
         for s in allowed
         if s.cmd not in access.INTERNAL and not (chat_active and s.cmd is Cmd.CHAT_REGISTER)
     }
@@ -257,7 +281,7 @@ def test_help_texts_en_and_ru_for_owner_member_and_private_root():
     assert ru_owner == (
         "\u041a\u043e\u043c\u0430\u043d\u0434\u044b:\n/on \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f\n"
         "/off \u2014 \u041e\u0442\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f\n/all \u2014 \u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445\n"
-        "/list \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438\n/rename &lt;name&gt; \u2014 \u0417\u0430\u0434\u0430\u0442\u044c \u0438\u043c\u044f\n/help \u2014 \u0421\u043f\u0440\u0430\u0432\u043a\u0430\n"
+        "/list \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438\n/rename &lt;\u0438\u043c\u044f&gt; \u2014 \u0417\u0430\u0434\u0430\u0442\u044c \u0438\u043c\u044f\n/help \u2014 \u0421\u043f\u0440\u0430\u0432\u043a\u0430\n"
         "/unregister \u2014 \u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e\n/lang &lt;en|ru&gt; \u2014 \u042f\u0437\u044b\u043a"
     )
     ru_member = help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang="ru")
@@ -396,7 +420,7 @@ def test_usage_is_empty_only_when_nothing_matches(actor, scope, chat_active, pre
         assert (text == "") == (not allowed)
     if text:
         assert find_html_errors(text) == []
-        assert _syntax_lines(text) <= {_shown(s) for s in allowed}
+        assert _syntax_lines(text) <= {_shown(s, 'ru') for s in allowed}
 
 
 def test_usage_never_falls_back_for_known_prefix():

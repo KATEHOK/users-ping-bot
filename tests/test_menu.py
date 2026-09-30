@@ -395,16 +395,33 @@ async def test_outbox_sync_ignores_the_startup_abort(db):
     assert {c["chat_id"] for c in transport.menu_calls} == {-1, -2, -3}
 
 
-async def test_a_nested_sync_does_not_clear_the_startup_abort(db):
+async def test_a_long_429_met_by_a_concurrent_sync_does_not_abort_the_startup_batch(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await register_chat(db, services, -1, ADMIN)
     await register_chat(db, services, -2, ADMIN)
-    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
-    await ctx.delivery.sync_chat_menu(-9, single_attempt=True)  # another task's sync
-    transport.menu_calls.clear()
-    await entry.sync_menus(ctx, [])
-    assert len(transport.menu_calls) == 1
+    entered, gate = asyncio.Event(), asyncio.Event()
+    real_set, real_delete = transport.set_chat_commands, transport.delete_chat_commands
+
+    async def set_commands(chat_id, commands, *, user_id=None):
+        if chat_id == -2 and user_id is None and not gate.is_set():
+            entered.set()
+            await gate.wait()  # the startup batch is parked inside its first chat
+        await real_set(chat_id, commands, user_id=user_id)
+
+    async def delete_commands(chat_id, *, user_id=None):
+        await real_delete(chat_id, user_id=user_id)
+        if chat_id == -9:
+            raise RateLimited(MENU_MAX_WAIT + 1)
+
+    transport.set_chat_commands, transport.delete_chat_commands = set_commands, delete_commands
+    startup = asyncio.create_task(entry.sync_menus(ctx, []))
+    await entered.wait()
+    assert await ctx.delivery.sync_chat_menu(-9, single_attempt=True) is False  # a handler's sync
+    gate.set()
+    await startup
+    # the flood belongs to the other sync: the startup batch still reaches chat -1
+    assert -1 in {c["chat_id"] for c in transport.menu_calls}
 
 
 async def test_startup_sync_goes_on_after_a_429_within_the_cap_was_waited_out(db):
@@ -699,7 +716,7 @@ async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
     assert slept == []
     assert any(r.getMessage().startswith("menu_delete_permanent ") for r in caplog.records)
     assert any(r.getMessage().startswith("menu_delete_retries_exhausted ") for r in caplog.records)
-    assert await _recorded(db, services, ADMIN) == [501, 502]  # failed deletes stay recorded
+    assert await _recorded(db, services, ADMIN) == [502]  # a permanent failure drops the record, a 429 keeps it
 
 
 async def test_unauthorized_from_the_admin_revoke_purge_propagates(db):

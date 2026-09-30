@@ -2,13 +2,15 @@
 
 import pytest
 
+import app.__main__ as entry
 from app import commands, rendering
+from app.delivery import PermanentSend
 from app.db import MIGRATIONS_DIR, Database, _split_statements, apply_migrations
 from app.handlers import handle_event
 from app.models import Cmd, ParsedCommand
 from app.rendering import t
 
-from conftest import BOT_USERNAME, group_event, make_admin, make_root, mk_ctx, private_event, register_chat, subscribe
+from conftest import BOT_ID, BOT_USERNAME, find_html_errors, group_event, make_admin, make_event, make_root, mk_ctx, private_event, register_chat, subscribe
 
 CHAT = 500
 REGISTRAR = 1
@@ -153,11 +155,25 @@ def test_validate_name_accepts(raw, name):
         "a⁦b",
         "a⁩b",
         "‮",
+        # nothing visible: format, bare marks, spaces, blank fillers, bidi marks
+        "\u200b", "\u2060", "\ufeff", "\u00ad", "\u200e", "\u200f", "\u061c",
+        "\u0301", "\u034f", "\u20dd", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800", "\u180e",
+        "\u200b\u2060\u3164\u0301\u2800", "\u00a0\u200b \u3000",
+        # bidi marks are rejected anywhere
+        "a\u200eb", "a\u200fb", "a\u061cb",
     ],
 )
 def test_validate_name_rejects(raw):
     with pytest.raises(ValueError):
         commands.validate_name(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["a\u200b", "\u200bx", "e\u0301", "\u0301e", "a\u3164", "\u2800b", "\U0001f468\u200d\U0001f469\u200d\U0001f467"],
+)
+def test_validate_name_accepts_a_visible_character_among_invisible_ones(raw):
+    assert commands.validate_name(raw) == raw
 
 
 def test_length_counts_code_points_after_normalisation():
@@ -196,7 +212,7 @@ async def test_reply_is_short_and_escaped(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await _say(ctx, f"/rename {EVIL}")
-    assert _texts(transport) == ["Name in this chat: &lt;b&gt;&amp;\"x\"&lt;/b&gt;."]
+    assert _texts(transport) == ["Name in this chat: &lt;b&gt;&amp;\"x\"&lt;/\u2060b&gt;."]
 
 
 async def test_reply_language_follows_the_chat(db):
@@ -387,13 +403,13 @@ async def test_names_are_per_chat(db):
         assert [s.display_name for s in await services.list_subscribers(c, 600)] == [f"User{SUB}"]
 
 
-async def test_list_uses_the_chat_name_escaped_and_keeps_the_username(db):
+async def test_list_shows_only_the_chat_name_escaped(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
     await _say(ctx, f"/rename {EVIL}@x", username="u_name")
     transport.calls.clear()
     await _say(ctx, "/list", username="u_name")
-    assert _texts(transport) == [f"&lt;b&gt;&amp;\"x\"&lt;/b&gt;＠x (u_name) - {SUB}"]
+    assert _texts(transport) == [f"&lt;b&gt;&amp;\"x\"&lt;/\u2060b&gt;＠x - {SUB}"]
 
 
 async def test_off_and_on_keep_the_name(db):
@@ -559,8 +575,103 @@ async def test_help_and_usage_list_the_alias_as_plain_text(db, lang, desc):
     await _say(ctx, "/help")
     await _say(ctx, "/upb notify")
     for text in _texts(transport):
-        assert f"/rename &lt;name&gt; — {desc}" in text
+        assert f"/rename &lt;{'имя' if lang == 'ru' else 'name'}&gt; — {desc}" in text
         assert "<pre>" not in text
     transport.calls.clear()
     await _say(ctx, "/help", user=NOBODY)
     assert transport.calls == []
+
+
+# --- inert rendering (F3) ---
+
+
+@pytest.mark.parametrize("lang", ["en", "ru"])
+async def test_replies_render_the_name_inert(db, lang):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    async with db.transaction() as c:
+        await services.set_chat_lang(c, CHAT, lang)
+    await _say(ctx, "/rename @boss /unregister")
+    await _say(ctx, "/rename")
+    set_text, usage_text = _texts(transport)
+    for text in (set_text, usage_text):
+        assert "\uff20boss" in text and "@boss" not in text
+        assert "/\u2060unregister" in text and "/unregister" not in text
+    await _say(ctx, "/rename -", display_name="/x @y")
+    reset_text = _texts(transport)[2]
+    assert "/\u2060x \uff20y" in reset_text and "@y" not in reset_text and "/x" not in reset_text
+    assert all(find_html_errors(x) == [] for x in _texts(transport))
+
+
+async def test_list_renders_a_leading_command_inert(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await _say(ctx, "/rename /unregister")
+    transport.calls.clear()
+    await _say(ctx, "/list")
+    assert _texts(transport) == [f"/\u2060unregister - {SUB}"]
+
+
+async def test_ping_mention_text_is_not_made_inert(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await subscribe(db, services, CHAT, 21)
+    await _say(ctx, "/rename /x@y")
+    transport.calls.clear()
+    await _say(ctx, "/all", user=21)
+    assert f'<a href="tg://user?id={SUB}">/x@y</a>' in _texts(transport)[0]
+
+
+async def test_rename_with_an_invisible_name_is_rejected_and_changes_nothing(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await _say(ctx, "/rename Ann")
+    await _say(ctx, "/rename \u200b\u3164")
+    assert await _names(db) == [(CHAT, SUB, "Ann")]
+    assert _texts(transport)[-1] == t("rename_bad", "en", syntax="/rename <name>")
+
+
+async def test_ru_syntax_uses_the_ru_placeholder(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    async with db.transaction() as c:
+        await services.set_chat_lang(c, CHAT, "ru")
+    await _say(ctx, "/rename")
+    await _say(ctx, "/upb notify rename \u200b")
+    await _say(ctx, "/upb rename")
+    texts = "\n".join(_texts(transport))
+    assert "<code>/rename &lt;\u0438\u043c\u044f&gt;</code>" in texts
+    assert "<code>/upb notify rename &lt;\u0438\u043c\u044f&gt;</code>" in texts
+    assert "&lt;name&gt;" not in texts
+
+
+# --- names go with the chat (F8) ---
+
+
+async def test_bot_removed_from_a_registered_chat_drops_its_names(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, 600, REGISTRAR)
+    await subscribe(db, services, 600, SUB)
+    await _say(ctx, "/rename Ann")
+    await _say(ctx, "/rename Bob", chat_id=600)
+    await handle_event(
+        ctx,
+        make_event(
+            kind="my_chat_member", update_id=1, chat_id=CHAT, user_id=REGISTRAR,
+            chat_type="group", bot_removed=True, left_user_id=BOT_ID, text=None,
+        ),
+    )
+    assert await _names(db) == [(600, SUB, "Bob")]
+
+
+async def test_startup_reconcile_of_a_gone_chat_drops_its_names(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, 600, REGISTRAR)
+    await subscribe(db, services, 600, SUB)
+    await _say(ctx, "/rename Ann")
+    await _say(ctx, "/rename Bob", chat_id=600)
+    transport.set_probe(CHAT, PermanentSend())
+    assert await entry.reconcile_chats(ctx, transport) == [CHAT]
+    assert await _names(db) == [(600, SUB, "Bob")]

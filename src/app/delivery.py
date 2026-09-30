@@ -453,6 +453,9 @@ class Delivery:
             except PermanentSend:
                 # a gone chat, a forbidden bot or a user who is not in the chat
                 _log_code(f"{code}_permanent", chat_id=chat_id, user_id=user_id)
+                if commands is None and user_id is not None:
+                    # the call can never succeed: drop the record instead of retrying forever
+                    await self._note_menu(chat_id, user_id, None, False)
                 return False
 
     # --- outbox ---

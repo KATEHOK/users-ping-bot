@@ -167,14 +167,22 @@ def parse_private_command(
 
 NAME_MAX = 64
 NAME_RESET = "-"
-_BIDI = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+_BIDI = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f\u061c")
+# blank-looking letters and symbols that are not format, mark or space characters
+_BLANK = frozenset("\u115f\u1160\u3164\uffa0\u2800\u180e")
+_NOT_VISIBLE = ("Cf", "Mn", "Me", "Zs", "Zl", "Zp", "Cc")
+
+
+def _visible(ch: str) -> bool:
+    return unicodedata.category(ch) not in _NOT_VISIBLE and ch not in _BLANK
 
 
 def validate_name(raw: str) -> str:
     """Normalised display name (1..NAME_MAX code points); ValueError when not allowed.
 
     Edges are stripped, then control/line-break/bidi characters are rejected (an inner
-    newline or tab is not a space), then runs of spaces collapse to one.
+    newline or tab is not a space), then runs of spaces collapse to one. At least one
+    character must be visible (not a format or bare combining mark, space or blank filler).
     """
     text = raw.strip()
     if any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") or ch in _BIDI for ch in text):
@@ -182,6 +190,8 @@ def validate_name(raw: str) -> str:
     name = " ".join(text.split())
     if not 1 <= len(name) <= NAME_MAX:
         raise ValueError("bad length")
+    if not any(_visible(ch) for ch in name):
+        raise ValueError("no visible character")
     return name
 
 
