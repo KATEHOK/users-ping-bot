@@ -302,3 +302,20 @@ async def test_reconcile_of_a_gone_chat_forgets_its_rows(db):
     transport.set_probe(CHAT_ID, PermanentSend())
     assert await entry.reconcile_chats(ctx, transport) == [CHAT_ID]
     assert await _rows(db) == [(FREE, ROOT, "register")]
+
+
+async def test_startup_purge_stops_on_a_long_429_after_a_migration(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT)
+    await register_chat(db, services, CHAT_ID, ROOT)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, CHAT_ID, 77, "register")
+        await services.record_member_menu(c, 900, 77, "register")
+    async with db.reader() as c:
+        first = (await services.roleless_member_menus(c))[0]
+    assert first == (CHAT_ID, 77)
+    # the first delete reports the migration, every later call meets a long 429
+    transport.queue_menu_raises([ChatMigrated(-1001)])
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await ctx.delivery.sync_menus_at_start([])
+    assert all(c["chat_id"] != 900 for c in transport.menu_calls)  # the other row was not tried

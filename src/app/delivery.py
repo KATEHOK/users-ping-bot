@@ -323,9 +323,11 @@ class Delivery:
         done = await self._menu_call(chat_id, user_id, None, active, attempts, flood)
         if done is None:
             # a registered chat had migrated: the registration and the record moved on
-            await self._delete_after_migration(chat_id, user_id, attempts)
+            await self._delete_after_migration(chat_id, user_id, attempts, flood)
 
-    async def _delete_after_migration(self, old_chat_id: int, user_id: int, attempts: int) -> None:
+    async def _delete_after_migration(
+        self, old_chat_id: int, user_id: int, attempts: int, flood: _Flood | None
+    ) -> None:
         try:
             async with self._db.reader() as c:
                 new_chat_id = await self._services.resolve_chat_id(c, old_chat_id)
@@ -333,7 +335,7 @@ class Delivery:
             logger.error("menu_state_error exc=%s", type(exc).__name__)
             return
         if new_chat_id != old_chat_id:
-            await self._menu_call(new_chat_id, user_id, None, True, attempts)
+            await self._menu_call(new_chat_id, user_id, None, True, attempts, flood)
 
     async def _note_menu(
         self, chat_id: int, user_id: int, commands: list[tuple[str, str]] | None, active: bool

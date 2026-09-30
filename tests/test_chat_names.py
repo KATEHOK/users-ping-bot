@@ -158,6 +158,7 @@ def test_validate_name_accepts(raw, name):
         # nothing visible: format, bare marks, spaces, blank fillers, bidi marks
         "\u200b", "\u2060", "\ufeff", "\u00ad", "\u200e", "\u200f", "\u061c",
         "\u0301", "\u034f", "\u20dd", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800", "\u180e",
+        "\ue000", "\U0010fffd", "\ue000\u200b",
         "\u200b\u2060\u3164\u0301\u2800", "\u00a0\u200b \u3000",
         # bidi marks are rejected anywhere
         "a\u200eb", "a\u200fb", "a\u061cb",
@@ -174,6 +175,11 @@ def test_validate_name_rejects(raw):
 )
 def test_validate_name_accepts_a_visible_character_among_invisible_ones(raw):
     assert commands.validate_name(raw) == raw
+
+
+def test_unassigned_code_points_count_as_visible():
+    # an emoji newer than the runtime's Unicode data looks unassigned here
+    assert commands.validate_name("\u0378") == "\u0378"
 
 
 def test_length_counts_code_points_after_normalisation():
