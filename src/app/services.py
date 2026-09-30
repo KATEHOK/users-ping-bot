@@ -786,4 +786,36 @@ class Services:
             (new_chat_id, now, old_chat_id),
         )
 
+        # recorded personal menus follow the chat (a later delete at the new id is harmless)
+        await c.execute(
+            "UPDATE OR IGNORE member_menus SET chat_id = ? WHERE chat_id = ?",
+            (new_chat_id, old_chat_id),
+        )
+        await c.execute("DELETE FROM member_menus WHERE chat_id = ?", (old_chat_id,))
+
         return MigrationResult(action=action)
+
+    # --- personal command menus ---
+
+    async def record_member_menu(
+        self, c: aiosqlite.Connection, chat_id: int, user_id: int, kind: str
+    ) -> None:
+        """A member-scope menu was set (`owner` or `register`): upsert."""
+        await c.execute(
+            "INSERT INTO member_menus(chat_id, user_id, kind, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, user_id) DO UPDATE SET kind = excluded.kind, "
+            "updated_at = excluded.updated_at",
+            (chat_id, user_id, kind, self._now()),
+        )
+
+    async def forget_member_menu(self, c: aiosqlite.Connection, chat_id: int, user_id: int) -> None:
+        await c.execute(
+            "DELETE FROM member_menus WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+
+    async def member_menu_chats(self, c: aiosqlite.Connection, user_id: int) -> list[int]:
+        """Chats (registered or not) where this user has a recorded personal menu."""
+        cursor = await c.execute(
+            "SELECT chat_id FROM member_menus WHERE user_id = ? ORDER BY chat_id", (user_id,)
+        )
+        return [r[0] for r in await cursor.fetchall()]

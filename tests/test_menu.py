@@ -601,17 +601,33 @@ async def _known_chats(db, services):
         await services.unregister_chat(c, 502)
 
 
-async def test_admin_revoke_deletes_the_member_menu_in_every_known_chat(db):
+async def _record(db, services, chat_id, user_id, kind="register"):
+    async with db.transaction() as c:
+        await services.record_member_menu(c, chat_id, user_id, kind)
+
+
+async def _recorded(db, services, user_id):
+    async with db.reader() as c:
+        return await services.member_menu_chats(c, user_id)
+
+
+async def test_admin_revoke_deletes_the_member_menu_in_the_recorded_chats_only(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _known_chats(db, services)
     await register_chat(db, services, CHAT_ID, ADMIN)
+    # 7777: a group the bot was added to and nobody registered; 888: someone else's menu only
+    for chat_id in (501, 502, 7777):
+        await _record(db, services, chat_id, ADMIN)
+    await _record(db, services, 888, ROOT)
     transport.menu_calls.clear()
     await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT))
     purge = [(c["chat_id"], c["op"]) for c in transport.menu_calls if c["user_id"] == ADMIN]
-    assert sorted(purge) == [(CHAT_ID, "delete"), (501, "delete"), (502, "delete")]
+    assert sorted(purge) == [(CHAT_ID, "delete"), (501, "delete"), (502, "delete"), (7777, "delete")]
     # the cascade chat is handled once: no second delete for the same member
-    assert len(purge) == 3
-    assert len(transport.menu_calls) == 5  # 2 purges + the cascade's chat, admin and root calls
+    assert len(transport.menu_calls) == 6  # 3 purges + the cascade's chat, admin and root calls
+    assert all(c["chat_id"] != 888 for c in transport.menu_calls)
+    assert await _recorded(db, services, ADMIN) == []
+    assert await _recorded(db, services, ROOT) == [CHAT_ID, 888]  # + the register menu just set
 
 
 async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
@@ -624,6 +640,8 @@ async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
     clock.sleep = sleep
     ctx, services, transport, _c = mk_ctx(db, clock)
     await _known_chats(db, services)
+    for chat_id in (501, 502):
+        await _record(db, services, chat_id, ADMIN)
     transport.menu_calls.clear()
     real = transport.delete_chat_commands
 
@@ -639,11 +657,13 @@ async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
     assert slept == []
     assert any(r.getMessage().startswith("menu_delete_permanent ") for r in caplog.records)
     assert any(r.getMessage().startswith("menu_delete_retries_exhausted ") for r in caplog.records)
+    assert await _recorded(db, services, ADMIN) == [501, 502]  # failed deletes stay recorded
 
 
 async def test_unauthorized_from_the_admin_revoke_purge_propagates(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _known_chats(db, services)
+    await _record(db, services, 501, ADMIN)
     transport.fail_menu(Unauthorized())
     with pytest.raises(Unauthorized):
         await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT))
@@ -693,6 +713,7 @@ async def test_cli_root_change_syncs_active_chats_once_the_notice_is_final(db, f
     await make_root(db, services, ROOT, contact=True)
     await make_admin(db, services, ADMIN)
     await register_chat(db, services, CHAT_ID, ADMIN)
+    await _record(db, services, CHAT_ID, ROOT, "owner")
     async with db.transaction() as c:  # what the CLI does: no transport
         await services.touch_user(c, 11)
         await services.set_root(c, 11)

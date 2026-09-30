@@ -93,8 +93,10 @@ async def _execute(
             return [t("admin_absent", lang, id=arg)]
         menu.extend(result.chat_ids)
         menu_users.extend([*await svc.staff_ids(c), *result.owner_ids])
-        # free groups the admin once added the bot to are not recorded: try every known chat
-        purge.extend((i, arg) for i in await svc.known_chat_ids(c) if i not in result.chat_ids)
+        # the recorded personal menus, registered chats or not (the cascaded ones are synced above)
+        purge.extend(
+            (i, arg) for i in await svc.member_menu_chats(c, arg) if i not in result.chat_ids
+        )
         return [t("admin_removed", lang, id=arg, n=len(result.chat_ids))]
 
     if cmd is Cmd.ADMIN_LIST:

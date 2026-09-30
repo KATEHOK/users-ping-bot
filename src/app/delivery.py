@@ -264,7 +264,7 @@ class Delivery:
     async def delete_member_menus(
         self, chat_ids: Sequence[int], user_id: int, *, single_attempt: bool = False
     ) -> None:
-        """Delete one user's member-scope menu in each chat (a revoked admin's leftovers).
+        """Delete one user's member-scope menu in each chat (a revoked role's leftovers).
 
         Failures (e.g. the user is not in the chat) are logged by code; Unauthorized propagates.
         """
@@ -272,7 +272,42 @@ class Delivery:
         for chat_id in dict.fromkeys(chat_ids):
             if self.stop.is_set():
                 return
-            await self._menu_call(chat_id, user_id, None, False, attempts)
+            try:
+                async with self._db.reader() as c:
+                    active = await self._services.get_chat(c, chat_id) is not None
+            except Exception as exc:
+                logger.error("menu_state_error exc=%s", type(exc).__name__)
+                active = False
+            done = await self._menu_call(chat_id, user_id, None, active, attempts)
+            if done is None:
+                # a registered chat had migrated: the registration and the record moved on
+                await self._delete_after_migration(chat_id, user_id, attempts)
+
+    async def _delete_after_migration(self, old_chat_id: int, user_id: int, attempts: int) -> None:
+        try:
+            async with self._db.reader() as c:
+                new_chat_id = await self._services.resolve_chat_id(c, old_chat_id)
+        except Exception as exc:
+            logger.error("menu_state_error exc=%s", type(exc).__name__)
+            return
+        if new_chat_id != old_chat_id:
+            await self._menu_call(new_chat_id, user_id, None, True, attempts)
+
+    async def _note_menu(
+        self, chat_id: int, user_id: int, commands: list[tuple[str, str]] | None, active: bool
+    ) -> None:
+        """Record a member menu after the Telegram call succeeded. A failure is only logged."""
+        try:
+            async with self._db.transaction() as c:
+                if commands is None:
+                    await self._services.forget_member_menu(c, chat_id, user_id)
+                else:
+                    kind = "owner" if active else "register"
+                    await self._services.record_member_menu(c, chat_id, user_id, kind)
+        except Exception as exc:
+            logger.error(
+                "menu_record_error exc=%s chat_id=%s user_id=%s", type(exc).__name__, chat_id, user_id
+            )
 
     async def _menu_plan(
         self, chat_id: int, users: tuple[int, ...]
@@ -337,6 +372,8 @@ class Delivery:
                     await self._transport.set_chat_commands(chat_id, commands, user_id=user_id)
                 else:
                     await self._transport.delete_chat_commands(chat_id, user_id=user_id)
+                if user_id is not None:
+                    await self._note_menu(chat_id, user_id, commands, active)
                 return True
             except RateLimited as exc:
                 if exc.retry_after > MENU_MAX_WAIT:
@@ -350,7 +387,10 @@ class Delivery:
             except ChatMigrated as exc:
                 _log_code(f"{code}_chat_migrated", chat_id=chat_id, user_id=user_id)
                 if not active:
-                    return True  # an upgraded group has no menu to show
+                    # an upgraded group has no menu to show; the old id is dead
+                    if user_id is not None:
+                        await self._note_menu(chat_id, user_id, None, False)
+                    return True
                 try:
                     # syncs both ids when the registration moved
                     await self._apply_migration(chat_id, exc.new_chat_id)
@@ -505,15 +545,18 @@ class Delivery:
                 await self._sync_after_root_change(event.target_id)
 
     async def _sync_after_root_change(self, old_root_id: int) -> None:
-        """Root changed while the bot runs (via the CLI): menus in known chats may be stale."""
+        """Root changed while the bot runs (via the CLI): drop the old root's recorded menus
+        and refresh the rest."""
         try:
             async with self._db.reader() as c:
+                recorded = await self._services.member_menu_chats(c, old_root_id)
                 chat_ids = await self._services.known_chat_ids(c)
                 staff = await self._services.staff_ids(c)
         except Exception as exc:
             logger.error("menu_state_error exc=%s", type(exc).__name__)
             return
-        await self.sync_chat_menus(chat_ids, users=[old_root_id, *staff])
+        await self.delete_member_menus(recorded, old_root_id)
+        await self.sync_chat_menus(chat_ids, users=staff)
 
     async def run_outbox_once(self) -> int:
         now_iso = iso(self._clock.now())
