@@ -46,6 +46,10 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "Startup report was not delivered. Chats removed on check: {ids}.",
         "\u041e\u0442\u0447\u0451\u0442 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {ids}.",
     ),
+    "report_partial": (
+        "Part of the startup report was not delivered. Chats removed on check and not reported: {ids}.",
+        "\u0427\u0430\u0441\u0442\u044c \u043e\u0442\u0447\u0451\u0442\u0430 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u0430. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435 \u0438 \u043d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d\u043e: {ids}.",
+    ),
     "startup": (
         "Bot started. Chats removed on check: {n}.",
         "\u0411\u043e\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {n}.",
@@ -272,6 +276,10 @@ def report_lost_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
     return t("report_lost", lang, ids=", ".join(str(i) for i in chat_ids))
 
 
+def report_partial_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
+    return t("report_partial", lang, ids=", ".join(str(i) for i in chat_ids))
+
+
 def _safe(text: str) -> str:
     # Telegram auto-links @name in plain text: swap in the fullwidth sign to keep lists inert.
     return esc(text.replace("@", "\uff20"))
@@ -351,3 +359,16 @@ def startup_report_ids_parts(
     lines = _startup_lines(removed_chat_ids, rows, lang)
     head = 1 + len(split_ids(removed_chat_ids))  # the header and the removed-ids lines
     return len(split_text("\n".join(lines[:head])))
+
+
+def startup_report_delivered_groups(
+    removed_chat_ids: Sequence[int],
+    rows: Sequence[ChatRowLike],
+    lang: Lang,
+    parts_sent: int,
+) -> int:
+    """How many `split_ids` groups of removed chats the first `parts_sent` report messages carry."""
+    lines = _startup_lines(removed_chat_ids, rows, lang)
+    head = 1 + len(split_ids(removed_chat_ids))
+    chunks = split_text("\n".join(lines[:head]))[:parts_sent]
+    return max(0, min(head - 1, sum(c.count("\n") + 1 for c in chunks) - 1))

@@ -150,6 +150,7 @@ class Delivery:
         # event again, it only retries the write. Memory only, so after a restart the
         # event may go out at most once more.
         self._unwritten: dict[int, _Outcome] = {}
+        self._menu_flood = False  # a menu call met a 429 longer than MENU_MAX_WAIT
 
     # --- replies and ping ---
 
@@ -253,7 +254,12 @@ class Delivery:
         for chat_id in dict.fromkeys(chat_ids):
             if self.stop.is_set():
                 return
+            self._menu_flood = False
             await self.sync_chat_menu(chat_id, single_attempt=single_attempt, users=users)
+            if self._menu_flood and not single_attempt:
+                # the flood wait is bot-wide: the rest heals at the next start or change
+                _log_code("menu_sync_aborted_rate_limited", chat_id=chat_id)
+                return
 
     async def delete_member_menus(
         self, chat_ids: Sequence[int], user_id: int, *, single_attempt: bool = False
@@ -333,6 +339,8 @@ class Delivery:
                     await self._transport.delete_chat_commands(chat_id, user_id=user_id)
                 return True
             except RateLimited as exc:
+                if exc.retry_after > MENU_MAX_WAIT:
+                    self._menu_flood = True
                 if attempts >= max_attempts or exc.retry_after > MENU_MAX_WAIT:
                     _log_code(f"{code}_retries_exhausted", chat_id=chat_id, user_id=user_id)
                     return False
@@ -372,6 +380,8 @@ class Delivery:
         if event.event_type == "reconcile_removed":
             raw = event.payload.get("chat_ids")
             ids = [i for i in raw if isinstance(i, int)] if isinstance(raw, list) else []
+            if event.payload.get("report_partial"):
+                return rendering.report_partial_text(ids, lang)
             if event.payload.get("report_lost"):
                 return rendering.report_lost_text(ids, lang)
             return rendering.reconcile_interrupted_text(ids, lang)

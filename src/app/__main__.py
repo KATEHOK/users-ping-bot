@@ -119,11 +119,17 @@ async def sync_menus(ctx: Context, extra: list[int]) -> None:
 
 
 async def _queue_interrupted_notice(
-    ctx: Context, removed: list[int], started_at: str, *, report_lost: bool = False
+    ctx: Context,
+    removed: list[int],
+    started_at: str,
+    *,
+    report_lost: bool = False,
+    skip_groups: int = 0,
 ) -> None:
     """Root is told about chats removed by an interrupted check, via the outbox.
 
     One event per message-sized group of ids; the run start keeps a later run's notice distinct.
+    `skip_groups`: leading groups root already received in the report.
     """
     if not removed:
         return
@@ -132,20 +138,28 @@ async def _queue_interrupted_notice(
         if root_id is None or not await ctx.services.has_private_contact(c, root_id):
             return
         lang = await ctx.services.get_user_lang(c, root_id)
-        for part, group in enumerate(rendering.split_ids(removed)):
+        groups = rendering.split_ids(removed)
+        for part, group in enumerate(groups):
+            if part < skip_groups:
+                continue
             await ctx.services.queue_event(
                 c,
                 event_key=f"reconcile_removed:{root_id}:{started_at}:{part}",
                 event_type="reconcile_removed",
                 target_kind="user",
                 target_id=root_id,
-                payload={"lang": lang, "chat_ids": group, "report_lost": report_lost},
+                payload={
+                    "lang": lang,
+                    "chat_ids": group,
+                    "report_lost": report_lost,
+                    "report_partial": skip_groups > 0,
+                },
             )
 
 
 class ReportResult(NamedTuple):
     complete: bool  # every part was delivered (or nobody to tell)
-    ids_delivered: bool  # the parts that list the removed chats were delivered
+    delivered_groups: int  # leading `split_ids` groups of removed chats that root received
 
 
 async def send_startup_report(ctx: Context, removed: list[int]) -> ReportResult:
@@ -153,14 +167,14 @@ async def send_startup_report(ctx: Context, removed: list[int]) -> ReportResult:
     async with ctx.db.reader() as c:
         root_id = await ctx.services.get_root(c)
         if root_id is None or not await ctx.services.has_private_contact(c, root_id):
-            return ReportResult(True, True)  # nobody to tell
+            return ReportResult(True, len(rendering.split_ids(removed)))  # nobody to tell
         lang = await ctx.services.get_user_lang(c, root_id)
         rows = await ctx.services.list_chats(c)
-    ids_parts = rendering.startup_report_ids_parts(removed, rows, lang)
     for sent, text in enumerate(rendering.startup_report_text(removed, rows, lang)):
         if not await ctx.delivery.send_reply(root_id, text, reply_to=None, thread_id=None):
-            return ReportResult(False, sent >= ids_parts)
-    return ReportResult(True, True)
+            groups = rendering.startup_report_delivered_groups(removed, rows, lang, sent)
+            return ReportResult(False, groups)
+    return ReportResult(True, len(rendering.split_ids(removed)))
 
 
 async def prune_once(ctx: Context) -> int:
@@ -229,10 +243,12 @@ async def serve(
         if stop.is_set():
             return 0  # signalled during reconciliation: no report, pruning or loops
         report = await send_startup_report(ctx, removed)
-        if removed and not report.ids_delivered:
-            # the removed ids were lost: the next start would say "0 removed"
+        if removed and report.delivered_groups < len(rendering.split_ids(removed)):
+            # some removed ids were lost: the next start would say "0 removed"
             try:
-                await _queue_interrupted_notice(ctx, removed, started_at, report_lost=True)
+                await _queue_interrupted_notice(
+                    ctx, removed, started_at, report_lost=True, skip_groups=report.delivered_groups
+                )
             except Exception as exc:
                 logger.error("interrupted_notice_error exc=%s", type(exc).__name__)
         await prune_once(ctx)

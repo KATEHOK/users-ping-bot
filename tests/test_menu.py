@@ -348,6 +348,39 @@ async def test_command_triggered_menu_sync_makes_one_attempt_and_never_waits(db,
     assert slept == []
 
 
+async def test_startup_sync_stops_the_batch_on_a_429_longer_than_the_cap(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    for chat in (-1, -2, -3):
+        await register_chat(db, services, chat, ADMIN)
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await entry.sync_menus(ctx, [])  # does not raise
+    assert len(transport.menu_calls) == 1 and slept == []
+
+
+async def test_startup_sync_goes_on_after_a_429_within_the_cap_was_waited_out(db):
+    clock = FakeClock()
+
+    async def sleep(seconds):
+        pass
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    for chat in (-1, -2):
+        await register_chat(db, services, chat, ADMIN)
+    transport.queue_menu_raises([RateLimited(1.0)])
+    await entry.sync_menus(ctx, [])
+    assert {c["chat_id"] for c in transport.menu_calls} == {-1, -2}
+
+
 async def test_startup_sync_picks_chats_from_the_outbox(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
@@ -874,10 +907,83 @@ async def test_join_triggered_delete_makes_one_attempt_and_never_waits_on_429(db
     clock.sleep = sleep
     ctx, services, transport, _c = mk_ctx(db, clock)
     await _world(db, services)
-    transport.fail_menu(RateLimited(7.0))
+    transport.fail_menu(RateLimited(1.0))  # within the cap: only single_attempt stops a retry
     await handle_event(ctx, _my_member(1, added=True))
     assert len(transport.menu_calls) == 1  # one attempt, no wait
     assert slept == []
+
+
+def _event_remove_chat(uid):
+    return private_event(f"/chat remove {CHAT_ID}", update_id=uid, user_id=ROOT)
+
+
+def _event_remove_admin(uid):
+    return private_event(f"/admin remove {ADMIN}", update_id=uid, user_id=ROOT)
+
+
+def _event_bot_kicked(uid):
+    return make_event(
+        kind="my_chat_member", update_id=uid, chat_id=CHAT_ID, chat_type="supergroup",
+        user_id=ADMIN, bot_removed=True, text=None,
+    )
+
+
+def _event_migrate_to(uid):
+    return make_event(
+        kind="message", update_id=uid, chat_id=CHAT_ID, user_id=None, text=None,
+        migrate_to_chat_id=-1001,
+    )
+
+
+def _event_migrate_from(uid):
+    return make_event(
+        kind="message", update_id=uid, chat_id=-1001, user_id=None, text=None,
+        migrate_from_chat_id=CHAT_ID,
+    )
+
+
+@pytest.mark.parametrize(
+    "make,calls",
+    [
+        (_event_remove_chat, 1),
+        (_event_remove_admin, 1),
+        (_event_bot_kicked, 1),
+        (_event_migrate_to, 2),  # one attempt for each of the two ids
+        (_event_migrate_from, 2),
+    ],
+)
+async def test_event_paths_make_one_menu_attempt_per_chat_and_never_wait(db, make, calls):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.fail_menu(RateLimited(1.0))
+    await handle_event(ctx, make(1))
+    assert len(transport.menu_calls) == calls
+    assert slept == []
+
+
+async def test_migration_found_by_a_failed_reply_makes_one_menu_attempt_per_id(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.fail_menu(RateLimited(1.0))
+    transport.raise_next(ChatMigrated(-1001))
+    await _say(ctx, "/upb list", 1, ADMIN)
+    assert len(transport.menu_calls) == 2 and slept == []
 
 
 async def test_other_membership_updates_do_not_sync_the_menu(db):
