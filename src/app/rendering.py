@@ -1,6 +1,7 @@
 """Texts, HTML escaping and message splitting. Pure: no I/O."""
 
 import html
+import re
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -291,10 +292,13 @@ def report_partial_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> s
     return t("report_partial", lang, ids=", ".join(str(i) for i in chat_ids))
 
 
+_COMMAND_SLASH = re.compile(r"/(?=[A-Za-z0-9_])")
+
+
 def _inert(text: str) -> str:
     # Telegram auto-links @name and /command in plain text: a fullwidth sign and an invisible
-    # word joiner after the slash keep names inert.
-    return text.replace("@", "\uff20").replace("/", "/\u2060")
+    # word joiner after a command-like slash keep names inert.
+    return _COMMAND_SLASH.sub("/\u2060", text.replace("@", "\uff20"))
 
 
 def _safe(text: str) -> str:

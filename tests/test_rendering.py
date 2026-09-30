@@ -526,3 +526,10 @@ def test_all_rendered_texts_pass_the_html_validator(lang):
     texts += split_mentions([mention(1, EVIL), mention(2, None)])
     for text in texts:
         assert find_html_errors(text) == [], text
+
+
+def test_inert_breaks_only_command_like_slashes():
+    from app.rendering import _inert
+
+    assert _inert("a / b, 1/2, x/") == "a / b, 1/⁠2, x/"
+    assert _inert("/unregister @boss") == "/⁠unregister ＠boss"
