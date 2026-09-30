@@ -23,7 +23,7 @@ async def test_schema_migrations_recorded(db: Database):
     async with db.reader() as conn:
         cursor = await conn.execute("SELECT version FROM schema_migrations")
         rows = await cursor.fetchall()
-    assert rows == [("001_initial",)]
+    assert rows == [("001_initial",), ("002_member_menus",), ("003_chat_names",)]
 
 
 async def test_expected_tables_exist(db: Database):
@@ -35,6 +35,7 @@ async def test_expected_tables_exist(db: Database):
         "outbox",
         "processed_updates",
         "chat_aliases",
+        "chat_names",
         "counters",
         "schema_migrations",
     }
@@ -106,7 +107,7 @@ async def test_open_database_creates_parent_dir(tmp_path):
         async with database.reader() as conn:
             cursor = await conn.execute("SELECT COUNT(*) FROM schema_migrations")
             (count,) = await cursor.fetchone()
-        assert count == 1
+        assert count == 3
     assert path.exists()
 
 

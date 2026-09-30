@@ -358,9 +358,13 @@ class Services:
     async def list_subscribers(
         self, c: aiosqlite.Connection, chat_id: int, *, exclude_user_id: int | None = None
     ) -> list[SubscriberRef]:
+        # the chat's own name, when set, replaces the Telegram name and the username
         sql = (
-            "SELECT s.user_id, u.display_name, u.username "
-            "FROM subscriptions s JOIN users u ON u.user_id = s.user_id WHERE s.chat_id = ?"
+            "SELECT s.user_id, COALESCE(n.name, u.display_name), "
+            "CASE WHEN n.name IS NULL THEN u.username END "
+            "FROM subscriptions s JOIN users u ON u.user_id = s.user_id "
+            "LEFT JOIN chat_names n ON n.chat_id = s.chat_id AND n.user_id = s.user_id "
+            "WHERE s.chat_id = ?"
         )
         params: list[int] = [chat_id]
         if exclude_user_id is not None:
@@ -371,6 +375,37 @@ class Services:
             SubscriberRef(user_id=r[0], display_name=r[1], username=r[2])
             for r in await cursor.fetchall()
         ]
+
+    # --- chat names ---
+
+    async def set_chat_name(
+        self, c: aiosqlite.Connection, chat_id: int, user_id: int, name: str
+    ) -> None:
+        """Upsert the member's name in this chat (already normalised)."""
+        await c.execute(
+            "INSERT INTO chat_names(chat_id, user_id, name, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, user_id) DO UPDATE SET name = excluded.name, "
+            "updated_at = excluded.updated_at",
+            (chat_id, user_id, name, self._now()),
+        )
+
+    async def clear_chat_name(self, c: aiosqlite.Connection, chat_id: int, user_id: int) -> None:
+        await c.execute(
+            "DELETE FROM chat_names WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+
+    async def effective_name(
+        self, c: aiosqlite.Connection, chat_id: int, user_id: int
+    ) -> str | None:
+        """The name shown for the user in this chat: its own, else the Telegram one."""
+        cursor = await c.execute(
+            "SELECT n.name, u.display_name FROM users u "
+            "LEFT JOIN chat_names n ON n.chat_id = ? AND n.user_id = u.user_id "
+            "WHERE u.user_id = ?",
+            (chat_id, user_id),
+        )
+        row = await cursor.fetchone()
+        return None if row is None else (row[0] if row[0] is not None else row[1])
 
     # --- roles / cascades ---
 
@@ -751,7 +786,7 @@ class Services:
             action = "alias_only"
         elif dest_row is None:
             action = "moved"
-            # new row first, then move subscriptions, then drop the old row (FKs)
+            # new row first, then move subscriptions and names, then drop the old row (FKs)
             await c.execute(
                 "INSERT INTO chats(chat_id, title, registered_by, registered_at, "
                 "registration_generation, lang) VALUES (?, ?, ?, ?, ?, ?)",
@@ -768,6 +803,9 @@ class Services:
                 "UPDATE subscriptions SET chat_id = ? WHERE chat_id = ?",
                 (new_chat_id, old_chat_id),
             )
+            await c.execute(
+                "UPDATE chat_names SET chat_id = ? WHERE chat_id = ?", (new_chat_id, old_chat_id)
+            )
             await c.execute("DELETE FROM chats WHERE chat_id = ?", (old_chat_id,))
         else:
             action = "kept_destination"
@@ -776,7 +814,7 @@ class Services:
                 old_chat_id,
                 new_chat_id,
             )
-            # subscriptions of the old chat go with it; no farewell to a chat that moved
+            # subscriptions and names of the old chat go with it; no farewell to a chat that moved
             await c.execute("DELETE FROM chats WHERE chat_id = ?", (old_chat_id,))
 
         # re-target undelivered group outbox events, registered or not
@@ -786,4 +824,48 @@ class Services:
             (new_chat_id, now, old_chat_id),
         )
 
+        # recorded personal menus follow the chat (a later delete at the new id is harmless)
+        await c.execute(
+            "UPDATE OR IGNORE member_menus SET chat_id = ? WHERE chat_id = ?",
+            (new_chat_id, old_chat_id),
+        )
+        await c.execute("DELETE FROM member_menus WHERE chat_id = ?", (old_chat_id,))
+
         return MigrationResult(action=action)
+
+    # --- personal command menus ---
+
+    async def record_member_menu(
+        self, c: aiosqlite.Connection, chat_id: int, user_id: int, kind: str
+    ) -> None:
+        """A member-scope menu was set (`owner` or `register`): upsert."""
+        await c.execute(
+            "INSERT INTO member_menus(chat_id, user_id, kind, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, user_id) DO UPDATE SET kind = excluded.kind, "
+            "updated_at = excluded.updated_at",
+            (chat_id, user_id, kind, self._now()),
+        )
+
+    async def forget_member_menu(self, c: aiosqlite.Connection, chat_id: int, user_id: int) -> None:
+        await c.execute(
+            "DELETE FROM member_menus WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+
+    async def forget_chat_member_menus(self, c: aiosqlite.Connection, chat_id: int) -> None:
+        """The bot left the chat: its recorded personal menus there are out of reach."""
+        await c.execute("DELETE FROM member_menus WHERE chat_id = ?", (chat_id,))
+
+    async def roleless_member_menus(self, c: aiosqlite.Connection) -> list[tuple[int, int]]:
+        """Recorded (chat_id, user_id) menus of users who hold no role now."""
+        cursor = await c.execute(
+            "SELECT chat_id, user_id FROM member_menus "
+            "WHERE user_id NOT IN (SELECT user_id FROM roles) ORDER BY chat_id, user_id"
+        )
+        return [(r[0], r[1]) for r in await cursor.fetchall()]
+
+    async def member_menu_chats(self, c: aiosqlite.Connection, user_id: int) -> list[int]:
+        """Chats (registered or not) where this user has a recorded personal menu."""
+        cursor = await c.execute(
+            "SELECT chat_id FROM member_menus WHERE user_id = ? ORDER BY chat_id", (user_id,)
+        )
+        return [r[0] for r in await cursor.fetchall()]

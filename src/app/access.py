@@ -20,6 +20,7 @@ CATALOG: tuple[CommandSpec, ...] = (
     CommandSpec(Cmd.NOTIFY_OFF, Scope.GROUP, "/upb notify off", "/off"),
     CommandSpec(Cmd.PING, Scope.GROUP, "/upb all", "/all"),
     CommandSpec(Cmd.LIST, Scope.GROUP, "/upb notify list", "/list"),
+    CommandSpec(Cmd.RENAME, Scope.GROUP, "/upb notify rename <name>", "/rename <name>"),
     CommandSpec(Cmd.HELP, Scope.GROUP, "/upb help", "/help"),
     CommandSpec(Cmd.CHAT_UNREGISTER, Scope.GROUP, "/upb chat unregister", "/unregister"),
     CommandSpec(Cmd.LANG, Scope.GROUP, "/upb lang <en|ru>", "/lang <en|ru>"),
@@ -61,7 +62,7 @@ def can_run(cmd: Cmd, actor: Actor, *, scope: Scope, chat_active: bool) -> bool:
             return actor.is_chat_owner
         if cmd in (Cmd.NOTIFY_ON, Cmd.USAGE):
             return True
-        if cmd in (Cmd.NOTIFY_OFF, Cmd.PING, Cmd.LIST, Cmd.HELP):
+        if cmd in (Cmd.NOTIFY_OFF, Cmd.PING, Cmd.LIST, Cmd.RENAME, Cmd.HELP):
             return actor.is_subscriber or actor.is_chat_owner
         return False
 

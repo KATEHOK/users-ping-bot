@@ -25,6 +25,7 @@ class Cmd(StrEnum):
     NOTIFY_OFF = "notify_off"
     PING = "ping"
     LIST = "list"
+    RENAME = "rename"
     HELP = "help"
     LANG = "lang"
     USAGE = "usage"  # bare/partial/unknown /upb input: help for the typed prefix

@@ -1106,9 +1106,10 @@ async def test_lost_startup_report_without_removed_chats_queues_no_notice(db):
 async def test_startup_report_returns_whether_everything_was_delivered(db):
     ctx, services, transport, _c = mk_ctx(db)
     await make_root(db, services, 10, contact=True)
-    assert await entry.send_startup_report(ctx, []) == (True, True)
+    assert await entry.send_startup_report(ctx, []) == (True, 0)
     transport.queue_raises([PermanentSend()])
-    assert await entry.send_startup_report(ctx, []) == (False, False)
+    assert await entry.send_startup_report(ctx, []) == (False, 0)
+    assert await entry.send_startup_report(ctx, [-1]) == (True, 1)
 
 
 class _FailNthSend(RecordingTransport):
@@ -1147,6 +1148,62 @@ async def test_report_lost_after_the_ids_part_queues_no_notice(db):
     )
     assert len(transport.calls) == 2 and "-1" in transport.calls[0]["text"]  # ids in part one
     assert rows == []
+
+
+async def _serve_with_many_removed(db, fail_at, lang="en"):
+    """400 removed chats (two ids groups, one report part each) and a failing n-th send."""
+    clock, stop = RecordingClock(), asyncio.Event()
+    ctx, services, _t, _c = mk_ctx(db, clock)
+    await make_root(db, services, 10, contact=True)
+    async with db.transaction() as c:
+        await c.execute("UPDATE users SET lang = ? WHERE user_id = 10", (lang,))
+    removed = [-(10**12) - n for n in range(400)]
+    for chat_id in removed:
+        await register_chat(db, services, chat_id, 10, "g")
+    transport = _FailNthSend(fail_at, PermanentSend())
+    for chat_id in removed:
+        transport.set_probe(chat_id, PermanentSend())
+    assert await _serve(db, FakeBot([[_bare(1)]], stop), clock, stop, transport) == 0
+    return removed, transport, await _notices(db)
+
+
+def _ids_in(text):
+    return {int(w.strip(",.")) for w in text.split() if w.strip(",.").startswith("-10")}
+
+
+async def test_second_ids_part_lost_queues_only_the_undelivered_groups(db):
+    removed, transport, rows = await _serve_with_many_removed(db, fail_at=2)
+    (row,) = rows
+    payload = json.loads(row[2])
+    delivered = _ids_in(transport.calls[0]["text"])
+    assert payload["report_partial"] is True
+    assert delivered and not delivered & set(payload["chat_ids"])
+    assert delivered | set(payload["chat_ids"]) == set(removed)  # nothing lost, nothing twice
+
+
+async def test_first_ids_part_lost_queues_every_group_as_lost(db):
+    removed, _transport, rows = await _serve_with_many_removed(db, fail_at=1)
+    payloads = [json.loads(r[2]) for r in rows]
+    assert len(payloads) == 2
+    assert {i for p in payloads for i in p["chat_ids"]} == set(removed)
+    assert all(p["report_lost"] is True and p["report_partial"] is False for p in payloads)
+
+
+async def test_report_partial_notice_is_rendered_in_the_root_language(db):
+    _removed, _transport, rows = await _serve_with_many_removed(db, fail_at=2, lang="ru")
+    ids = json.loads(rows[0][2])["chat_ids"]
+    ctx, _s, transport, _c = mk_ctx(db, FakeClock())
+    await ctx.delivery.run_outbox_once()
+    text = transport.calls[0]["text"]
+    assert text == rendering.report_partial_text(ids, "ru")
+    assert text.startswith("\u0427\u0430\u0441\u0442\u044c \u043e\u0442\u0447\u0451\u0442\u0430")
+
+
+def test_report_partial_text_in_english():
+    assert rendering.report_partial_text([-1, -2]) == (
+        "Part of the startup report was not delivered. "
+        "Chats removed on check and not reported: -1, -2."
+    )
 
 
 async def test_report_lost_before_the_ids_part_queues_the_report_lost_notice(db):

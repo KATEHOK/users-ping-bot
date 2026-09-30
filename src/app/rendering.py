@@ -1,6 +1,7 @@
 """Texts, HTML escaping and message splitting. Pure: no I/O."""
 
 import html
+import re
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -46,10 +47,18 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "Startup report was not delivered. Chats removed on check: {ids}.",
         "\u041e\u0442\u0447\u0451\u0442 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {ids}.",
     ),
+    "report_partial": (
+        "Part of the startup report was not delivered. Chats removed on check and not reported: {ids}.",
+        "\u0427\u0430\u0441\u0442\u044c \u043e\u0442\u0447\u0451\u0442\u0430 \u043e \u0437\u0430\u043f\u0443\u0441\u043a\u0435 \u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u0430. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435 \u0438 \u043d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d\u043e: {ids}.",
+    ),
     "startup": (
         "Bot started. Chats removed on check: {n}.",
         "\u0411\u043e\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u0421\u043d\u044f\u0442\u043e \u0447\u0430\u0442\u043e\u0432 \u043f\u0440\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0435: {n}.",
     ),
+    "rename_usage": ("Usage: <code>{syntax}</code>\nName: 1-64 characters. <code>-</code> resets it to your Telegram name.\nCurrent name: {name}", "\u0424\u043e\u0440\u043c\u0430\u0442: <code>{syntax}</code>\n\u0418\u043c\u044f: \u043e\u0442 1 \u0434\u043e 64 \u0441\u0438\u043c\u0432\u043e\u043b\u043e\u0432. <code>-</code> \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0438\u043c\u044f \u0438\u0437 Telegram.\n\u0422\u0435\u043a\u0443\u0449\u0435\u0435 \u0438\u043c\u044f: {name}"),
+    "rename_bad": ("Invalid name: 1-64 characters, at least one visible, no control or line-break characters. Usage: <code>{syntax}</code>", "\u041d\u0435\u0434\u043e\u043f\u0443\u0441\u0442\u0438\u043c\u043e\u0435 \u0438\u043c\u044f: \u043e\u0442 1 \u0434\u043e 64 \u0441\u0438\u043c\u0432\u043e\u043b\u043e\u0432, \u0445\u043e\u0442\u044f \u0431\u044b \u043e\u0434\u0438\u043d \u0432\u0438\u0434\u0438\u043c\u044b\u0439, \u0431\u0435\u0437 \u0443\u043f\u0440\u0430\u0432\u043b\u044f\u044e\u0449\u0438\u0445 \u0441\u0438\u043c\u0432\u043e\u043b\u043e\u0432 \u0438 \u043f\u0435\u0440\u0435\u0432\u043e\u0434\u043e\u0432 \u0441\u0442\u0440\u043e\u043a\u0438. \u0424\u043e\u0440\u043c\u0430\u0442: <code>{syntax}</code>"),
+    "rename_set": ("Name in this chat: {name}.", "\u0418\u043c\u044f \u0432 \u044d\u0442\u043e\u043c \u0447\u0430\u0442\u0435: {name}."),
+    "rename_reset": ("Name reset: {name}.", "\u0418\u043c\u044f \u0441\u0431\u0440\u043e\u0448\u0435\u043d\u043e: {name}."),
     "name_unknown": ("name unknown", "\u0438\u043c\u044f \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"),
     "help_title": ("Commands:", "\u041a\u043e\u043c\u0430\u043d\u0434\u044b:"),
     "help_register_hint": ("To register a group: add the bot there and send <code>/register</code>.", "\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f \u0433\u0440\u0443\u043f\u043f\u044b: \u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u0431\u043e\u0442\u0430 \u0432 \u0433\u0440\u0443\u043f\u043f\u0443 \u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 <code>/register</code>."),
@@ -65,6 +74,7 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "cmd_notify_off": ("Unsubscribe", "\u041e\u0442\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f"),
     "cmd_ping": ("Ping all", "\u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445"),
     "cmd_list": ("Subscribers", "\u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438"),
+    "cmd_rename": ("Set name", "\u0417\u0430\u0434\u0430\u0442\u044c \u0438\u043c\u044f"),
     "cmd_help": ("Help", "\u0421\u043f\u0440\u0430\u0432\u043a\u0430"),
     "cmd_lang": ("Language", "\u042f\u0437\u044b\u043a"),
     "cmd_p_help": ("Help", "\u0421\u043f\u0440\u0430\u0432\u043a\u0430"),
@@ -81,6 +91,11 @@ def esc(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+def _u16(text: str) -> int:
+    """Length in UTF-16 code units, the way Telegram counts message text."""
+    return len(text.encode("utf-16-le")) // 2
+
+
 def t(key: str, lang: Lang, **kw: object) -> str:
     """Catalogue text; every keyword value is HTML-escaped."""
     pair = _CATALOG[key]
@@ -94,6 +109,7 @@ _MENU_COMMON = (
     ("on", "cmd_notify_on"),
     ("off", "cmd_notify_off"),
     ("list", "cmd_list"),
+    ("rename", "cmd_rename"),
     ("help", "cmd_help"),
     ("usage", "menu_usage"),
 )
@@ -130,17 +146,17 @@ def mention(user_id: int, display_name: str | None) -> str:
 def split_mentions(
     parts: Sequence[str], *, limit: int = MAX_MESSAGE, max_items: int = MAX_MENTIONS
 ) -> list[str]:
-    """Join mentions with spaces into chunks of <= max_items and <= limit chars, never splitting one."""
+    """Join mentions with spaces into chunks of <= max_items and <= limit UTF-16 units, never splitting one."""
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0
     for part in parts:
-        extra = len(part) + (1 if current else 0)
+        extra = _u16(part) + (1 if current else 0)
         if current and (len(current) >= max_items or current_len + extra > limit):
             chunks.append(" ".join(current))
             current = []
             current_len = 0
-            extra = len(part)
+            extra = _u16(part)
         current.append(part)
         current_len += extra
     if current:
@@ -149,18 +165,18 @@ def split_mentions(
 
 
 def split_text(text: str, *, limit: int = MAX_MESSAGE) -> list[str]:
-    """Splits on newline boundaries into chunks under limit."""
+    """Splits on newline boundaries into chunks under limit (UTF-16 units)."""
     lines = text.split("\n")
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0
     for line in lines:
-        extra = len(line) + (1 if current else 0)
+        extra = _u16(line) + (1 if current else 0)
         if current and current_len + extra > limit:
             chunks.append("\n".join(current))
             current = []
             current_len = 0
-            extra = len(line)
+            extra = _u16(line)
         current.append(line)
         current_len += extra
     if current:
@@ -173,11 +189,11 @@ def _command_lines(specs: Sequence[access.CommandSpec], lang: Lang) -> list[str]
     for s in specs:
         desc = t("cmd_" + s.cmd.value, lang)
         if s.alias:
-            lines.append(f"{esc(s.alias)} \u2014 {desc}")  # plain text: Telegram makes it clickable
+            lines.append(f"{esc(syntax_text(s.alias, lang))} \u2014 {desc}")  # plain text: Telegram makes it clickable
         elif len(s.syntax.split()) >= 2 or len(desc.split()) >= 2:
-            lines.append(f"{desc}\n<pre>{esc(s.syntax)}</pre>")
+            lines.append(f"{desc}\n<pre>{esc(syntax_text(s.syntax, lang))}</pre>")
         else:
-            lines.append(f"{esc(s.syntax)} \u2014 {desc}")
+            lines.append(f"{esc(syntax_text(s.syntax, lang))} \u2014 {desc}")
     return lines
 
 
@@ -272,12 +288,42 @@ def report_lost_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
     return t("report_lost", lang, ids=", ".join(str(i) for i in chat_ids))
 
 
+def report_partial_text(chat_ids: Sequence[int], lang: Lang = DEFAULT_LANG) -> str:
+    return t("report_partial", lang, ids=", ".join(str(i) for i in chat_ids))
+
+
+_COMMAND_SLASH = re.compile(r"/(?=[A-Za-z0-9_])")
+
+
+def _inert(text: str) -> str:
+    # Telegram auto-links @name and /command in plain text: a fullwidth sign and an invisible
+    # word joiner after a command-like slash keep names inert.
+    return _COMMAND_SLASH.sub("/\u2060", text.replace("@", "\uff20"))
+
+
 def _safe(text: str) -> str:
-    # Telegram auto-links @name in plain text: swap in the fullwidth sign to keep lists inert.
-    return esc(text.replace("@", "\uff20"))
+    return esc(_inert(text))
+
+
+def syntax_text(syntax: str, lang: Lang) -> str:
+    """Command syntax for the reader's language (only the <name> placeholder differs)."""
+    return syntax.replace("<name>", "<\u0438\u043c\u044f>") if lang == "ru" else syntax
+
+
+def rename_usage_text(syntax: str, name: str, lang: Lang) -> str:
+    return t("rename_usage", lang, syntax=syntax_text(syntax, lang), name=_inert(name))
+
+
+def rename_bad_text(syntax: str, lang: Lang) -> str:
+    return t("rename_bad", lang, syntax=syntax_text(syntax, lang))
+
+
+def rename_done_text(name: str, lang: Lang, *, reset: bool) -> str:
+    return t("rename_reset" if reset else "rename_set", lang, name=_inert(name))
 
 
 def _plain_label(display_name: str | None, username: str | None, lang: Lang) -> str:
+    # a chat name arrives with username=None (the query drops it), so it stands alone
     name = _safe(display_name) if display_name else t("name_unknown", lang)
     return f"{name} ({_safe(username.lstrip('@'))})" if username else name
 
@@ -344,10 +390,14 @@ def _startup_lines(removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike],
     return lines
 
 
-def startup_report_ids_parts(
-    removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike], lang: Lang = DEFAULT_LANG
+def startup_report_delivered_groups(
+    removed_chat_ids: Sequence[int],
+    rows: Sequence[ChatRowLike],
+    lang: Lang,
+    parts_sent: int,
 ) -> int:
-    """How many leading report messages carry the removed-chat ids."""
+    """How many `split_ids` groups of removed chats the first `parts_sent` report messages carry."""
     lines = _startup_lines(removed_chat_ids, rows, lang)
-    head = 1 + len(split_ids(removed_chat_ids))  # the header and the removed-ids lines
-    return len(split_text("\n".join(lines[:head])))
+    head = 1 + len(split_ids(removed_chat_ids))
+    chunks = split_text("\n".join(lines[:head]))[:parts_sent]
+    return max(0, min(head - 1, sum(c.count("\n") + 1 for c in chunks) - 1))

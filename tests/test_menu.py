@@ -31,7 +31,7 @@ from test_transport_aiogram import CHAT, TOKEN, ScriptedSession
 ROOT = 10
 ADMIN = 1
 CHAT_ID = 500
-COMMANDS = ["all", "on", "off", "list", "help", "usage"]
+COMMANDS = ["all", "on", "off", "list", "rename", "help", "usage"]
 OWNER_COMMANDS = [*COMMANDS, "unregister", "lang"]
 REGISTER_COMMANDS = ["register", "help"]
 
@@ -348,6 +348,98 @@ async def test_command_triggered_menu_sync_makes_one_attempt_and_never_waits(db,
     assert slept == []
 
 
+async def test_startup_sync_stops_the_batch_on_a_429_longer_than_the_cap(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    for chat in (-1, -2, -3):
+        await register_chat(db, services, chat, ADMIN)
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await entry.sync_menus(ctx, [])  # does not raise
+    assert len(transport.menu_calls) == 1 and slept == []
+
+
+async def test_a_long_429_stops_the_rest_of_the_chats_calls_at_startup(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, -1, ADMIN)
+    await register_chat(db, services, -2, ADMIN)
+    # chat scope ok, then the first member call floods
+    calls = []
+    real = transport.set_chat_commands
+
+    async def flaky(chat_id, commands, *, user_id=None):
+        calls.append((chat_id, user_id))
+        if user_id is not None:
+            raise RateLimited(MENU_MAX_WAIT + 1)
+        await real(chat_id, commands, user_id=user_id)
+
+    transport.set_chat_commands = flaky
+    await entry.sync_menus(ctx, [])
+    assert calls == [(-2, None), (-2, ROOT)]  # ascending ids; chat -1 is not reached
+
+
+async def test_outbox_sync_ignores_the_startup_abort(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    for chat in (-1, -2, -3):
+        await register_chat(db, services, chat, ADMIN)
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await ctx.delivery.sync_chat_menus([-1, -2, -3])  # as from the outbox
+    assert {c["chat_id"] for c in transport.menu_calls} == {-1, -2, -3}
+
+
+async def test_a_long_429_met_by_a_concurrent_sync_does_not_abort_the_startup_batch(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, -1, ADMIN)
+    await register_chat(db, services, -2, ADMIN)
+    entered, gate = asyncio.Event(), asyncio.Event()
+    real_set, real_delete = transport.set_chat_commands, transport.delete_chat_commands
+
+    async def set_commands(chat_id, commands, *, user_id=None):
+        if chat_id == -2 and user_id is None and not gate.is_set():
+            entered.set()
+            await gate.wait()  # the startup batch is parked inside its first chat
+        await real_set(chat_id, commands, user_id=user_id)
+
+    async def delete_commands(chat_id, *, user_id=None):
+        await real_delete(chat_id, user_id=user_id)
+        if chat_id == -9:
+            raise RateLimited(MENU_MAX_WAIT + 1)
+
+    transport.set_chat_commands, transport.delete_chat_commands = set_commands, delete_commands
+    startup = asyncio.create_task(entry.sync_menus(ctx, []))
+    await entered.wait()
+    assert await ctx.delivery.sync_chat_menu(-9, single_attempt=True) is False  # a handler's sync
+    gate.set()
+    await startup
+    # the flood belongs to the other sync: the startup batch still reaches chat -1
+    assert -1 in {c["chat_id"] for c in transport.menu_calls}
+
+
+async def test_startup_sync_goes_on_after_a_429_within_the_cap_was_waited_out(db):
+    clock = FakeClock()
+
+    async def sleep(seconds):
+        pass
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    for chat in (-1, -2):
+        await register_chat(db, services, chat, ADMIN)
+    transport.queue_menu_raises([RateLimited(1.0)])
+    await entry.sync_menus(ctx, [])
+    assert {c["chat_id"] for c in transport.menu_calls} == {-1, -2}
+
+
 async def test_startup_sync_picks_chats_from_the_outbox(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _world(db, services)
@@ -568,17 +660,33 @@ async def _known_chats(db, services):
         await services.unregister_chat(c, 502)
 
 
-async def test_admin_revoke_deletes_the_member_menu_in_every_known_chat(db):
+async def _record(db, services, chat_id, user_id, kind="register"):
+    async with db.transaction() as c:
+        await services.record_member_menu(c, chat_id, user_id, kind)
+
+
+async def _recorded(db, services, user_id):
+    async with db.reader() as c:
+        return await services.member_menu_chats(c, user_id)
+
+
+async def test_admin_revoke_deletes_the_member_menu_in_the_recorded_chats_only(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _known_chats(db, services)
     await register_chat(db, services, CHAT_ID, ADMIN)
+    # 7777: a group the bot was added to and nobody registered; 888: someone else's menu only
+    for chat_id in (501, 502, 7777):
+        await _record(db, services, chat_id, ADMIN)
+    await _record(db, services, 888, ROOT)
     transport.menu_calls.clear()
     await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT))
     purge = [(c["chat_id"], c["op"]) for c in transport.menu_calls if c["user_id"] == ADMIN]
-    assert sorted(purge) == [(CHAT_ID, "delete"), (501, "delete"), (502, "delete")]
+    assert sorted(purge) == [(CHAT_ID, "delete"), (501, "delete"), (502, "delete"), (7777, "delete")]
     # the cascade chat is handled once: no second delete for the same member
-    assert len(purge) == 3
-    assert len(transport.menu_calls) == 5  # 2 purges + the cascade's chat, admin and root calls
+    assert len(transport.menu_calls) == 6  # 3 purges + the cascade's chat, admin and root calls
+    assert all(c["chat_id"] != 888 for c in transport.menu_calls)
+    assert await _recorded(db, services, ADMIN) == []
+    assert await _recorded(db, services, ROOT) == [CHAT_ID, 888]  # + the register menu just set
 
 
 async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
@@ -591,6 +699,8 @@ async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
     clock.sleep = sleep
     ctx, services, transport, _c = mk_ctx(db, clock)
     await _known_chats(db, services)
+    for chat_id in (501, 502):
+        await _record(db, services, chat_id, ADMIN)
     transport.menu_calls.clear()
     real = transport.delete_chat_commands
 
@@ -606,11 +716,13 @@ async def test_admin_revoke_purge_makes_one_attempt_and_logs_errors(db, caplog):
     assert slept == []
     assert any(r.getMessage().startswith("menu_delete_permanent ") for r in caplog.records)
     assert any(r.getMessage().startswith("menu_delete_retries_exhausted ") for r in caplog.records)
+    assert await _recorded(db, services, ADMIN) == [502]  # a permanent failure drops the record, a 429 keeps it
 
 
 async def test_unauthorized_from_the_admin_revoke_purge_propagates(db):
     ctx, services, transport, _c = mk_ctx(db)
     await _known_chats(db, services)
+    await _record(db, services, 501, ADMIN)
     transport.fail_menu(Unauthorized())
     with pytest.raises(Unauthorized):
         await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=1, user_id=ROOT))
@@ -660,6 +772,7 @@ async def test_cli_root_change_syncs_active_chats_once_the_notice_is_final(db, f
     await make_root(db, services, ROOT, contact=True)
     await make_admin(db, services, ADMIN)
     await register_chat(db, services, CHAT_ID, ADMIN)
+    await _record(db, services, CHAT_ID, ROOT, "owner")
     async with db.transaction() as c:  # what the CLI does: no transport
         await services.touch_user(c, 11)
         await services.set_root(c, 11)
@@ -874,10 +987,83 @@ async def test_join_triggered_delete_makes_one_attempt_and_never_waits_on_429(db
     clock.sleep = sleep
     ctx, services, transport, _c = mk_ctx(db, clock)
     await _world(db, services)
-    transport.fail_menu(RateLimited(7.0))
+    transport.fail_menu(RateLimited(1.0))  # within the cap: only single_attempt stops a retry
     await handle_event(ctx, _my_member(1, added=True))
     assert len(transport.menu_calls) == 1  # one attempt, no wait
     assert slept == []
+
+
+def _event_remove_chat(uid):
+    return private_event(f"/chat remove {CHAT_ID}", update_id=uid, user_id=ROOT)
+
+
+def _event_remove_admin(uid):
+    return private_event(f"/admin remove {ADMIN}", update_id=uid, user_id=ROOT)
+
+
+def _event_bot_kicked(uid):
+    return make_event(
+        kind="my_chat_member", update_id=uid, chat_id=CHAT_ID, chat_type="supergroup",
+        user_id=ADMIN, bot_removed=True, text=None,
+    )
+
+
+def _event_migrate_to(uid):
+    return make_event(
+        kind="message", update_id=uid, chat_id=CHAT_ID, user_id=None, text=None,
+        migrate_to_chat_id=-1001,
+    )
+
+
+def _event_migrate_from(uid):
+    return make_event(
+        kind="message", update_id=uid, chat_id=-1001, user_id=None, text=None,
+        migrate_from_chat_id=CHAT_ID,
+    )
+
+
+@pytest.mark.parametrize(
+    "make,calls",
+    [
+        (_event_remove_chat, 1),
+        (_event_remove_admin, 1),
+        (_event_bot_kicked, 1),
+        (_event_migrate_to, 2),  # one attempt for each of the two ids
+        (_event_migrate_from, 2),
+    ],
+)
+async def test_event_paths_make_one_menu_attempt_per_chat_and_never_wait(db, make, calls):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.fail_menu(RateLimited(1.0))
+    await handle_event(ctx, make(1))
+    assert len(transport.menu_calls) == calls
+    assert slept == []
+
+
+async def test_migration_found_by_a_failed_reply_makes_one_menu_attempt_per_id(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    await _world(db, services)
+    await register_chat(db, services, CHAT_ID, ADMIN)
+    transport.fail_menu(RateLimited(1.0))
+    transport.raise_next(ChatMigrated(-1001))
+    await _say(ctx, "/upb list", 1, ADMIN)
+    assert len(transport.menu_calls) == 2 and slept == []
 
 
 async def test_other_membership_updates_do_not_sync_the_menu(db):
