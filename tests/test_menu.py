@@ -31,7 +31,7 @@ from test_transport_aiogram import CHAT, TOKEN, ScriptedSession
 ROOT = 10
 ADMIN = 1
 CHAT_ID = 500
-COMMANDS = ["all", "on", "off", "list", "help", "usage"]
+COMMANDS = ["all", "on", "off", "list", "rename", "help", "usage"]
 OWNER_COMMANDS = [*COMMANDS, "unregister", "lang"]
 REGISTER_COMMANDS = ["register", "help"]
 

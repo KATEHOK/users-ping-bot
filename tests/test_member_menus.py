@@ -42,7 +42,7 @@ async def test_migration_002_applies_on_a_v11_database(tmp_path):
             await c.execute(stmt)
         await c.execute("INSERT INTO schema_migrations VALUES ('001_initial', 'x')")
         await c.execute("INSERT INTO users(user_id, updated_at) VALUES (5, 'x')")
-    assert await apply_migrations(database) == ["002_member_menus"]
+    assert await apply_migrations(database) == ["002_member_menus", "003_chat_names"]
     async with database.reader() as c:
         cursor = await c.execute("SELECT COUNT(*) FROM users")
         assert (await cursor.fetchone())[0] == 1  # existing data is untouched

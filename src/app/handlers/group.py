@@ -112,6 +112,24 @@ async def handle(ctx: Context, event: IncomingEvent) -> None:
         elif cmd is Cmd.LIST:
             subs = await ctx.services.list_subscribers(c, chat_id)
             replies.extend(rendering.subscriber_list_text(subs, lang) or [t("list_empty", lang)])
+        elif cmd is Cmd.RENAME:
+            syntax = _syntax(cmd, parsed.via_alias)
+            if not parsed.args:  # bare: usage and the current name, nothing changes
+                name = await ctx.services.effective_name(c, chat_id, event.user_id)
+                replies.append(t("rename_usage", lang, syntax=syntax, name=name or f"id{event.user_id}"))
+            else:
+                try:
+                    new_name = commands.validate_name(parsed.args[0])
+                except ValueError:
+                    replies.append(t("rename_bad", lang, syntax=syntax))
+                else:
+                    if new_name == commands.NAME_RESET:
+                        await ctx.services.clear_chat_name(c, chat_id, event.user_id)
+                    else:
+                        await ctx.services.set_chat_name(c, chat_id, event.user_id, new_name)
+                    name = await ctx.services.effective_name(c, chat_id, event.user_id)
+                    key = "rename_reset" if new_name == commands.NAME_RESET else "rename_set"
+                    replies.append(t(key, lang, name=name or f"id{event.user_id}"))
         elif cmd is Cmd.HELP:
             replies.append(rendering.help_text(actor, scope=Scope.GROUP, chat_active=active, lang=lang))
         elif cmd is Cmd.LANG:

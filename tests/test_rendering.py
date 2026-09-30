@@ -246,23 +246,23 @@ def test_help_texts_en_and_ru_for_owner_member_and_private_root():
     }
     assert en["owner"] == (
         "Commands:\n/on \u2014 Subscribe\n/off \u2014 Unsubscribe\n/all \u2014 Ping all\n"
-        "/list \u2014 Subscribers\n/help \u2014 Help\n/unregister \u2014 Unregister\n"
+        "/list \u2014 Subscribers\n/rename &lt;name&gt; \u2014 Set name\n/help \u2014 Help\n/unregister \u2014 Unregister\n"
         "/lang &lt;en|ru&gt; \u2014 Language"
     )
     assert en["member"] == (
         "Commands:\n/on \u2014 Subscribe\n/off \u2014 Unsubscribe\n/all \u2014 Ping all\n"
-        "/list \u2014 Subscribers\n/help \u2014 Help"
+        "/list \u2014 Subscribers\n/rename &lt;name&gt; \u2014 Set name\n/help \u2014 Help"
     )
     ru_owner = help_text(owner, scope=Scope.GROUP, chat_active=True, lang="ru")
     assert ru_owner == (
         "\u041a\u043e\u043c\u0430\u043d\u0434\u044b:\n/on \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f\n"
         "/off \u2014 \u041e\u0442\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f\n/all \u2014 \u041f\u043e\u0437\u0432\u0430\u0442\u044c \u0432\u0441\u0435\u0445\n"
-        "/list \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438\n/help \u2014 \u0421\u043f\u0440\u0430\u0432\u043a\u0430\n"
+        "/list \u2014 \u041f\u043e\u0434\u043f\u0438\u0441\u0447\u0438\u043a\u0438\n/rename &lt;name&gt; \u2014 \u0417\u0430\u0434\u0430\u0442\u044c \u0438\u043c\u044f\n/help \u2014 \u0421\u043f\u0440\u0430\u0432\u043a\u0430\n"
         "/unregister \u2014 \u0421\u043d\u044f\u0442\u044c \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044e\n/lang &lt;en|ru&gt; \u2014 \u042f\u0437\u044b\u043a"
     )
     ru_member = help_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, lang="ru")
     assert "/unregister" not in ru_member and "/lang" not in ru_member
-    assert ru_member.split("\n")[1:] == ru_owner.split("\n")[1:6]
+    assert ru_member.split("\n")[1:] == ru_owner.split("\n")[1:7]
     assert help_text(ROOT, scope=Scope.PRIVATE, chat_active=True, lang="en") == (
         "Commands:\n/help \u2014 Help\n"
         "Language\n<pre>/lang &lt;en|ru&gt;</pre>\n"
@@ -316,7 +316,7 @@ def test_descriptions_are_short():
 
 def test_usage_shows_alias_and_prefix_matching_ignores_it():
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
-    assert _syntax_lines(text) == {"/on", "/off", "/list"}
+    assert _syntax_lines(text) == {"/on", "/off", "/list", "/rename &lt;name&gt;"}
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("all",), lang="en")
     assert "/all \u2014 Ping all" in text  # unknown prefix: everything allowed
 
@@ -351,7 +351,7 @@ def test_usage_filters_by_prefix():
     text = usage_text(FOREIGN_ADMIN, scope=Scope.GROUP, chat_active=False, prefix=("chat",), lang="en")
     assert _syntax_lines(text) == {"/register"}
     text = usage_text(SUBSCRIBER, scope=Scope.GROUP, chat_active=True, prefix=("notify",), lang="en")
-    assert _syntax_lines(text) == {"/on", "/off", "/list"}
+    assert _syntax_lines(text) == {"/on", "/off", "/list", "/rename &lt;name&gt;"}
     text = usage_text(REGISTRAR, scope=Scope.GROUP, chat_active=True, prefix=("lang",), lang="en")
     assert _syntax_lines(text) == {"/lang &lt;en|ru&gt;"}
     text = usage_text(ROOT, scope=Scope.PRIVATE, chat_active=True, prefix=("admin",), lang="en")
@@ -478,7 +478,7 @@ def test_startup_report():
 @pytest.mark.parametrize("lang", LANGS)
 def test_all_rendered_texts_pass_the_html_validator(lang):
     texts: list[str] = [
-        t(key, lang, syntax="/x <a|b>", id="<1>", n=1, chat_id=-1, time="<t>", ids="1, 2")
+        t(key, lang, syntax="/x <a|b>", id="<1>", n=1, chat_id=-1, time="<t>", ids="1, 2", name="<n>")
         for key in rendering._CATALOG
     ]
     texts += [welcome_text(lang), farewell_text(lang), root_revoked_text("<now>", lang)]

@@ -1,6 +1,7 @@
 """Pure command parsing: no I/O. Recognition only from a bot_command entity at offset 0."""
 
 import re
+import unicodedata
 from collections.abc import Sequence
 
 from .models import LANGS, Cmd, Lang, ParsedCommand
@@ -44,6 +45,21 @@ _GROUP_ALIASES: dict[str, Cmd] = {
 }
 
 
+_WORD = re.compile(r"\s*\S+")
+
+
+def _tail(rest: str, words: int) -> tuple[str, ...]:
+    """The text after the first `words` words, as one untouched argument (none when blank)."""
+    pos = 0
+    for _ in range(words):
+        m = _WORD.match(rest, pos)
+        if m is None:
+            return ()
+        pos = m.end()
+    tail = rest[pos:]
+    return (tail,) if tail.strip() else ()
+
+
 def parse_group_command(
     text: str | None,
     entities: tuple[tuple[str, int, int], ...],
@@ -57,6 +73,8 @@ def parse_group_command(
     if name == "lang":
         words = rest.split()
         return ParsedCommand(Cmd.LANG, tuple(words), True) if words else ParsedCommand(Cmd.USAGE, ("lang",))
+    if name == "rename":
+        return ParsedCommand(Cmd.RENAME, _tail(rest, 0), True)
     if name in _GROUP_ALIASES:
         return ParsedCommand(_GROUP_ALIASES[name], tuple(rest.split()), True)
     if name != "upb":
@@ -87,6 +105,8 @@ def parse_group_command(
             return ParsedCommand(Cmd.NOTIFY_ON, tuple(words[2:]))
         if len(w) >= 2 and w[1] == "off":
             return ParsedCommand(Cmd.NOTIFY_OFF, tuple(words[2:]))
+        if len(w) >= 2 and w[1] == "rename":
+            return ParsedCommand(Cmd.RENAME, _tail(rest, 2))
         if len(w) >= 2 and w[1] == "all":
             return ParsedCommand(Cmd.PING, tuple(words[2:]))
         return usage()
@@ -94,6 +114,8 @@ def parse_group_command(
         if len(words) == 1:
             return usage()
         return ParsedCommand(Cmd.LANG, tuple(words[1:]))
+    if w[0] == "rename":
+        return ParsedCommand(Cmd.RENAME, _tail(rest, 1))
     if w[0] == "all":
         return ParsedCommand(Cmd.PING, tuple(words[1:]))
     if w[0] == "list":
@@ -141,6 +163,26 @@ def parse_private_command(
         return ParsedCommand(Cmd.P_USAGE, ("chat",))
 
     return None
+
+
+NAME_MAX = 64
+NAME_RESET = "-"
+_BIDI = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def validate_name(raw: str) -> str:
+    """Normalised display name (1..NAME_MAX code points); ValueError when not allowed.
+
+    Edges are stripped, then control/line-break/bidi characters are rejected (an inner
+    newline or tab is not a space), then runs of spaces collapse to one.
+    """
+    text = raw.strip()
+    if any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") or ch in _BIDI for ch in text):
+        raise ValueError("forbidden character")
+    name = " ".join(text.split())
+    if not 1 <= len(name) <= NAME_MAX:
+        raise ValueError("bad length")
+    return name
 
 
 _INT_RE = re.compile(r"-?[0-9]+")
