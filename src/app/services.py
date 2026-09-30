@@ -813,6 +813,18 @@ class Services:
             "DELETE FROM member_menus WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
         )
 
+    async def forget_chat_member_menus(self, c: aiosqlite.Connection, chat_id: int) -> None:
+        """The bot left the chat: its recorded personal menus there are out of reach."""
+        await c.execute("DELETE FROM member_menus WHERE chat_id = ?", (chat_id,))
+
+    async def roleless_member_menus(self, c: aiosqlite.Connection) -> list[tuple[int, int]]:
+        """Recorded (chat_id, user_id) menus of users who hold no role now."""
+        cursor = await c.execute(
+            "SELECT chat_id, user_id FROM member_menus "
+            "WHERE user_id NOT IN (SELECT user_id FROM roles) ORDER BY chat_id, user_id"
+        )
+        return [(r[0], r[1]) for r in await cursor.fetchall()]
+
     async def member_menu_chats(self, c: aiosqlite.Connection, user_id: int) -> list[int]:
         """Chats (registered or not) where this user has a recorded personal menu."""
         cursor = await c.execute(

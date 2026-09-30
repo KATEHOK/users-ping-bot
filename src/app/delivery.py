@@ -131,6 +131,12 @@ class _Outcome:
 _MENU_MOVED = ("moved", "kept_destination")  # migrate_chat actions that change registrations
 
 
+class _Flood:
+    """One startup menu batch: set when a menu call meets a 429 longer than MENU_MAX_WAIT."""
+
+    hit = False
+
+
 class Delivery:
     def __init__(
         self,
@@ -150,7 +156,6 @@ class Delivery:
         # event again, it only retries the write. Memory only, so after a restart the
         # event may go out at most once more.
         self._unwritten: dict[int, _Outcome] = {}
-        self._menu_flood = False  # a menu call met a 429 longer than MENU_MAX_WAIT
 
     # --- replies and ping ---
 
@@ -245,20 +250,52 @@ class Delivery:
         True if every menu now matches the state.
         """
         return await self._sync_menu(
-            chat_id, MAX_MENU_ATTEMPTS if not single_attempt else 1, tuple(users)
+            chat_id, MAX_MENU_ATTEMPTS if not single_attempt else 1, tuple(users), None
         )
 
     async def sync_chat_menus(
         self, chat_ids: Sequence[int], *, single_attempt: bool = False, users: Sequence[int] = ()
     ) -> None:
+        await self._sync_chats(chat_ids, single_attempt, tuple(users), None)
+
+    async def _sync_chats(
+        self,
+        chat_ids: Sequence[int],
+        single_attempt: bool,
+        users: tuple[int, ...],
+        flood: _Flood | None,
+    ) -> None:
+        attempts = MAX_MENU_ATTEMPTS if not single_attempt else 1
         for chat_id in dict.fromkeys(chat_ids):
             if self.stop.is_set():
                 return
-            self._menu_flood = False
-            await self.sync_chat_menu(chat_id, single_attempt=single_attempt, users=users)
-            if self._menu_flood and not single_attempt:
+            await self._sync_menu(chat_id, attempts, users, flood)
+            if flood is not None and flood.hit:
                 # the flood wait is bot-wide: the rest heals at the next start or change
                 _log_code("menu_sync_aborted_rate_limited", chat_id=chat_id)
+                return
+
+    async def sync_menus_at_start(
+        self, chat_ids: Sequence[int], *, users: Sequence[int] = ()
+    ) -> None:
+        """Startup batch: sync the chats, then delete the recorded member menus of users
+        without a role. A 429 longer than MENU_MAX_WAIT stops the rest of the batch."""
+        flood = _Flood()
+        await self._sync_chats(chat_ids, False, tuple(users), flood)
+        if flood.hit:
+            return
+        try:
+            async with self._db.reader() as c:
+                leftovers = await self._services.roleless_member_menus(c)
+        except Exception as exc:
+            logger.error("menu_state_error exc=%s", type(exc).__name__)
+            return
+        for chat_id, user_id in leftovers:
+            if self.stop.is_set():
+                return
+            await self._delete_member_menu(chat_id, user_id, MAX_MENU_ATTEMPTS, flood)
+            if flood.hit:
+                _log_code("menu_sync_aborted_rate_limited", chat_id=chat_id, user_id=user_id)
                 return
 
     async def delete_member_menus(
@@ -272,16 +309,21 @@ class Delivery:
         for chat_id in dict.fromkeys(chat_ids):
             if self.stop.is_set():
                 return
-            try:
-                async with self._db.reader() as c:
-                    active = await self._services.get_chat(c, chat_id) is not None
-            except Exception as exc:
-                logger.error("menu_state_error exc=%s", type(exc).__name__)
-                active = False
-            done = await self._menu_call(chat_id, user_id, None, active, attempts)
-            if done is None:
-                # a registered chat had migrated: the registration and the record moved on
-                await self._delete_after_migration(chat_id, user_id, attempts)
+            await self._delete_member_menu(chat_id, user_id, attempts, None)
+
+    async def _delete_member_menu(
+        self, chat_id: int, user_id: int, attempts: int, flood: _Flood | None
+    ) -> None:
+        try:
+            async with self._db.reader() as c:
+                active = await self._services.get_chat(c, chat_id) is not None
+        except Exception as exc:
+            logger.error("menu_state_error exc=%s", type(exc).__name__)
+            active = False
+        done = await self._menu_call(chat_id, user_id, None, active, attempts, flood)
+        if done is None:
+            # a registered chat had migrated: the registration and the record moved on
+            await self._delete_after_migration(chat_id, user_id, attempts)
 
     async def _delete_after_migration(self, old_chat_id: int, user_id: int, attempts: int) -> None:
         try:
@@ -337,7 +379,9 @@ class Delivery:
                     plan.append((u, rendering.register_menu_commands(lang)))
             return False, plan
 
-    async def _sync_menu(self, chat_id: int, max_attempts: int, users: tuple[int, ...]) -> bool:
+    async def _sync_menu(
+        self, chat_id: int, max_attempts: int, users: tuple[int, ...], flood: _Flood | None
+    ) -> bool:
         try:
             active, plan = await self._menu_plan(chat_id, users)
         except Exception as exc:
@@ -345,13 +389,15 @@ class Delivery:
             return False
         ok = True
         for user_id, commands in plan:
-            done = await self._menu_call(chat_id, user_id, commands, active, max_attempts)
+            done = await self._menu_call(chat_id, user_id, commands, active, max_attempts, flood)
             if done is None:
                 return True  # the chat moved: the migration synced both ids
             if not done:
                 ok = False
                 if user_id is None:
                     break  # the chat itself is out of reach: member menus would fail too
+                if flood is not None and flood.hit:
+                    break  # the rest of this chat's calls would meet the same flood
         return ok
 
     async def _menu_call(
@@ -361,6 +407,7 @@ class Delivery:
         commands: list[tuple[str, str]] | None,
         active: bool,
         max_attempts: int,
+        flood: _Flood | None = None,
     ) -> bool | None:
         """One set/delete with the 429 policy. None: the chat migrated and was handled."""
         code = "menu_set" if commands is not None else "menu_delete"
@@ -376,8 +423,8 @@ class Delivery:
                     await self._note_menu(chat_id, user_id, commands, active)
                 return True
             except RateLimited as exc:
-                if exc.retry_after > MENU_MAX_WAIT:
-                    self._menu_flood = True
+                if exc.retry_after > MENU_MAX_WAIT and flood is not None:
+                    flood.hit = True
                 if attempts >= max_attempts or exc.retry_after > MENU_MAX_WAIT:
                     _log_code(f"{code}_retries_exhausted", chat_id=chat_id, user_id=user_id)
                     return False

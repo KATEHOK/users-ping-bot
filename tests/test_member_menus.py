@@ -2,12 +2,15 @@
 
 import logging
 
+import pytest
+
+import app.__main__ as entry
 from app import rendering
 from app.db import MIGRATIONS_DIR, Database, _split_statements, apply_migrations
-from app.delivery import ChatMigrated, PermanentSend, RateLimited
+from app.delivery import MENU_MAX_WAIT, AmbiguousSend, ChatMigrated, PermanentSend, RateLimited, Unauthorized
 from app.handlers import handle_event
 
-from conftest import group_event, make_admin, make_event, make_root, mk_ctx, private_event, register_chat
+from conftest import BOT_ID, FakeClock, group_event, make_admin, make_event, make_root, mk_ctx, private_event, register_chat
 
 ROOT = 10
 ADMIN = 1
@@ -164,4 +167,109 @@ async def test_menu_text_kinds_match_the_recorded_kind(db):
     await make_root(db, services, ROOT)
     await ctx.delivery.sync_chat_menu(FREE, users=[ROOT])
     assert transport.menu_calls[-1]["commands"] == rendering.register_menu_commands("en")
+    assert await _rows(db) == [(FREE, ROOT, "register")]
+
+
+# --- startup heal and forgetting chats the bot left ---
+
+
+def _deletes(transport):
+    return [(c["chat_id"], c["user_id"]) for c in transport.menu_calls if c["op"] == "delete"]
+
+
+async def test_a_failed_purge_is_retried_at_the_next_start_and_the_row_dropped(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT)
+    await make_admin(db, services, ADMIN)
+    await handle_event(ctx, _joined(FREE, ADMIN))
+    transport.fail_menu(AmbiguousSend())
+    await handle_event(ctx, private_event(f"/admin remove {ADMIN}", update_id=2, user_id=ROOT))
+    assert (FREE, ADMIN, "register") in await _rows(db)  # the single attempt failed
+    transport.fail_menu(None)
+    transport.menu_calls.clear()
+    await entry.sync_menus(ctx, [])  # the next start
+    assert (FREE, ADMIN) in _deletes(transport)
+    assert all(r[1] != ADMIN for r in await _rows(db))
+
+
+async def test_startup_deletes_recorded_menus_of_roleless_users_only(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, FREE, 77, "register")  # no role
+        await services.record_member_menu(c, -800, 78, "owner")
+        await services.record_member_menu(c, FREE, ROOT, "register")  # root keeps it
+    await entry.sync_menus(ctx, [])
+    assert sorted(_deletes(transport)) == [(-800, 78), (FREE, 77)]
+    assert await _rows(db) == [(FREE, ROOT, "register")]
+
+
+async def test_startup_purge_keeps_the_row_on_failure_and_logs(db, caplog):
+    ctx, services, transport, _c = mk_ctx(db)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, FREE, 77, "register")
+    transport.fail_menu(PermanentSend())
+    with caplog.at_level(logging.DEBUG):
+        await entry.sync_menus(ctx, [])
+    assert await _rows(db) == [(FREE, 77, "register")]
+    assert any(r.getMessage().startswith("menu_delete_permanent") for r in caplog.records)
+
+
+async def test_startup_purge_lets_unauthorized_out(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, FREE, 77, "register")
+    transport.fail_menu(Unauthorized())
+    with pytest.raises(Unauthorized):
+        await entry.sync_menus(ctx, [])
+
+
+async def test_startup_purge_stops_on_a_long_429_and_after_a_sync_flood_does_not_start(db):
+    clock = FakeClock()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    clock.sleep = sleep
+    ctx, services, transport, _c = mk_ctx(db, clock)
+    async with db.transaction() as c:
+        for chat in (-801, -802, -803):
+            await services.record_member_menu(c, chat, 77, "register")
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await entry.sync_menus(ctx, [])
+    assert len(transport.menu_calls) == 1 and slept == []
+    # a flood in the chat sync leaves the purge alone
+    await register_chat(db, services, CHAT_ID, ROOT)
+    transport.menu_calls.clear()
+    await entry.sync_menus(ctx, [])
+    assert len(transport.menu_calls) == 1 and transport.menu_calls[0]["chat_id"] == CHAT_ID
+
+
+async def test_bot_kicked_forgets_the_chats_rows_only(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, FREE, ROOT, "register")
+        await services.record_member_menu(c, FREE, 77, "register")
+        await services.record_member_menu(c, -800, ROOT, "register")
+    await handle_event(
+        ctx,
+        make_event(
+            kind="my_chat_member", update_id=1, chat_id=FREE, user_id=ROOT,
+            chat_type="group", bot_removed=True, left_user_id=BOT_ID, text=None,
+        ),
+    )
+    assert await _rows(db) == [(-800, ROOT, "register")]
+
+
+async def test_reconcile_of_a_gone_chat_forgets_its_rows(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await make_root(db, services, ROOT)
+    await register_chat(db, services, CHAT_ID, ROOT)
+    async with db.transaction() as c:
+        await services.record_member_menu(c, CHAT_ID, ROOT, "owner")
+        await services.record_member_menu(c, FREE, ROOT, "register")
+    transport.set_probe(CHAT_ID, PermanentSend())
+    assert await entry.reconcile_chats(ctx, transport) == [CHAT_ID]
     assert await _rows(db) == [(FREE, ROOT, "register")]

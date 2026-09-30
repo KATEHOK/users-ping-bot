@@ -89,6 +89,7 @@ async def reconcile_chats(ctx: Context, transport: Transport) -> list[int]:
         except PermanentSend:
             async with ctx.db.transaction() as c:
                 await ctx.services.unregister_chat(c, chat.chat_id, farewell=False)
+                await ctx.services.forget_chat_member_menus(c, chat.chat_id)
             removed.append(chat.chat_id)
         except ChatMigrated as exc:
             async with ctx.db.transaction() as c:
@@ -110,12 +111,14 @@ async def sync_menus(ctx: Context, extra: list[int]) -> None:
     """Menus of every known chat: registered -> set, otherwise delete.
 
     Former roots and current staff are checked too: their member menus may be stale.
+    Then the recorded member menus of users without a role are deleted.
+    A 429 longer than MENU_MAX_WAIT ends the whole batch.
     """
     async with ctx.db.reader() as c:
         known = await ctx.services.known_chat_ids(c)
         former = await ctx.services.former_root_ids(c)
         staff = await ctx.services.staff_ids(c)
-    await ctx.delivery.sync_chat_menus([*known, *extra], users=[*former, *staff])
+    await ctx.delivery.sync_menus_at_start([*known, *extra], users=[*former, *staff])
 
 
 async def _queue_interrupted_notice(

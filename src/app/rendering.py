@@ -352,15 +352,6 @@ def _startup_lines(removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike],
     return lines
 
 
-def startup_report_ids_parts(
-    removed_chat_ids: Sequence[int], rows: Sequence[ChatRowLike], lang: Lang = DEFAULT_LANG
-) -> int:
-    """How many leading report messages carry the removed-chat ids."""
-    lines = _startup_lines(removed_chat_ids, rows, lang)
-    head = 1 + len(split_ids(removed_chat_ids))  # the header and the removed-ids lines
-    return len(split_text("\n".join(lines[:head])))
-
-
 def startup_report_delivered_groups(
     removed_chat_ids: Sequence[int],
     rows: Sequence[ChatRowLike],

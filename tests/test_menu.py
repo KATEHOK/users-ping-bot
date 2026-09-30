@@ -365,6 +365,48 @@ async def test_startup_sync_stops_the_batch_on_a_429_longer_than_the_cap(db):
     assert len(transport.menu_calls) == 1 and slept == []
 
 
+async def test_a_long_429_stops_the_rest_of_the_chats_calls_at_startup(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, -1, ADMIN)
+    await register_chat(db, services, -2, ADMIN)
+    # chat scope ok, then the first member call floods
+    calls = []
+    real = transport.set_chat_commands
+
+    async def flaky(chat_id, commands, *, user_id=None):
+        calls.append((chat_id, user_id))
+        if user_id is not None:
+            raise RateLimited(MENU_MAX_WAIT + 1)
+        await real(chat_id, commands, user_id=user_id)
+
+    transport.set_chat_commands = flaky
+    await entry.sync_menus(ctx, [])
+    assert calls == [(-2, None), (-2, ROOT)]  # ascending ids; chat -1 is not reached
+
+
+async def test_outbox_sync_ignores_the_startup_abort(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    for chat in (-1, -2, -3):
+        await register_chat(db, services, chat, ADMIN)
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await ctx.delivery.sync_chat_menus([-1, -2, -3])  # as from the outbox
+    assert {c["chat_id"] for c in transport.menu_calls} == {-1, -2, -3}
+
+
+async def test_a_nested_sync_does_not_clear_the_startup_abort(db):
+    ctx, services, transport, _c = mk_ctx(db)
+    await _world(db, services)
+    await register_chat(db, services, -1, ADMIN)
+    await register_chat(db, services, -2, ADMIN)
+    transport.fail_menu(RateLimited(MENU_MAX_WAIT + 1))
+    await ctx.delivery.sync_chat_menu(-9, single_attempt=True)  # another task's sync
+    transport.menu_calls.clear()
+    await entry.sync_menus(ctx, [])
+    assert len(transport.menu_calls) == 1
+
+
 async def test_startup_sync_goes_on_after_a_429_within_the_cap_was_waited_out(db):
     clock = FakeClock()
 

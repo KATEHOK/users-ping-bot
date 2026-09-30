@@ -80,6 +80,7 @@ async def _left(ctx: Context, event: IncomingEvent, *, is_bot: bool) -> None:
             # unreachable chat: no farewell; subscriptions go with the registration
             result = await ctx.services.unregister_chat(c, event.chat_id, farewell=False)
             gone = result.generation != 0
+            await ctx.services.forget_chat_member_menus(c, event.chat_id)
         elif event.left_user_id is not None:
             # only this chat's subscription; a mere restriction change carries no left_user_id
             await ctx.services.unsubscribe(c, event.chat_id, event.left_user_id)
